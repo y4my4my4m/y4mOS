@@ -425,13 +425,24 @@ public Bool WinHorz(I64 left, I64 right, CTask *task = NULL)
 
 public Bool WinVert(I64 top, I64 bottom, CTask *task = NULL)
 {//Set task's win top and bottom rows.
-	I64 d = bottom-top;
+	I64 d = bottom-top, limit;
 
 	if (!task)
 		task = Fs;
 	if (!TaskValidate(task))
 		return FALSE;
 	if (d < 0) d = 0;
+	if (gr.reserved_bottom_rows && !Bt(&task->display_flags, DISPLAYf_NO_BORDER))
+	{//Keep bordered windows above the DE taskbar; slide up, preserving height.
+		limit = TEXT_ROWS - 2 - gr.reserved_bottom_rows;
+		if (bottom > limit)
+		{
+			top -= bottom - limit;
+			bottom = limit;
+			if (top < 1)
+				top = 1;
+		}
+	}
 	if (top >= TEXT_ROWS)
 	{
 		top = TEXT_ROWS - 1;

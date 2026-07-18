@@ -1,0 +1,61 @@
+//y4mOS Image Viewer - shows a PNG in a normal window, scaled to fit.
+//Run with DEViewImage; or DEViewImage("::/path/File.PNG"); Any key exits.
+
+U0 DEViewerDrawIt(CTask *task, CDC *dc)
+{
+	CDC *img = task->user_data;
+
+	dc->color = de_theme.win_bg;
+	GrRect(dc, 0, 0, task->pix_width, task->pix_height);
+	if (img)
+		GrBlot(dc, (task->pix_width  - img->width)  / 2,
+				   (task->pix_height - img->height) / 2, img);
+}
+
+public U0 DEViewImage(U8 *filename=NULL)
+{
+	U8	*pick = NULL;
+	CDC *img, *scaled;
+	I64  cw, ch, s;
+
+	if (!filename)
+		filename = pick = PopUpPickFile("::/DE");
+	if (!filename)
+		return;
+	img = PNGRead(filename);
+	if (!img)
+	{
+		"Can't decode \"%s\" (PNG, non-interlaced, 8/16-bit).\n", filename;
+		Free(pick);
+		return;
+	}
+
+	SettingsPush;
+	StrCopy(Fs->task_title, "Image Viewer");
+	WinMax; //Bordered, so it respects the taskbar rows.
+	DocCursor(OFF);
+	DocClear;
+
+	cw = Fs->pix_width;
+	ch = Fs->pix_height;
+	if (img->width > cw || img->height > ch)
+	{//Scale down to fit, keeping aspect.
+		s = MinI64(cw * 1000 / img->width, ch * 1000 / img->height);
+		scaled = DEDCScaleNew(img, MaxI64(1, img->width * s / 1000),
+								   MaxI64(1, img->height * s / 1000));
+		DCDel(img);
+		img = scaled;
+	}
+	Fs->user_data = img;
+	Fs->draw_it = &DEViewerDrawIt;
+
+	while (!CharScan)
+		Refresh;
+
+	Fs->draw_it = NULL;
+	Fs->user_data = 0;
+	DCDel(img);
+	Free(pick);
+	DocClear;
+	SettingsPop;
+}

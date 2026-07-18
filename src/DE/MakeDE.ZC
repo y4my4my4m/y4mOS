@@ -1,6 +1,10 @@
 Cd(__DIR__);;
 
+#include "Theme"
 #include "DE"
+#include "Widgets"
+#include "Settings"
+#include "Viewer"
 
 Cd("..");;
 

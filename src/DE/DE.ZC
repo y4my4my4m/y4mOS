@@ -1,28 +1,36 @@
-//y4mOS Desktop Environment - phase 3 skeleton.
+//y4mOS Desktop Environment - phase 4.
 //
-//Wallpaper: a truecolor DC blotted behind all windows by hanging a draw_it on
+//Wallpaper: truecolor DC blotted behind all windows by hanging a draw_it on
 //sys_winmgr_task. GrBlot() honors gr.win_z_buf, so the image only lands on
 //8x8 cells not covered by any window - base OS windows keep working untouched.
 //
-//Taskbar: a GrOverlayNew() alpha overlay composited over the finished screen
-//every frame by the overlay compositor. A background DE task redraws its
-//contents and handles taskbar clicks.
+//Taskbar: a real CCtrl on sys_winmgr_task. The WinMgr dispatches clicks on
+//ctrls BEFORE window focus handling, so taskbar clicks are swallowed natively
+//- no passthrough to windows. Drawing happens in the ctrl's draw_it every
+//frame (z-clipped), so the clock and focus highlight are always fresh.
+//
+//Window policy: gr.reserved_bottom_rows makes WinVert() keep bordered windows
+//above the bar (borderless/fullscreen apps may still cover it, intentionally).
+//The DE task clamps windows that set their rows directly.
 //
 //DEStart; / DEStop; toggle the whole thing at runtime.
 
-#define DE_BAR_HEIGHT		24
-#define DE_BAR_ALPHA		235
+#define DE_BAR_ROWS			3
+#define DE_BAR_HEIGHT		(DE_BAR_ROWS * FONT_HEIGHT)
 #define DE_BAR_TASKS_MAX	32
 #define DE_BTTN_WIDTH		136
+#define DE_CHIP_WIDTH		56
 
 class CDEGlobals
 {
-	CDC		*wallpaper, *bar;
-	CTask	*task;
+	CDC		*wallpaper;
+	CCtrl	*bar, *term_bttn;
+	CTask	*task, *menu_task;
 	U0		(*old_wall_paper)(CTask *task);
 	CTask	*bar_tasks[DE_BAR_TASKS_MAX];
 	I64		 bar_x0[DE_BAR_TASKS_MAX], bar_x1[DE_BAR_TASKS_MAX], bar_count;
-	Bool	 on, last_lb;
+	I64		 chip_x0, chip_x1;
+	Bool	 on;
 } de;
 
 CDC *DEDCScaleNew(CDC *src, I64 w, I64 h)
@@ -88,28 +96,83 @@ U0 DEWallpaperLoad(U8 *filename)
 		DCDel(old);
 }
 
-U0 DETaskbarRedraw()
-{//Repaint the taskbar overlay: launcher chip, window buttons, clock.
-	CDC			*dc = de.bar;
+extern U0 DEStop(); //Fwd ref for the launcher menu; body at end of file.
+
+U0 DEMenuTask()
+{//Launcher menu, runs in its own task so the WinMgr never blocks.
+	I64 i = PopUpPickList(
+			"New Terminal\0"
+			"Settings\0"
+			"Image Viewer\0"
+			"File Manager\0"
+			"Task Manager\0"
+			"PNG Demo\0"
+			"TrueColor Demo\0"
+			"About y4mOS\0"
+			"Stop DE\0");
+
+	switch (i)
+	{
+		case 0:
+			User;
+			break;
+		case 1:
+			User("DESettings;\n");
+			break;
+		case 2:
+			User("DEViewImage;\n");
+			break;
+		case 3:
+			User("FileMgr;\n");
+			break;
+		case 4:
+			User("TaskRep;\n");
+			break;
+		case 5:
+			User("PNGDemo;\n");
+			break;
+		case 6:
+			User("ExeFile(\"::/Demo/Graphics/TrueColor/TrueColor\");\n");
+			break;
+		case 7:
+			PopUpOk("\n     y4mOS\n\n"
+					"ZealOS, heavily modified:\n"
+					"1280x720 boot, truecolor,\n"
+					"native PNG, desktop environment.\n"
+					"No ELFs were harmed.\n\n");
+			break;
+		case 8:
+			DEStop;
+			break;
+	}
+	de.menu_task = NULL;
+}
+
+U0 DEBarDraw(CDC *dc, CCtrl *c)
+{//Taskbar paint, called every frame from the WinMgr ctrl pass. dc is the
+//z-clipped screen alias; the bar strip is reserved, so it always shows.
 	CTask		*t = sys_winmgr_task;
 	CDateStruct	 ds;
-	I64			 x = 4, n = 0, ty = (DE_BAR_HEIGHT - FONT_HEIGHT) / 2;
+	I64			 y0 = GR_HEIGHT - DE_BAR_HEIGHT, x = 4, n = 0,
+				 ty = y0 + (DE_BAR_HEIGHT - FONT_HEIGHT) / 2;
 	U8			 buf[STR_LEN];
 
-	if (!dc)
-		return;
+	dc->color = de_theme.bar_bg;
+	GrRect(dc, 0, y0, GR_WIDTH, DE_BAR_HEIGHT);
+	dc->color = de_theme.bar_edge;
+	GrRect(dc, 0, y0, GR_WIDTH, 1);
 
-	dc->color = ColorRGB(0x14, 0x18, 0x22);
-	GrRect(dc, 0, 0, GR_WIDTH, DE_BAR_HEIGHT);
-	dc->color = ColorRGB(0x30, 0x64, 0x8C);
-	GrRect(dc, 0, 0, GR_WIDTH, 1);
-
-	//y4mOS chip (launcher menu comes in phase 4).
-	dc->color = ColorRGB(0x8C, 0x3A, 0xF0);
-	GrRect(dc, x, 4, 56, DE_BAR_HEIGHT - 8);
-	dc->color = ColorRGB(0xFF, 0xFF, 0xFF);
+	//y4mOS launcher chip.
+	if (TaskValidate(de.menu_task))
+		dc->color = de_theme.chip_hot;
+	else
+		dc->color = de_theme.chip;
+	GrRect(dc, x, y0 + 4, DE_CHIP_WIDTH, DE_BAR_HEIGHT - 8);
+	dc->color = de_theme.text;
 	GrPrint(dc, x + 8, ty, "y4mOS");
-	x += 64;
+	de.chip_x0 = x;
+	de.chip_x1 = x + DE_CHIP_WIDTH - 1;
+	x += DE_CHIP_WIDTH + 8;
 
 	//One button per visible Core0 window task.
 	while ((t = t->next_task) != sys_winmgr_task && n < DE_BAR_TASKS_MAX)
@@ -122,13 +185,13 @@ U0 DETaskbarRedraw()
 			de.bar_x0[n]	= x;
 			de.bar_x1[n]	= x + DE_BTTN_WIDTH - 6;
 			if (t == sys_focus_task)
-				dc->color = ColorRGB(0x28, 0x50, 0x78);
+				dc->color = de_theme.bttn_focus;
 			else
-				dc->color = ColorRGB(0x1E, 0x28, 0x38);
-			GrRect(dc, x, 3, DE_BTTN_WIDTH - 6, DE_BAR_HEIGHT - 6);
+				dc->color = de_theme.bttn;
+			GrRect(dc, x, y0 + 3, DE_BTTN_WIDTH - 6, DE_BAR_HEIGHT - 6);
 			MemCopy(buf, t->task_title, 15);
 			buf[15] = 0;
-			dc->color = ColorRGB(0xE8, 0xEC, 0xF4);
+			dc->color = de_theme.text;
 			GrPrint(dc, x + 6, ty, "%s", buf);
 			x += DE_BTTN_WIDTH;
 			n++;
@@ -138,52 +201,97 @@ U0 DETaskbarRedraw()
 
 	Date2Struct(&ds, Now);
 	StrPrint(buf, "%02d:%02d:%02d", ds.hour, ds.min, ds.sec);
-	dc->color = ColorRGB(0xE8, 0xEC, 0xF4);
+	dc->color = de_theme.text;
 	GrPrint(dc, GR_WIDTH - FONT_WIDTH * StrLen(buf) - 8, ty, "%s", buf);
 }
 
-U0 DETaskMain()
-{//Background DE task: taskbar repaint + click handling.
-	I64 i, x, y, cnt = 0;
+U0 DEBarClick(CCtrl *c, I64 x, I64 y, Bool down)
+{//Native ctrl click routing: the WinMgr swallows these before any window
+//focus change. Runs in the WinMgr task - keep it quick, spawn the slow bits.
+	I64 i;
 
+	if (!down)
+		return;
+	if (de.chip_x0 <= x <= de.chip_x1)
+	{
+		if (!TaskValidate(de.menu_task))
+			de.menu_task = Spawn(&DEMenuTask, NULL, "DE Menu");
+		return;
+	}
+	for (i = 0; i < de.bar_count; i++)
+		if (de.bar_x0[i] <= x <= de.bar_x1[i])
+		{
+			if (TaskValidate(de.bar_tasks[i]))
+			{
+				WinFocus(de.bar_tasks[i]);
+				WinToTop(de.bar_tasks[i]);
+			}
+			return;
+		}
+}
+
+U0 DEWinPolicyEnforce()
+{//Clamp bordered windows that bypassed WinVert() (e.g. fresh task defaults).
+	CTask	*t = sys_winmgr_task;
+	I64		 limit = TEXT_ROWS - 2 - DE_BAR_ROWS;
+
+	while ((t = t->next_task) != sys_winmgr_task)
+	{
+		if (!TaskValidate(t))
+			break;
+		if (Bt(&t->display_flags, DISPLAYf_SHOW) &&
+			!Bt(&t->display_flags, DISPLAYf_NO_BORDER) && t->win_bottom > limit)
+			WinVert(t->win_top, t->win_bottom, t); //WinVert clamps + slides up.
+	}
+}
+
+U0 DETaskMain()
+{//Background DE task: window policy enforcement.
 	de.task = Fs;
 	while (de.on)
 	{
-		if (!(cnt & 7)) //~every 240ms
-			DETaskbarRedraw;
-		if (mouse.lb && !de.last_lb)
-		{
-			x = mouse.pos.x;
-			y = mouse.pos.y;
-			if (y >= GR_HEIGHT - DE_BAR_HEIGHT)
-			{
-				for (i = 0; i < de.bar_count; i++)
-					if (de.bar_x0[i] <= x <= de.bar_x1[i] && TaskValidate(de.bar_tasks[i]))
-					{
-						WinFocus(de.bar_tasks[i]);
-						WinToTop(de.bar_tasks[i]);
-						break;
-					}
-				DETaskbarRedraw;
-			}
-		}
-		de.last_lb = mouse.lb;
-		cnt++;
-		Sleep(30);
+		DEWinPolicyEnforce;
+		Sleep(200);
 	}
 	de.task = NULL;
 }
 
 public U0 DEStart(U8 *wallpaper_filename="::/DE/Wallpaper.PNG")
-{//Bring up the y4mOS desktop: wallpaper + taskbar. Base OS stays fully live.
+{//Bring up the y4mOS desktop: wallpaper + taskbar + launcher. Base OS stays live.
+	CCtrl *c;
+
 	if (de.on)
 		return;
+
 	DEWallpaperLoad(wallpaper_filename);
 	de.old_wall_paper = gr.fp_wall_paper;
 	gr.fp_wall_paper = NULL; //Retire the text-stats wallpaper.
 	sys_winmgr_task->draw_it = &DEWallpaperDraw;
-	de.bar = GrOverlayNew(GR_WIDTH, DE_BAR_HEIGHT, 0, GR_HEIGHT - DE_BAR_HEIGHT, DE_BAR_ALPHA);
-	DETaskbarRedraw;
+
+	//Reserve the bar rows and pull existing windows out from under it.
+	gr.reserved_bottom_rows = DE_BAR_ROWS;
+	DEWinPolicyEnforce;
+
+	//Hide the stock Term button; the launcher menu replaces it.
+	de.term_bttn = CtrlFindUnique(sys_winmgr_task, CTRLT_GENERIC);
+	if (de.term_bttn)
+		de.term_bttn->flags &= ~CTRLF_SHOW;
+
+	//Taskbar = ctrl on the winmgr task: native draw + native click routing.
+	c = SysCAlloc(sizeof(CCtrl));
+	c->win_task		= sys_winmgr_task;
+	c->flags		= CTRLF_SHOW;
+	c->type			= CTRLT_GENERIC;
+	c->draw_it		= &DEBarDraw;
+	c->left_click	= &DEBarClick;
+	c->left			= 0;
+	c->right		= GR_WIDTH - 1;
+	c->top			= GR_HEIGHT - DE_BAR_HEIGHT;
+	c->bottom		= GR_HEIGHT - 1;
+	QueueInsert(c, sys_winmgr_task->last_ctrl);
+	TaskDerivedValsUpdate(sys_winmgr_task);
+	de.bar = c;
+
 	de.on = TRUE;
 	Spawn(&DETaskMain, NULL, "DE");
 	"y4mOS DE started. DEStop; returns to stock.\n";
@@ -194,12 +302,33 @@ public U0 DEStop()
 	if (!de.on)
 		return;
 	de.on = FALSE;
+
+	if (TaskValidate(de.menu_task))
+		Kill(de.menu_task);
+	de.menu_task = NULL;
+
+	gr.reserved_bottom_rows = 0;
 	sys_winmgr_task->draw_it = NULL;
 	gr.fp_wall_paper = de.old_wall_paper;
-	Sleep(100); //Let the DE task and the current frame finish.
+
 	if (de.bar)
 	{
-		GrOverlayDel(de.bar);
+		PUSHFD
+		CLI
+		QueueRemove(de.bar);
+		POPFD
+		TaskDerivedValsUpdate(sys_winmgr_task);
+	}
+	if (de.term_bttn)
+	{
+		de.term_bttn->flags |= CTRLF_SHOW;
+		de.term_bttn = NULL;
+	}
+
+	Sleep(100); //Let the DE task and the current frame finish before freeing.
+	if (de.bar)
+	{
+		Free(de.bar);
 		de.bar = NULL;
 	}
 	if (de.wallpaper)

@@ -1,0 +1,81 @@
+//y4mOS Settings - first DE-native widget app. Run with DESettings;
+//(the launcher menu does it via a terminal task). <ESC> exits.
+
+Bool de_settings_done;
+
+U0 DESettingsHue(CDEWidget *wg)
+{
+	DEThemeAccentSet(wg->val);
+}
+
+U0 DESettingsChrome(CDEWidget *wg)
+{
+	if (wg->checked)
+		GuiChromeTrueColor(de_theme.accent, ColorRGB(0x0A, 0x10, 0x1A), de_theme.accent_dim);
+	else
+		GuiChromePalette;
+}
+
+U0 DESettingsPickWall(CDEWidget *wg)
+{
+	U8 *file = PopUpPickFile("::/DE");
+
+	if (file)
+	{
+		DEWallpaperLoad(file);
+		Free(file);
+	}
+}
+
+U0 DESettingsReloadWall(CDEWidget *wg)
+{
+	DEWallpaperLoad("::/DE/Wallpaper.PNG");
+}
+
+U0 DESettingsGradient(CDEWidget *wg)
+{//Load a name that never resolves -> procedural gradient fallback.
+	DEWallpaperLoad("::/DE/NoSuchWallpaper.PNG");
+}
+
+U0 DESettingsStopDE(CDEWidget *wg)
+{
+	de_settings_done = TRUE;
+	DEStop;
+}
+
+U0 DESettingsExit(CDEWidget *wg)
+{
+	de_settings_done = TRUE;
+}
+
+public U0 DESettings()
+{
+	CDEWinCtx	*ctx;
+	U8			 buf[STR_LEN];
+
+	de_settings_done = FALSE;
+	ctx = DEWinInit("Settings", 52, 30);
+
+	DELabel(ctx, 16, 12, "y4mOS Settings", TRUE);
+	StrPrint(buf, "%dx%d truecolor, ZealOS core V%.02f", GR_WIDTH, GR_HEIGHT, sys_os_version);
+	DELabel(ctx, 16, 26, buf);
+
+	DEPanel(ctx, 12, 44, 392, 88);
+	DELabel(ctx, 20, 50, "Appearance", TRUE);
+	DESlider(ctx, 20, 64, 240, "Accent hue", 0, 359, de_theme.hue, &DESettingsHue);
+	DECheck(ctx, 20, 104, "Truecolor window chrome", gr.tc_chrome, &DESettingsChrome);
+
+	DEPanel(ctx, 12, 140, 392, 60);
+	DELabel(ctx, 20, 146, "Wallpaper", TRUE);
+	DEButton(ctx, 20,  162, 110, 22, "Pick PNG...", &DESettingsPickWall);
+	DEButton(ctx, 140, 162, 90,  22, "Reload",      &DESettingsReloadWall);
+	DEButton(ctx, 240, 162, 90,  22, "Gradient",    &DESettingsGradient);
+
+	DEButton(ctx, 12,  210, 100, 22, "Stop DE",    &DESettingsStopDE);
+	DEButton(ctx, 304, 210, 100, 22, "Exit (ESC)", &DESettingsExit);
+
+	while (!de_settings_done && DEWinPoll(ctx))
+		Sleep(30);
+
+	DEWinExit(ctx);
+}

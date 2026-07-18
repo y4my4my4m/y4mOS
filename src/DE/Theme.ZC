@@ -1,0 +1,67 @@
+//y4mOS DE theme - one palette shared by the taskbar, widget toolkit and
+//window chrome. All entries are ColorRGB() pens (ROPF_TRUE_COLOR set).
+//DEThemeAccentSet() re-derives the accent family from a hue and updates the
+//truecolor window borders, so the whole desktop recolors live.
+
+class CDETheme
+{
+	CColorROPU32	bar_bg, bar_edge,
+					chip, chip_hot,
+					bttn, bttn_hot, bttn_focus,
+					panel, panel_edge,
+					win_bg,
+					text, text_dim,
+					accent, accent_dim;
+	I64				hue; //0..359, driven by the Settings slider.
+} de_theme;
+
+CColorROPU32 DEHue2RGB(I64 hue, I64 s, I64 v)
+{//HSV to a ColorRGB() pen. hue 0..359, s/v 0..255. Integer math only.
+	I64 r, g, b, i, f, p, q, t;
+
+	hue = ClampI64(hue, 0, 359);
+	i = hue / 60;
+	f = hue % 60;
+	p = v * (255 - s) / 255;
+	q = v * (255 * 60 - s * f) / (255 * 60);
+	t = v * (255 * 60 - s * (60 - f)) / (255 * 60);
+	switch (i)
+	{
+		case 0:	r = v; g = t; b = p; break;
+		case 1:	r = q; g = v; b = p; break;
+		case 2:	r = p; g = v; b = t; break;
+		case 3:	r = p; g = q; b = v; break;
+		case 4:	r = t; g = p; b = v; break;
+		default: r = v; g = p; b = q; break;
+	}
+
+	return ColorRGB(r, g, b);
+}
+
+U0 DEThemeAccentSet(I64 hue)
+{//Recolor the accent family + window chrome from one hue.
+	de_theme.hue		= hue;
+	de_theme.accent		= DEHue2RGB(hue, 190, 245);
+	de_theme.accent_dim	= DEHue2RGB(hue, 190, 120);
+	de_theme.chip		= DEHue2RGB(hue, 200, 190);
+	de_theme.chip_hot	= DEHue2RGB(hue, 140, 255);
+	de_theme.bttn_focus	= DEHue2RGB(hue, 170, 105);
+	if (gr.tc_chrome)
+		GuiChromeTrueColor(de_theme.accent, ColorRGB(0x0A, 0x10, 0x1A), de_theme.accent_dim);
+}
+
+U0 DEThemeInit()
+{
+	de_theme.bar_bg		= ColorRGB(0x14, 0x18, 0x22);
+	de_theme.bar_edge	= ColorRGB(0x30, 0x64, 0x8C);
+	de_theme.bttn		= ColorRGB(0x1E, 0x28, 0x38);
+	de_theme.bttn_hot	= ColorRGB(0x2A, 0x38, 0x4E);
+	de_theme.panel		= ColorRGB(0x18, 0x1E, 0x2A);
+	de_theme.panel_edge	= ColorRGB(0x3A, 0x46, 0x5C);
+	de_theme.win_bg		= ColorRGB(0x10, 0x14, 0x1E);
+	de_theme.text		= ColorRGB(0xE8, 0xEC, 0xF4);
+	de_theme.text_dim	= ColorRGB(0x8A, 0x94, 0xA8);
+	DEThemeAccentSet(271); //y4mOS violet.
+}
+
+DEThemeInit;
