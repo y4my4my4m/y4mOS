@@ -1,0 +1,548 @@
+// YIRC - IRC client for YDE
+// Public Domain
+//
+// Two-window layout like TCPChatClient: a display window (chat log, DolDoc)
+// and an input window (StrGet line editor). The calling task pumps the socket
+// and parses the IRC protocol. Needs the net stack loaded (BrowserBoot).
+//
+// Input window commands:
+//   /join #chan   /part [#chan]   /msg target text   /me action
+//   /nick name    /topic [text]   /names             /raw anything
+//   /quit [msg]   plain text goes to the current target
+
+#define IRC_PORT		6667
+#define IRC_RECV_BUF	4096
+#define IRC_LINE_MAX	512
+
+CTask	*irc_display_task = NULL;
+CTask	*irc_input_task   = NULL;
+I64		 irc_sock		 = 0;	 // CTCPSocket *
+Bool	 irc_quit		 = FALSE;
+U8		 irc_nick[40];
+U8		 irc_target[80];		 // current channel / query target
+U8		 irc_autojoin[80];		 // joined after registration completes
+U8		 irc_lbuf[IRC_LINE_MAX + 4]; // partial protocol line across receives
+I64		 irc_lbuf_len	 = 0;
+
+U8 *IrcClean(U8 *src)
+{ // sanitize network text for DolDoc: dollar (0x24) doubled, mIRC codes + ctrl stripped
+	U8 *res = MAlloc(StrLen(src) * 2 + 1);
+	U8 *d = res;
+
+	while (*src)
+	{
+		if (*src == 0x24)
+		{ // bare dollar starts a DolDoc command, escape it
+			*d++ = 0x24;
+			*d++ = 0x24;
+			src++;
+		}
+		else if (*src == 3)
+		{ // mIRC color: ^CNN[,NN]
+			src++;
+			if ('0' <= *src <= '9') src++;
+			if ('0' <= *src <= '9') src++;
+			if (*src == ',' && '0' <= src[1] <= '9')
+			{
+				src++;
+				if ('0' <= *src <= '9') src++;
+				if ('0' <= *src <= '9') src++;
+			}
+		}
+		else if (*src < 32)
+			src++; // bold/underline/reset/CR etc: drop
+		else
+			*d++ = *src++;
+	}
+	*d = 0;
+
+	return res;
+}
+
+U0 IrcShow(U8 *dol_prefix, U8 *raw_text)
+{ // one log line: prefix is trusted DolDoc markup, raw_text is network data.
+  // Composed into one atomic doc write: the input task and the socket pump
+  // both log lines, interleaved DocPrints would splice lines mid-text.
+	CDoc *doc;
+	U8	 *clean, *full;
+	Bool  unlock;
+
+	if (!TaskValidate(irc_display_task))
+		return;
+	doc = irc_display_task->put_doc;
+	clean = IrcClean(raw_text);
+	full = MStrPrint("%s%s$$FG$$$$BG$$\n", dol_prefix, clean);
+
+	unlock = DocLock(doc);
+	DocBottom(doc);
+	DocPrint(doc, "%s", full);
+	// park the cursor at column 0 or the window horizontally scrolls to the
+	// end of the longest line and clips every line's head (see Telnet's TermBottom)
+	doc->cur_entry = doc;
+	doc->cur_col = 0;
+	if (unlock)
+		DocUnlock(doc);
+
+	Free(clean);
+	Free(full);
+}
+
+U0 IrcStatus(U8 *raw_text)
+{
+	IrcShow("$$PURPLE$$-- $$FG$$", raw_text);
+}
+
+U0 IrcSendF(U8 *fmt, ...)
+{ // raw IRC line out, CRLF appended
+	U8 *line = StrPrintJoin(NULL, fmt, argc, argv);
+	U8 *full = MStrPrint("%s\r\n", line);
+
+	TCPSocketSendString(irc_sock, full);
+	Free(line);
+	Free(full);
+}
+
+U0 IrcHandleLine(U8 *line)
+{
+	U8	*prefix = NULL, *cmd, *params = "", *text = NULL, *nick = NULL, *p, *target;
+	U8	 head[160];
+	Bool numeric;
+
+	if (!*line)
+		return;
+
+	if (*line == ':')
+	{ // :nick!user@host COMMAND params
+		prefix = line + 1;
+		p = StrFirstOcc(prefix, " ");
+		if (!p)
+			return;
+		*p = 0;
+		cmd = p + 1;
+	}
+	else
+		cmd = line;
+
+	p = StrFirstOcc(cmd, " ");
+	if (p)
+	{
+		*p = 0;
+		params = p + 1;
+	}
+
+	// trailing ":text" parameter
+	if (*params == ':')
+	{
+		text = params + 1;
+		params = "";
+	}
+	else
+	{
+		p = StrFind(" :", params);
+		if (p)
+		{
+			*p = 0;
+			text = p + 2;
+		}
+	}
+
+	if (prefix)
+	{ // sender nick = prefix up to '!'
+		nick = prefix;
+		p = StrFirstOcc(prefix, "!");
+		if (p)
+			*p = 0;
+	}
+
+	if (!StrCompare(cmd, "PING"))
+	{
+		if (text)
+			IrcSendF("PONG :%s", text);
+		else
+			IrcSendF("PONG :%s", params);
+		return;
+	}
+
+	numeric = '0' <= cmd[0] <= '9' && '0' <= cmd[1] <= '9' && '0' <= cmd[2] <= '9' && !cmd[3];
+	if (numeric)
+	{ // server numeric: first param is our nick, rest is payload
+		p = StrFirstOcc(params, " ");
+		if (p)
+			params = p + 1;
+
+		if (!StrCompare(cmd, "001") || !StrCompare(cmd, "376") || !StrCompare(cmd, "422"))
+		{ // welcome / end of MOTD: registration done, run the autojoin
+			if (text)
+				IrcStatus(text);
+			if (irc_autojoin[0])
+			{
+				IrcSendF("JOIN %s", irc_autojoin);
+				StrCopy(irc_target, irc_autojoin);
+				irc_autojoin[0] = 0;
+			}
+			return;
+		}
+		if (!StrCompare(cmd, "353"))
+		{ // NAMES reply: params = "= #chan"
+			p = StrFirstOcc(params, "#");
+			if (!p)
+				p = params;
+			StrPrint(head, "$$LTBLUE$$[%s] users: $$FG$$", p);
+			if (text)
+				IrcShow(head, text);
+			return;
+		}
+		if (!StrCompare(cmd, "332"))
+		{ // topic
+			StrPrint(head, "$$LTBLUE$$[%s] topic: $$FG$$", params);
+			if (text)
+				IrcShow(head, text);
+			return;
+		}
+		if (text)
+			IrcStatus(text);
+		else
+			IrcStatus(params);
+		return;
+	}
+
+	if (!StrCompare(cmd, "PRIVMSG") || !StrCompare(cmd, "NOTICE"))
+	{
+		target = params;
+		if (!text || !nick)
+			return;
+		if (!StrNCompare(text, "\x01""ACTION ", 8))
+		{ // CTCP action: "* nick does something"
+			text += 8;
+			p = StrFirstOcc(text, "\x01");
+			if (p)
+				*p = 0;
+			StrPrint(head, "$$LTGREEN$$[%s] * %s $$FG$$", target, nick);
+			IrcShow(head, text);
+			return;
+		}
+		if (!StrCompare(cmd, "NOTICE"))
+			StrPrint(head, "$$YELLOW$$[%s] -%s- $$FG$$", target, nick);
+		else if (!StrCompare(target, irc_nick))
+		{ // private query: reply target becomes the sender
+			StrPrint(head, "$$LTRED$$[query] <%s> $$FG$$", nick);
+			if (!irc_target[0])
+				StrCopy(irc_target, nick);
+		}
+		else
+			StrPrint(head, "$$LTCYAN$$[%s] $$FG$$$$WHITE$$<%s>$$FG$$ ", target, nick);
+		IrcShow(head, text);
+		return;
+	}
+
+	if (!StrCompare(cmd, "JOIN"))
+	{
+		if (!nick)
+			return;
+		if (text)
+			target = text; // some servers send JOIN :#chan
+		else
+			target = params;
+		StrPrint(head, "$$GREEN$$--> %s joined %s$$FG$$", nick, target);
+		IrcShow(head, "");
+		return;
+	}
+	if (!StrCompare(cmd, "PART"))
+	{
+		if (!nick)
+			return;
+		StrPrint(head, "$$RED$$<-- %s left %s$$FG$$", nick, params);
+		IrcShow(head, "");
+		return;
+	}
+	if (!StrCompare(cmd, "QUIT"))
+	{
+		if (!nick)
+			return;
+		StrPrint(head, "$$RED$$<-- %s quit: $$FG$$", nick);
+		if (text)
+			IrcShow(head, text);
+		else
+			IrcShow(head, "");
+		return;
+	}
+	if (!StrCompare(cmd, "NICK"))
+	{
+		if (!nick)
+			return;
+		if (text)
+			target = text;
+		else
+			target = params;
+		if (!StrCompare(nick, irc_nick))
+			StrCopy(irc_nick, target);
+		StrPrint(head, "$$PURPLE$$-- %s is now %s$$FG$$", nick, target);
+		IrcShow(head, "");
+		return;
+	}
+	if (!StrCompare(cmd, "TOPIC") || !StrCompare(cmd, "KICK") || !StrCompare(cmd, "MODE"))
+	{
+		StrPrint(head, "$$PURPLE$$-- %s %s %s: $$FG$$", nick, cmd, params);
+		if (text)
+			IrcShow(head, text);
+		else
+			IrcShow(head, "");
+		return;
+	}
+
+	// anything unhandled: show raw so nothing is silently lost
+	if (text)
+	{
+		StrPrint(head, "$$DKGRAY$$%s %s $$FG$$", cmd, params);
+		IrcShow(head, text);
+	}
+	else
+	{
+		StrPrint(head, "$$DKGRAY$$%s $$FG$$", cmd);
+		IrcShow(head, params);
+	}
+}
+
+U0 IrcLocalEcho(U8 *target, U8 *msg)
+{
+	U8 head[160];
+
+	StrPrint(head, "$$LTCYAN$$[%s] $$FG$$$$LTGREEN$$<%s>$$FG$$ ", target, irc_nick);
+	IrcShow(head, msg);
+}
+
+U0 IrcInputLine(U8 *msg)
+{ // one line from the input window
+	U8	*arg;
+	U8	 buf[IRC_LINE_MAX];
+
+	if (msg[0] != '/')
+	{ // plain text to the current target
+		if (!irc_target[0])
+		{
+			IrcStatus("No target. /join a channel first.");
+			return;
+		}
+		IrcSendF("PRIVMSG %s :%s", irc_target, msg);
+		IrcLocalEcho(irc_target, msg);
+		return;
+	}
+
+	StrCopy(buf, msg + 1);
+	arg = StrFirstOcc(buf, " ");
+	if (arg)
+	{
+		*arg = 0;
+		arg++;
+		while (*arg == ' ')
+			arg++;
+	}
+	else
+		arg = "";
+
+	if (!StrICompare(buf, "join") && *arg)
+	{
+		IrcSendF("JOIN %s", arg);
+		StrCopy(irc_target, arg);
+	}
+	else if (!StrICompare(buf, "part"))
+	{
+		if (*arg)
+			IrcSendF("PART %s", arg);
+		else if (irc_target[0])
+		{
+			IrcSendF("PART %s", irc_target);
+			irc_target[0] = 0;
+		}
+	}
+	else if (!StrICompare(buf, "msg") && *arg)
+	{
+		U8 *sp = StrFirstOcc(arg, " ");
+		if (sp)
+		{
+			*sp = 0;
+			IrcSendF("PRIVMSG %s :%s", arg, sp + 1);
+			IrcLocalEcho(arg, sp + 1);
+		}
+	}
+	else if (!StrICompare(buf, "me") && *arg && irc_target[0])
+	{
+		U8 head[160];
+		IrcSendF("PRIVMSG %s :\x01""ACTION %s\x01", irc_target, arg);
+		StrPrint(head, "$$LTGREEN$$[%s] * %s $$FG$$", irc_target, irc_nick);
+		IrcShow(head, arg);
+	}
+	else if (!StrICompare(buf, "nick") && *arg)
+		IrcSendF("NICK %s", arg);
+	else if (!StrICompare(buf, "topic"))
+	{
+		if (*arg)
+			IrcSendF("TOPIC %s :%s", irc_target, arg);
+		else
+			IrcSendF("TOPIC %s", irc_target);
+	}
+	else if (!StrICompare(buf, "names"))
+		IrcSendF("NAMES %s", irc_target);
+	else if (!StrICompare(buf, "raw") && *arg)
+		IrcSendF("%s", arg);
+	else if (!StrICompare(buf, "quit"))
+	{
+		if (*arg)
+			IrcSendF("QUIT :%s", arg);
+		else
+			IrcSendF("QUIT :YIRC on y4mOS");
+		irc_quit = TRUE;
+	}
+	else
+		IrcStatus("Commands: /join /part /msg /me /nick /topic /names /raw /quit");
+}
+
+U0 IrcInputTask(I64)
+{
+	U8 *msg;
+
+	DocTermNew;
+	DocPrint(, "$$WW,1$$");
+
+	while (!irc_quit && (msg = StrGet("> ",, SGF_SHIFT_ESC_EXIT)))
+	{
+		if (*msg)
+			IrcInputLine(msg);
+		Free(msg);
+		DocClear;
+		DocPrint(, "$$WW,1$$");
+	}
+	irc_quit = TRUE;
+}
+
+U0 IrcDisplayTask(I64)
+{
+	DocTermNew;
+	DocCursor(OFF);
+	DocPrint(, "$$WW,1$$");
+	DocPrint(, "$$LTBLUE$$== YIRC ==$$FG$$\n");
+
+	while (TaskValidate(irc_input_task) && !irc_quit)
+		Refresh;
+}
+
+U0 IrcWindowsInit()
+{
+	irc_input_task	 = Spawn(&IrcInputTask, NULL, "IRC Input");
+	irc_display_task = Spawn(&IrcDisplayTask, NULL, "IRC");
+	irc_input_task->win_inhibit	  = WIG_USER_TASK_DEFAULT;
+	irc_display_task->win_inhibit = WIG_USER_TASK_DEFAULT;
+	LBts(&irc_input_task->display_flags, DISPLAYf_SHOW);
+	LBts(&irc_display_task->display_flags, DISPLAYf_SHOW);
+
+	irc_display_task->win_top	 = 2;
+	irc_display_task->win_bottom = TEXT_ROWS - 9;
+	irc_display_task->win_left	 = TEXT_COLS / 6;
+	irc_display_task->win_right	 = TEXT_COLS / 6 * 5;
+
+	irc_input_task->win_top		= irc_display_task->win_bottom + 2;
+	irc_input_task->win_bottom	= irc_input_task->win_top + 2;
+	irc_input_task->win_left	= irc_display_task->win_left;
+	irc_input_task->win_right	= irc_display_task->win_right;
+
+	WinFocus(irc_input_task);
+}
+
+U0 IRC(U8 *host=NULL, U16 port=IRC_PORT, U8 *nick=NULL, U8 *autojoin=NULL)
+{
+	U8	 buf[IRC_RECV_BUF];
+	U8	*st;
+	I64  received, i;
+	CTCPSocket *tcp;
+
+	irc_quit = FALSE;
+	irc_lbuf_len = 0;
+	irc_target[0] = 0;
+	irc_autojoin[0] = 0;
+
+	if (!host)
+	{
+		st = StrGet("IRC server: ");
+		if (!st || !*st)
+			return;
+		host = st;
+	}
+	if (nick)
+		StrCopy(irc_nick, nick);
+	else
+	{
+		st = StrGet("Nick (blank = zealot): ");
+		if (st && *st)
+			StrCopy(irc_nick, st);
+		else
+			StrPrint(irc_nick, "zealot%03d", counts.jiffies % 1000);
+	}
+	if (autojoin)
+		StrCopy(irc_autojoin, autojoin);
+	else
+	{
+		st = StrGet("Channel to join (blank = none): ");
+		if (st && *st)
+			StrCopy(irc_autojoin, st);
+	}
+
+	"Connecting to %s:%d as %s...\n", host, port, irc_nick;
+	irc_sock = TCPConnectionCreate(host, port);
+	if (irc_sock <= 0)
+	{
+		PrintErr("Failed to connect to %s:%d\n", host, port);
+		return;
+	}
+
+	IrcSendF("NICK %s", irc_nick);
+	IrcSendF("USER %s 0 * :YIRC on y4mOS", irc_nick);
+
+	IrcWindowsInit;
+
+	tcp = irc_sock;
+	tcp->timeout = 0; // poll mode so the loop notices irc_quit quickly
+
+	while (!irc_quit && TaskValidate(irc_input_task))
+	{
+		received = TCPSocketReceive(irc_sock, buf, IRC_RECV_BUF);
+		if (received == 0)
+		{
+			IrcStatus("Server closed the connection.");
+			break;
+		}
+		if (received < 0)
+		{
+			Sleep(30);
+		}
+		else
+		{
+			for (i = 0; i < received; i++)
+			{
+				if (buf[i] == '\n')
+				{
+					irc_lbuf[irc_lbuf_len] = 0;
+					if (irc_lbuf_len && irc_lbuf[irc_lbuf_len - 1] == '\r')
+						irc_lbuf[irc_lbuf_len - 1] = 0;
+					IrcHandleLine(irc_lbuf);
+					irc_lbuf_len = 0;
+				}
+				else if (irc_lbuf_len < IRC_LINE_MAX)
+					irc_lbuf[irc_lbuf_len++] = buf[i];
+			}
+		}
+	}
+
+	irc_quit = TRUE;
+	Sleep(200);
+	if (TaskValidate(irc_input_task))
+		Kill(irc_input_task);
+	if (TaskValidate(irc_display_task))
+		Kill(irc_display_task);
+
+	tcp->timeout = TCP_TIMEOUT;
+	TCPSocketClose(irc_sock);
+	irc_sock = 0;
+	"\nYIRC session ended.\n";
+}
+
+IRC;
