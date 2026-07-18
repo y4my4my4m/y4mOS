@@ -18,4 +18,5 @@ if (ipv4_globals.local_ip == 0)
 
 Cd("Programs");;
 #include "WebBrowser"
+#include "ZincGX"
 Cd("/");;

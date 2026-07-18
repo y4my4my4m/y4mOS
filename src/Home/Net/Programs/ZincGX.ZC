@@ -1,0 +1,989 @@
+/*	ZincGX: the y4mOS GUI frontend for the Zinc browser engine.
+
+	Zinc's engine (Zinc/HTML CSS JS + WebBrowser.ZC fetch/history/forms) is
+	UI-agnostic; only ZincShow renders DolDoc. ZincGX replaces that with a
+	truecolor display-list renderer drawn in the window's draw_it:
+	  - proportional-ish layout with word wrap, pixel-upscaled headings
+	  - clickable links + form widgets with the MOUSE
+	  - chrome bar: back/forward/reload/home, editable URL box, Go
+	  - wheel + keyboard scrolling, scrollbar, hover href in status bar
+	Run: ZincGX;  or  ZincGX("http://frogfind.com/");
+	<ESC> quits. Compiled system-wide by ::/DE/BrowserBoot after WebBrowser.
+
+	No literal dollar signs in this file (DolDoc source rule). */
+
+#define GX_OPS_MAX		9000
+#define GX_RUN_MAX		512
+#define GX_CHROME_H		30
+#define GX_STATUS_H		16
+#define GX_SBAR_W		10
+#define GX_MARGIN		10
+#define GX_LINE_LEAD	5
+
+//Op types.
+#define GXO_TEXT		0
+#define GXO_RECT		1
+#define GXO_SCALED		2
+#define GXO_WIDGET		3
+
+//Widget kinds.
+#define GXW_TEXT		0
+#define GXW_CHECK		1
+#define GXW_RADIO		2
+#define GXW_SUBMIT		3
+#define GXW_BUTTON		4
+#define GXW_SELECT		5
+#define GXW_AREA		6
+
+class CGxOp
+{
+	I64				 type, x, y, w, h;
+	CColorROPU32	 fg, bg;
+	U8				*text;		//MAlloc'ed; freed on reset.
+	CDC				*sc;		//Scaled heading run.
+	U8				*href;		//Link target (DOM attr memory).
+	CZNode			*node;		//Widget node.
+	I64				 wkind;
+	Bool			 bold, ul, has_bg;
+};
+
+class CGxGlobals
+{
+	CGxOp	*ops;
+	I64		 op_count;
+	I64		 doc_h;			//Total laid-out height.
+	I64		 scroll;
+	I64		 wrap_w, last_w;
+	I64		 x, y, line_h;	//Layout cursor.
+	I64		 link_depth;	//>0: inside <a>.
+	U8		*cur_href;
+	I64		 list_depth;
+	U8		 url[256];
+	I64		 url_len;
+	Bool	 url_focus, quit, fetch, relayout;
+	U8		*hover_href;
+	U8		 run[GX_RUN_MAX];
+	I64		 run_len, run_x, run_y, run_scale;
+	CZStyle	 run_style;
+	Bool	 run_link, busy; //busy: layout in flux; draw_it must not read ops.
+	I64		 last_wheel;
+	U8		*pending_nav;	//StrNew'd target set by click handlers.
+} gx;
+
+CColorROPU32 GxPen(I64 vga, CColorROPU32 def)
+{//VGA index -> truecolor pen. Pages assume a light background; our chrome is
+//dark, so dark palette colors get promoted to their bright variants and
+//black falls back to the theme text color.
+	if (vga < 0 || vga > 15)
+		return def;
+	if (vga == 0)
+		return de_theme.text;
+	if (vga < 7)
+		vga += 8;
+	return ColorBGR(gr_palette[vga]);
+}
+
+U0 GxOpsReset()
+{
+	I64 i;
+
+	for (i = 0; i < gx.op_count; i++)
+	{
+		Free(gx.ops[i].text);
+		if (gx.ops[i].sc)
+			DCDel(gx.ops[i].sc);
+	}
+	gx.op_count = 0;
+	gx.doc_h = 0;
+	gx.hover_href = NULL;
+}
+
+CGxOp *GxOpAdd(I64 type, I64 x, I64 y, I64 w, I64 h)
+{
+	CGxOp *op;
+
+	if (gx.op_count >= GX_OPS_MAX)
+		return NULL;
+	op = &gx.ops[gx.op_count++];
+	MemSet(op, 0, sizeof(CGxOp));
+	op->type = type;
+	op->x = x;	op->y = y;
+	op->w = w;	op->h = h;
+	return op;
+}
+
+//--- Layout ------------------------------------------------------------------
+U0 GxNewline(I64 extra)
+{
+	gx.x = GX_MARGIN + gx.list_depth * 16;
+	gx.y += gx.line_h + extra;
+	gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+}
+
+U0 GxRunFlush()
+{//Emit the accumulated text run as one op (scaled if heading).
+	CGxOp	*op;
+	CDC		*tmp;
+	I64		 w, sf = gx.run_scale;
+
+	if (!gx.run_len)
+		return;
+	gx.run[gx.run_len] = 0;
+	if (sf > 1)
+	{
+		tmp = DCNew(gx.run_len * FONT_WIDTH + 1, FONT_HEIGHT + 1);
+		DCFill(tmp);
+		tmp->color = GxPen(gx.run_style.fg, de_theme.text);
+		GrPrint(tmp, 0, 0, "%s", gx.run);
+		if (gx.run_style.bold == 1)
+			GrPrint(tmp, 1, 0, "%s", gx.run);
+		op = GxOpAdd(GXO_SCALED, gx.run_x, gx.run_y,
+					 tmp->width * sf, tmp->height * sf);
+		if (op)
+		{
+			op->sc = DEDCScaleNew(tmp, tmp->width * sf, tmp->height * sf);
+			op->sc->flags &= ~DCF_NO_TRANSPARENTS;
+		}
+		DCDel(tmp);
+	}
+	else
+	{
+		w = gx.run_len * FONT_WIDTH;
+		op = GxOpAdd(GXO_TEXT, gx.run_x, gx.run_y, w, FONT_HEIGHT);
+		if (op)
+		{
+			op->text = StrNew(gx.run);
+			op->fg	 = GxPen(gx.run_style.fg, de_theme.text);
+			op->bold = gx.run_style.bold == 1;
+			op->ul	 = gx.run_style.underline == 1 || gx.run_link;
+			if (gx.run_style.bg >= 0)
+			{
+				op->has_bg = TRUE;
+				op->bg = GxPen(gx.run_style.bg, de_theme.win_bg);
+			}
+		}
+	}
+	if (op && gx.run_link)
+		op->href = gx.cur_href;
+	gx.run_len = 0;
+}
+
+U0 GxWord(U8 *word, I64 len, CZStyle *style, I64 scale)
+{//Place one word, wrapping as needed, merging into the current run.
+	I64 cw = FONT_WIDTH * scale, need = len * cw;
+
+	if (len <= 0)
+		return;
+	//Style/link/scale change or wrap breaks the run.
+	if (gx.run_len &&
+		(scale != gx.run_scale || gx.run_link != (gx.link_depth > 0) ||
+		 MemCompare(&gx.run_style, style, sizeof(CZStyle))))
+		GxRunFlush;
+
+	if (gx.x + need > gx.wrap_w && gx.x > GX_MARGIN + gx.list_depth * 16)
+	{
+		GxRunFlush;
+		GxNewline(0);
+	}
+	if (!gx.run_len)
+	{
+		gx.run_x	 = gx.x;
+		gx.run_y	 = gx.y;
+		gx.run_scale = scale;
+		gx.run_link	 = gx.link_depth > 0;
+		MemCopy(&gx.run_style, style, sizeof(CZStyle));
+	}
+	if (gx.run_len + len + 1 >= GX_RUN_MAX)
+		GxRunFlush;
+	if (!gx.run_len)
+	{
+		gx.run_x = gx.x;
+		gx.run_y = gx.y;
+	}
+	MemCopy(&gx.run[gx.run_len], word, len);
+	gx.run_len += len;
+	gx.run[gx.run_len++] = ' ';
+	gx.x += need + cw;
+	if (FONT_HEIGHT * scale + GX_LINE_LEAD > gx.line_h)
+		gx.line_h = FONT_HEIGHT * scale + GX_LINE_LEAD;
+}
+
+U0 GxText(U8 *text, CZStyle *style, I64 scale, Bool pre)
+{
+	U8	*p = text, *start;
+	I64	 len;
+
+	if (!text)
+		return;
+	while (*p)
+	{
+		if (pre)
+		{
+			start = p;
+			while (*p && *p != '\n')
+				p++;
+			len = p - start;
+			if (len)
+				GxWord(start, len, style, scale);
+			if (*p == '\n')
+			{
+				GxRunFlush;
+				GxNewline(0);
+				p++;
+			}
+		}
+		else
+		{
+			while (*p == ' ' || *p == '\n' || *p == '\t' || *p == '\r')
+				p++;
+			start = p;
+			while (*p && *p != ' ' && *p != '\n' && *p != '\t' && *p != '\r')
+				p++;
+			len = p - start;
+			if (len)
+				GxWord(start, len, style, scale);
+		}
+	}
+}
+
+U0 GxWidgetLabel(CZNode *node, U8 *out, I64 max)
+{//Display label for a form widget.
+	U8	*v = node->value, *a;
+	CZNode *child;
+	I64	 len;
+
+	out[0] = 0;
+	if (!StrCompare(node->tag, "select"))
+	{//Checked option, else first option.
+		child = node->first_child;
+		while (child)
+		{
+			if (!StrCompare(child->tag, "option") &&
+				(child->checked || !out[0]))
+			{
+				if (child->first_child && child->first_child->type == ZH_TEXT &&
+					child->first_child->text)
+				{
+					a = child->first_child->text;
+					len = StrLen(a);
+					if (len > max - 1)
+						len = max - 1;
+					MemCopy(out, a, len);
+					out[len] = 0;
+				}
+				if (child->checked)
+					return;
+			}
+			child = child->next;
+		}
+		return;
+	}
+	if (!v)
+		v = ZNodeAttr(node, "value");
+	if (!v && !StrCompare(node->tag, "button") && node->first_child &&
+		node->first_child->type == ZH_TEXT)
+		v = node->first_child->text;
+	if (!v)
+		v = "";
+	len = StrLen(v);
+	if (len > max - 1)
+		len = max - 1;
+	MemCopy(out, v, len);
+	out[len] = 0;
+}
+
+U0 GxWidget(CZNode *node, I64 kind)
+{
+	CGxOp	*op;
+	U8		 label[64];
+	I64		 w, h = 20;
+
+	GxRunFlush;
+	GxWidgetLabel(node, label, 48);
+	if (kind == GXW_CHECK || kind == GXW_RADIO)
+	{
+		w = 14;
+		h = 14;
+	}
+	else
+	{
+		w = MaxI64(60, StrLen(label) * FONT_WIDTH + 16);
+		if (kind == GXW_AREA)
+			h = 40;
+	}
+	if (gx.x + w > gx.wrap_w)
+		GxNewline(0);
+	op = GxOpAdd(GXO_WIDGET, gx.x, gx.y, w, h);
+	if (op)
+	{
+		op->node  = node;
+		op->wkind = kind;
+		op->text  = StrNew(label);
+	}
+	gx.x += w + FONT_WIDTH;
+	if (h + GX_LINE_LEAD > gx.line_h)
+		gx.line_h = h + GX_LINE_LEAD;
+}
+
+U0 GxNode(CZNode *node, CZStyle *inherited, I64 scale)
+{
+	CZStyle	 style, author;
+	CZNode	*child;
+	CGxOp	*op;
+	U8		*attr, *type;
+	I64		 kid_scale;
+
+	if (!node || gx.op_count >= GX_OPS_MAX - 8)
+		return;
+
+	if (node->type == ZH_TEXT)
+	{
+		GxText(node->text, inherited, scale, inherited->pre == 1);
+		return;
+	}
+	if (ZnTagSkipped(node->tag))
+		return;
+
+	MemCopy(&style, inherited, sizeof(CZStyle));
+	ZnUaStyle(node->tag, &style);
+	ZCssApply(node, &author);
+	if (author.display == ZCSS_DISP_NONE)
+		return;
+	ZStyleMerge(&style, &author);
+	style.display = -1;
+
+	if (!StrCompare(node->tag, "br"))
+	{
+		GxRunFlush;
+		GxNewline(0);
+		return;
+	}
+	if (!StrCompare(node->tag, "hr"))
+	{
+		GxRunFlush;
+		GxNewline(4);
+		op = GxOpAdd(GXO_RECT, GX_MARGIN, gx.y + 3, gx.wrap_w - GX_MARGIN * 2, 2);
+		if (op)
+			op->fg = de_theme.panel_edge;
+		GxNewline(4);
+		return;
+	}
+	if (!StrCompare(node->tag, "img"))
+	{
+		attr = ZNodeAttr(node, "alt");
+		GxRunFlush;
+		op = GxOpAdd(GXO_RECT, gx.x, gx.y, 60, 16);
+		if (op)
+			op->fg = de_theme.panel;
+		if (attr && *attr)
+			GxText(attr, &style, 1, FALSE);
+		else
+			GxText("[img]", &style, 1, FALSE);
+		return;
+	}
+	if (!StrCompare(node->tag, "input"))
+	{
+		type = ZNodeAttr(node, "type");
+		if (!type)
+			type = "text";
+		if (!StrICompare(type, "hidden"))
+			return;
+		if (!StrICompare(type, "checkbox"))
+			GxWidget(node, GXW_CHECK);
+		else if (!StrICompare(type, "radio"))
+			GxWidget(node, GXW_RADIO);
+		else if (!StrICompare(type, "submit") || !StrICompare(type, "image"))
+			GxWidget(node, GXW_SUBMIT);
+		else if (!StrICompare(type, "button"))
+			GxWidget(node, GXW_BUTTON);
+		else
+			GxWidget(node, GXW_TEXT);
+		return;
+	}
+	if (!StrCompare(node->tag, "button"))
+	{
+		type = ZNodeAttr(node, "type");
+		if (type && !StrICompare(type, "button"))
+			GxWidget(node, GXW_BUTTON);
+		else
+			GxWidget(node, GXW_SUBMIT);
+		return;
+	}
+	if (!StrCompare(node->tag, "select"))
+	{
+		GxWidget(node, GXW_SELECT);
+		return;
+	}
+	if (!StrCompare(node->tag, "textarea"))
+	{
+		GxWidget(node, GXW_AREA);
+		return;
+	}
+
+	kid_scale = scale;
+	if (!StrCompare(node->tag, "h1"))
+		kid_scale = 3;
+	else if (!StrCompare(node->tag, "h2"))
+		kid_scale = 2;
+	else if (!StrCompare(node->tag, "h3"))
+	{
+		kid_scale = 1;
+		style.bold = 1;
+	}
+
+	if (!StrCompare(node->tag, "a"))
+	{
+		attr = ZNodeAttr(node, "href");
+		if (attr && *attr)
+		{
+			GxRunFlush;
+			gx.link_depth++;
+			gx.cur_href = attr;
+			child = node->first_child;
+			while (child)
+			{
+				GxNode(child, &style, kid_scale);
+				child = child->next;
+			}
+			GxRunFlush;
+			gx.link_depth--;
+			return;
+		}
+	}
+
+	if (ZHtmlTagBlock(node->tag) || !StrCompare(node->tag, "td") ||
+		!StrCompare(node->tag, "th") || author.display == ZCSS_DISP_BLOCK)
+	{
+		GxRunFlush;
+		if (gx.x > GX_MARGIN + gx.list_depth * 16)
+			GxNewline(0);
+		if (!StrCompare(node->tag, "p") || !StrCompare(node->tag, "h1") ||
+			!StrCompare(node->tag, "h2") || !StrCompare(node->tag, "h3") ||
+			!StrCompare(node->tag, "blockquote"))
+			gx.y += 5;
+	}
+	if (!StrCompare(node->tag, "ul") || !StrCompare(node->tag, "ol"))
+		gx.list_depth++;
+	if (!StrCompare(node->tag, "li"))
+	{
+		GxRunFlush;
+		GxNewline(0);
+		GxText("-", &style, 1, FALSE);
+	}
+
+	child = node->first_child;
+	while (child)
+	{
+		GxNode(child, &style, kid_scale);
+		child = child->next;
+	}
+
+	if (!StrCompare(node->tag, "ul") || !StrCompare(node->tag, "ol"))
+	{
+		gx.list_depth--;
+		GxRunFlush;
+		GxNewline(0);
+	}
+	if (ZHtmlTagBlock(node->tag) || author.display == ZCSS_DISP_BLOCK)
+	{
+		GxRunFlush;
+		if (gx.x > GX_MARGIN + gx.list_depth * 16)
+			GxNewline(0);
+	}
+}
+
+U0 GxLayout()
+{
+	CZStyle root;
+
+	gx.busy = TRUE;
+	GxOpsReset;
+	gx.wrap_w = Fs->pix_width - GX_SBAR_W - GX_MARGIN;
+	gx.last_w = Fs->pix_width;
+	gx.x = GX_MARGIN;
+	gx.y = 8;
+	gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+	gx.link_depth = 0;
+	gx.list_depth = 0;
+	gx.run_len = 0;
+	ZStyleReset(&root);
+	root.fg = 15; //Default: white-ish; page styles override.
+	if (zinc_dom)
+		GxNode(zinc_dom, &root, 1);
+	GxRunFlush;
+	gx.doc_h = gx.y + gx.line_h + 16;
+	if (gx.scroll > gx.doc_h)
+		gx.scroll = 0;
+	gx.busy = FALSE;
+}
+
+//--- Drawing -----------------------------------------------------------------
+U0 GxDrawChrome(CDC *dc)
+{
+	I64 w = Fs->pix_width, bx = 4, ty = (GX_CHROME_H - FONT_HEIGHT) / 2;
+	U8	buf[264];
+
+	dc->color = de_theme.bar_bg;
+	GrRect(dc, 0, 0, w, GX_CHROME_H);
+	dc->color = de_theme.bar_edge;
+	GrRect(dc, 0, GX_CHROME_H - 1, w, 1);
+
+	//Back, forward, reload, home.
+	dc->color = de_theme.bttn;
+	GrRect(dc, bx, 4, 26, GX_CHROME_H - 8);
+	GrRect(dc, bx + 30, 4, 26, GX_CHROME_H - 8);
+	GrRect(dc, bx + 60, 4, 26, GX_CHROME_H - 8);
+	GrRect(dc, bx + 90, 4, 26, GX_CHROME_H - 8);
+	dc->color = de_theme.text;
+	GrPrint(dc, bx + 9, ty, "<");
+	GrPrint(dc, bx + 39, ty, ">");
+	GrPrint(dc, bx + 69, ty, "R");
+	GrPrint(dc, bx + 99, ty, "H");
+
+	//URL box.
+	dc->color = de_theme.win_bg;
+	GrRect(dc, bx + 122, 4, w - bx - 122 - 40, GX_CHROME_H - 8);
+	if (gx.url_focus)
+		dc->color = de_theme.accent;
+	else
+		dc->color = de_theme.panel_edge;
+	GrRect(dc, bx + 122, 4, w - bx - 122 - 40, 1);
+	GrRect(dc, bx + 122, GX_CHROME_H - 5, w - bx - 122 - 40, 1);
+	GrRect(dc, bx + 122, 4, 1, GX_CHROME_H - 8);
+	GrRect(dc, w - 44, 4, 1, GX_CHROME_H - 8);
+	dc->color = de_theme.text;
+	if (gx.url_focus && Blink)
+		StrPrint(buf, "%s_", gx.url);
+	else
+		StrPrint(buf, "%s", gx.url);
+	buf[ClampI64((w - bx - 130 - 44) / FONT_WIDTH, 0, 262)] = 0; //Clip to the box.
+	GrPrint(dc, bx + 128, ty, "%s", buf);
+
+	//Go.
+	dc->color = de_theme.chip;
+	GrRect(dc, w - 36, 4, 32, GX_CHROME_H - 8);
+	dc->color = de_theme.text;
+	GrPrint(dc, w - 32, ty, "Go");
+}
+
+U0 GxDrawIt(CTask *task, CDC *dc)
+{
+	I64	 i, oy, view_top = GX_CHROME_H, mx, my;
+	I64	 view_h = task->pix_height - GX_CHROME_H - GX_STATUS_H, th, ty;
+	CGxOp *op;
+	U8	*hover = NULL;
+	U8	 buf[168];
+
+	mx = mouse.pos.x - task->pix_left - task->scroll_x;
+	my = mouse.pos.y - task->pix_top - task->scroll_y;
+
+	dc->color = de_theme.win_bg;
+	GrRect(dc, 0, 0, task->pix_width, task->pix_height);
+
+	if (gx.busy)
+	{//Layout rebuilding: ops are in flux, draw chrome only.
+		GxDrawChrome(dc);
+		return;
+	}
+
+	for (i = 0; i < gx.op_count; i++)
+	{
+		op = &gx.ops[i];
+		oy = op->y - gx.scroll + view_top;
+		if (oy + op->h < view_top || oy > view_top + view_h)
+			goto gx_draw_next;
+		switch (op->type)
+		{
+			case GXO_RECT:
+				dc->color = op->fg;
+				GrRect(dc, op->x, oy, op->w, op->h);
+				break;
+			case GXO_TEXT:
+				if (op->has_bg)
+				{
+					dc->color = op->bg;
+					GrRect(dc, op->x, oy, op->w, op->h);
+				}
+				if (op->href && op->x <= mx < op->x + op->w && oy <= my < oy + FONT_HEIGHT)
+				{
+					hover = op->href;
+					dc->color = de_theme.accent;
+				}
+				else
+					dc->color = op->fg;
+				GrPrint(dc, op->x, oy, "%s", op->text);
+				if (op->bold)
+					GrPrint(dc, op->x + 1, oy, "%s", op->text);
+				if (op->ul)
+					GrRect(dc, op->x, oy + FONT_HEIGHT, op->w, 1);
+				break;
+			case GXO_SCALED:
+				if (op->sc)
+					GrBlot(dc, op->x, oy, op->sc);
+				break;
+			case GXO_WIDGET:
+				if (op->wkind == GXW_SUBMIT || op->wkind == GXW_BUTTON)
+					dc->color = de_theme.bttn;
+				else
+					dc->color = de_theme.win_bg;
+				GrRect(dc, op->x, oy, op->w, op->h);
+				dc->color = de_theme.panel_edge;
+				GrRect(dc, op->x, oy, op->w, 1);
+				GrRect(dc, op->x, oy + op->h - 1, op->w, 1);
+				GrRect(dc, op->x, oy, 1, op->h);
+				GrRect(dc, op->x + op->w - 1, oy, 1, op->h);
+				if ((op->wkind == GXW_CHECK || op->wkind == GXW_RADIO) && op->node->checked)
+				{
+					dc->color = de_theme.accent;
+					GrRect(dc, op->x + 3, oy + 3, op->w - 6, op->h - 6);
+				}
+				if (op->wkind != GXW_CHECK && op->wkind != GXW_RADIO)
+				{
+					dc->color = de_theme.text;
+					GrPrint(dc, op->x + 6, oy + (op->h - FONT_HEIGHT) / 2, "%s", op->text);
+				}
+				break;
+		}
+gx_draw_next:;
+	}
+
+	//Scrollbar.
+	dc->color = de_theme.bar_bg;
+	GrRect(dc, task->pix_width - GX_SBAR_W, view_top, GX_SBAR_W, view_h);
+	if (gx.doc_h > view_h)
+	{
+		th = MaxI64(16, view_h * view_h / gx.doc_h);
+		ty = view_top + gx.scroll * (view_h - th) / MaxI64(1, gx.doc_h - view_h);
+		dc->color = de_theme.bttn_focus;
+		GrRect(dc, task->pix_width - GX_SBAR_W + 1, ty, GX_SBAR_W - 2, th);
+	}
+
+	//Status bar.
+	dc->color = de_theme.bar_bg;
+	GrRect(dc, 0, task->pix_height - GX_STATUS_H, task->pix_width, GX_STATUS_H);
+	dc->color = de_theme.text_dim;
+	if (hover)
+		StrPrint(buf, "%s", hover);
+	else
+		StrPrint(buf, "%s", zinc_note);
+	buf[MinI64(166, (task->pix_width - 8) / FONT_WIDTH)] = 0;
+	GrPrint(dc, 4, task->pix_height - GX_STATUS_H + 4, "%s", buf);
+
+	gx.hover_href = hover;
+	GxDrawChrome(dc);
+}
+
+//--- Input -------------------------------------------------------------------
+U0 GxNavTo(U8 *target_new)
+{//Takes ownership of target_new.
+	Free(gx.pending_nav);
+	gx.pending_nav = target_new;
+}
+
+U0 GxUrlSet(U8 *url)
+{
+	I64 len = StrLen(url);
+
+	if (len > 254)
+		len = 254;
+	MemCopy(gx.url, url, len);
+	gx.url[len] = 0;
+	gx.url_len = len;
+}
+
+U0 GxClickContent(I64 x, I64 y)
+{
+	I64	 i, cy = y - GX_CHROME_H + gx.scroll;
+	CGxOp *op;
+	U8	*s, *sub;
+
+	for (i = 0; i < gx.op_count; i++)
+	{
+		op = &gx.ops[i];
+		if (!(op->x <= x < op->x + op->w && op->y <= cy < op->y + op->h))
+			goto gx_click_next;
+		if (op->type == GXO_TEXT && op->href)
+		{
+			GxNavTo(ZincResolveLink(op->href));
+			return;
+		}
+		if (op->type == GXO_WIDGET)
+		{
+			switch (op->wkind)
+			{
+				case GXW_TEXT:
+				case GXW_AREA:
+					s = PopUpGetStr("Value:");
+					if (s)
+					{
+						Free(op->node->value);
+						op->node->value = s;
+						gx.relayout = TRUE;
+					}
+					break;
+				case GXW_CHECK:
+					op->node->checked = !op->node->checked;
+					break;
+				case GXW_RADIO:
+					ZincRadioGroupClear(op->node);
+					op->node->checked = TRUE;
+					break;
+				case GXW_SELECT:
+					ZincSelectCycle(op->node);
+					gx.relayout = TRUE;
+					break;
+				case GXW_SUBMIT:
+					sub = ZincFormSubmitUrl(op->node);
+					if (sub)
+						GxNavTo(sub);
+					break;
+				case GXW_BUTTON:
+					break; //onclick JS not wired in GX yet.
+			}
+			return;
+		}
+gx_click_next:;
+	}
+}
+
+U0 GxClick(I64 x, I64 y)
+{
+	I64 w = Fs->pix_width, view_h = Fs->pix_height - GX_CHROME_H - GX_STATUS_H;
+	I64 th, tyy;
+
+	if (y < GX_CHROME_H)
+	{//Chrome.
+		gx.url_focus = FALSE;
+		if (4 <= x < 30)
+			GxNavTo(StrNew("b"));		//Marker: back.
+		else if (34 <= x < 60)
+			GxNavTo(StrNew("f"));		//Marker: forward.
+		else if (64 <= x < 90)
+			GxNavTo(StrNew("r"));		//Marker: reload.
+		else if (94 <= x < 120)
+			GxNavTo(StrNew("zinc:welcome"));
+		else if (w - 36 <= x < w - 4)
+			GxNavTo(ZincResolveInput(gx.url));
+		else if (126 <= x < w - 44)
+			gx.url_focus = TRUE;
+		return;
+	}
+	if (x >= w - GX_SBAR_W && gx.doc_h > view_h)
+	{//Scrollbar: jump.
+		gx.scroll = ClampI64((y - GX_CHROME_H) * gx.doc_h / view_h - view_h / 2,
+							 0, gx.doc_h - view_h);
+		return;
+	}
+	gx.url_focus = FALSE;
+	if (y < Fs->pix_height - GX_STATUS_H)
+		GxClickContent(x, y);
+}
+
+public U0 ZincGX(U8 *start_url=NULL)
+{
+	U8	*current, *target;
+	I64	 msg, a1, a2, view_h, nav_chain = 0;
+	U8	 title[80];
+
+	MemSet(&gx, 0, sizeof(CGxGlobals));
+	gx.ops = CAlloc(sizeof(CGxOp) * GX_OPS_MAX);
+	gx.fetch = TRUE;
+	gx.last_wheel = mouse.pos.z;
+
+	AutoComplete(OFF);
+	DocCursor(OFF);
+	DocClear;
+	StrCopy(Fs->task_title, "ZincGX");
+	Fs->win_inhibit = Fs->win_inhibit | WIF_FOCUS_TASK_MS_L_D;
+	WinFocus;
+	zinc_note[0] = 0;
+	zinc_back_count = 0;
+	zinc_fwd_count	= 0;
+
+	if (start_url)
+		current = StrNew(start_url);
+	else
+		current = StrNew("zinc:welcome");
+
+	Fs->draw_it = &GxDrawIt;
+
+	while (!gx.quit)
+	{
+		if (gx.fetch)
+		{
+			gx.busy = TRUE; //Ops reference the old DOM; park the drawer.
+			GxOpsReset;
+			ZincLoad(current);
+			gx.fetch = FALSE;
+			if (zinc_js && zinc_js->navigate && nav_chain < 5)
+			{
+				nav_chain++;
+				target = StrNew(zinc_js->navigate);
+				zinc_js->navigate = NULL;
+				current = ZincNavPush(current, target);
+				gx.fetch = TRUE;
+			}
+			else
+			{
+				if (zinc_js)
+					zinc_js->navigate = NULL;
+				nav_chain = 0;
+				GxUrlSet(current);
+				GxLayout;
+				gx.scroll = 0;
+				ZincTitleGet(title, 60);
+				if (title[0])
+					StrPrint(Fs->task_title, "GX:%s", title);
+				else
+					StrCopy(Fs->task_title, "ZincGX");
+			}
+			if (gx.fetch)
+				goto gx_next;
+		}
+
+		//Deferred navigation from click handlers.
+		if (gx.pending_nav)
+		{
+			target = gx.pending_nav;
+			gx.pending_nav = NULL;
+			if (!StrCompare(target, "b"))
+			{//Back.
+				Free(target);
+				if (zinc_back_count)
+				{
+					if (zinc_fwd_count < ZINC_HISTORY)
+						zinc_fwd[zinc_fwd_count++] = current;
+					current = zinc_back[--zinc_back_count];
+					gx.fetch = TRUE;
+				}
+			}
+			else if (!StrCompare(target, "f"))
+			{//Forward.
+				Free(target);
+				if (zinc_fwd_count)
+				{
+					if (zinc_back_count < ZINC_HISTORY)
+						zinc_back[zinc_back_count++] = current;
+					current = zinc_fwd[--zinc_fwd_count];
+					gx.fetch = TRUE;
+				}
+			}
+			else if (!StrCompare(target, "r"))
+			{
+				Free(target);
+				gx.fetch = TRUE;
+			}
+			else
+			{
+				current = ZincNavPush(current, target);
+				gx.fetch = TRUE;
+			}
+			goto gx_next;
+		}
+
+		if (gx.relayout || Fs->pix_width != gx.last_w)
+		{
+			gx.relayout = FALSE;
+			GxLayout;
+		}
+
+		//Wheel scroll.
+		view_h = Fs->pix_height - GX_CHROME_H - GX_STATUS_H;
+		if (mouse.pos.z != gx.last_wheel)
+		{
+			gx.scroll += (mouse.pos.z - gx.last_wheel) * 40;
+			gx.last_wheel = mouse.pos.z;
+			gx.scroll = ClampI64(gx.scroll, 0, MaxI64(0, gx.doc_h - view_h));
+		}
+
+		while (msg = MessageScan(&a1, &a2))
+		{
+			switch (msg)
+			{
+				case MESSAGE_MS_L_DOWN:
+					GxClick(a1, a2);
+					break;
+				case MESSAGE_KEY_DOWN:
+					if (gx.url_focus)
+					{
+						if (a1 == '\n')
+						{
+							gx.url_focus = FALSE;
+							GxNavTo(ZincResolveInput(gx.url));
+						}
+						else if (a1 == CH_BACKSPACE)
+						{
+							if (gx.url_len)
+								gx.url[--gx.url_len] = 0;
+						}
+						else if (a1 == CH_ESC)
+							gx.url_focus = FALSE;
+						else if (' ' <= a1 < 0x7F && gx.url_len < 254)
+						{
+							gx.url[gx.url_len++] = a1;
+							gx.url[gx.url_len] = 0;
+						}
+					}
+					else switch (a1)
+					{
+						case CH_ESC:
+						case CH_SHIFT_ESC:
+							gx.quit = TRUE;
+							break;
+						case 'b':
+							GxNavTo(StrNew("b"));
+							break;
+						case 'f':
+							GxNavTo(StrNew("f"));
+							break;
+						case 'r':
+							GxNavTo(StrNew("r"));
+							break;
+						case 'h':
+							GxNavTo(StrNew("zinc:welcome"));
+							break;
+						case 0:
+							switch (a2.u8[0])
+							{
+								case SC_CURSOR_UP:
+									gx.scroll = MaxI64(0, gx.scroll - 40);
+									break;
+								case SC_CURSOR_DOWN:
+									gx.scroll = ClampI64(gx.scroll + 40, 0, MaxI64(0, gx.doc_h - view_h));
+									break;
+								case SC_PAGE_UP:
+									gx.scroll = MaxI64(0, gx.scroll - view_h + 20);
+									break;
+								case SC_PAGE_DOWN:
+									gx.scroll = ClampI64(gx.scroll + view_h - 20, 0, MaxI64(0, gx.doc_h - view_h));
+									break;
+								case SC_HOME:
+									gx.scroll = 0;
+									break;
+								case SC_END:
+									gx.scroll = MaxI64(0, gx.doc_h - view_h);
+									break;
+							}
+							break;
+					}
+					break;
+			}
+		}
+gx_next:
+		Sleep(20);
+	}
+
+	//Teardown.
+	Fs->draw_it = NULL;
+	GxOpsReset;
+	Free(gx.ops);
+	ZincPageFree;
+	Free(current);
+	while (zinc_back_count)
+		Free(zinc_back[--zinc_back_count]);
+	while (zinc_fwd_count)
+		Free(zinc_fwd[--zinc_fwd_count]);
+	DocCursor(ON);
+	DocClear;
+	"ZincGX closed.\n";
+}

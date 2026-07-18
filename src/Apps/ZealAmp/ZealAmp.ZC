@@ -545,6 +545,14 @@ Bool ZAWavBuf(U8 *raw, I64 size, U8 *filename)
 	return TRUE;
 }
 
+U0 ZAMp3Progress(I64 pct)
+{
+	U8 buf[64];
+
+	StrPrint(buf, "DECODING MP3: %d%% *** ", ClampI64(pct, 0, 100));
+	ZAMarqueeSet(buf);
+}
+
 Bool ZAMp3Buf(U8 *raw, I64 size, U8 *filename)
 {//Native MPEG-1 Layer III decode (MP3.ZC), then into the 48kHz pipeline.
 	I16	*s16;
@@ -552,7 +560,9 @@ Bool ZAMp3Buf(U8 *raw, I64 size, U8 *filename)
 	U8	 title[300];
 
 	ZAMarqueeSet("DECODING MP3 - PURE ZEALC, NO ELF - PLEASE WAIT *** ");
+	mp3_progress_cb = &ZAMp3Progress;
 	s16 = MP3Decode(raw, size, &frames, &rate, &channels);
+	mp3_progress_cb = NULL;
 	if (!s16)
 	{
 		PopUpOk("MP3 decode failed (MPEG-1 Layer III only).");

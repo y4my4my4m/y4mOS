@@ -122,7 +122,7 @@ U0 DEMenuTask()
 				Sys("ExeFile(\"::/DE/BrowserBoot\");");
 				de.net_up = TRUE;
 			}
-			User("Zinc;\n");
+			User("ZincGX;\n");
 			break;
 		case 2:
 			User("Cd(\"::/Apps/ZealAmp\");;ExeFile(\"Run\");\n");
