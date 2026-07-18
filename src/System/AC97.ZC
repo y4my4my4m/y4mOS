@@ -1,0 +1,234 @@
+//y4mOS native AC'97 audio driver + software mixer.
+//Ported from ZealAmp/erythros (Alec Murphy / y4my4m), adapted to the ZealOS
+//kernel PCI API. Pure ZealC - no ELF, no FFI. Polling driven (no IRQs).
+//
+//QEMU needs: -device AC97,audiodev=<your audiodev>
+//If no AC'97 device is found, everything no-ops safely (ac97.present=FALSE).
+//
+//Output path: streams are CFifoI64s of U32 frames (L16|R16<<16, 48kHz).
+//AC97MixTask mixes all live streams into the hardware Buffer Descriptor List.
+
+#define AC97_INT_IOC			(1 << 3)
+
+#define AC97_BDL_BUF_SIZE		2044
+#define AC97_MAX_BDLS			32
+#define AC97_PCM_BUF_SIZE		2048
+#define AC97_PCM_OUT			1
+
+//Native Audio Mixer registers (U16)
+#define AC97_RESET				0x00
+#define AC97_MASTER_VOL			0x02
+#define AC97_PCM_VOL			0x18
+
+//Native Audio Bus Master registers
+#define AC97_PCM_OUTPUT_REG_BOX	0x10
+#define AC97_GLOBAL_CTL			0x2C
+
+//NABM register box registers
+#define AC97_BUFFER_DSC_ADDR	0x00
+#define AC97_LAST_VALID_ENTRY	0x05
+#define AC97_TRANSFER_STS		0x06
+#define AC97_BUFFER_CNT			0x0B
+
+class CAC97PCIInfo
+{
+	U16 vendor_id, device_id;
+	U32 bar[6];
+};
+
+class CAC97BDLEntry
+{
+	U32 addr;
+	U16 length; //Samples - 1.
+	U16 flags;
+};
+
+class CAC97BDL
+{
+	CAC97BDLEntry entries[AC97_MAX_BDLS];
+};
+
+class CAC97
+{
+	CAC97PCIInfo pci;
+	CAC97BDL	*bdl;
+	U16			 nam, nabm;
+	I64			 volume; //0-100 master, cached.
+	Bool		 present;
+} ac97;
+
+#define AUDIO_MAX_STREAMS			4
+#define AUDIO_STREAM_FIFO_FRAMES	262144 //~5.4s of 48kHz stereo per stream.
+
+class CAudioStream
+{
+	CFifoI64 *data;
+};
+
+class CAudio
+{
+	CAudioStream output[AUDIO_MAX_STREAMS];
+	I64			 output_frames[AUDIO_MAX_STREAMS];
+} audio;
+
+U0 AudioInit()
+{
+	I64 i;
+
+	for (i = 0; i < AUDIO_MAX_STREAMS; i++)
+		audio.output[i].data = FifoI64New(AUDIO_STREAM_FIFO_FRAMES, sys_task);
+}
+
+public I64 AudioAvailableOutputStreamGet()
+{//First idle output stream, or -1.
+	I64 stream = 0;
+
+	while (stream < AUDIO_MAX_STREAMS && FifoI64Count(audio.output[stream].data))
+		stream++;
+	if (stream > AUDIO_MAX_STREAMS - 1)
+		return -1;
+
+	return stream;
+}
+
+public I64 AudioSFXPlay(U32 *frames, I64 count)
+{//Queue a one-shot buffer of U32 (L16|R16) 48kHz frames. Returns stream or -1.
+	I64 i, stream = AudioAvailableOutputStreamGet;
+
+	if (stream < 0)
+		return stream;
+	audio.output_frames[stream] = 0;
+	for (i = 0; i < count; i++)
+		FifoI64Ins(audio.output[stream].data, frames[i]);
+
+	return stream;
+}
+
+public U0 AC97MasterVolumeSet(I64 pct)
+{//0 = mute, 100 = max.
+	I64 att;
+
+	ac97.volume = ClampI64(pct, 0, 100);
+	if (!ac97.present)
+		return;
+	att = (100 - ac97.volume) * 31 / 100;
+	if (!ac97.volume)
+		OutU16(ac97.nam + AC97_MASTER_VOL, 0x8000); //Mute bit.
+	else
+		OutU16(ac97.nam + AC97_MASTER_VOL, att << 8 | att);
+}
+
+U0 AC97OutputMix(U32 *buf, I64 length)
+{
+	I64 i, j, acc_l, acc_r, acc_streams;
+	U32 sample;
+
+	for (i = 0; i < length / 4; i++)
+	{
+		acc_l = 0;
+		acc_r = 0;
+		acc_streams = 0;
+		for (j = 0; j < AUDIO_MAX_STREAMS; j++)
+		{
+			if (FifoI64Count(audio.output[j].data))
+			{
+				FifoI64Remove(audio.output[j].data, &sample);
+				audio.output_frames[j]++;
+				acc_streams++;
+				acc_l += sample.i16[0];
+				acc_r += sample.i16[1];
+			}
+		}
+		if (acc_streams)
+		{
+			buf[i].i16[0] = ToI64(acc_l / Sqrt(acc_streams));
+			buf[i].i16[1] = ToI64(acc_r / Sqrt(acc_streams));
+		}
+		else
+			buf[i] = 0; //Silence; the original NaN'd here.
+	}
+}
+
+U0 AC97BufferFill()
+{
+	I64  idx = InU8(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_LAST_VALID_ENTRY) & (AC97_MAX_BDLS - 1);
+	U32 *buf;
+
+	idx = (idx + 1) & (AC97_MAX_BDLS - 1); //Ring-safe; original overran entry 32.
+	buf = ac97.bdl->entries[idx].addr;
+	AC97OutputMix(buf, AC97_BDL_BUF_SIZE);
+	OutU8(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_LAST_VALID_ENTRY, idx);
+}
+
+U0 AC97MixTask()
+{
+	U16 status;
+
+	while (TRUE)
+	{
+		status = InU16(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_TRANSFER_STS);
+		if (status & AC97_INT_IOC)
+		{
+			AC97BufferFill;
+			OutU16(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_TRANSFER_STS, 0x1C);
+		}
+		Sleep(1);
+	}
+}
+
+U0 AC97PCIInfoGet(I64 i, CAC97PCIInfo *pci)
+{
+	I64 j;
+
+	pci->vendor_id = PCIReadU32(i.u8[2], i.u8[1], i.u8[0], 0x0) & 0xFFFF;
+	pci->device_id = PCIReadU32(i.u8[2], i.u8[1], i.u8[0], 0x0) >> 16;
+	for (j = 0; j < 6; j++)
+		pci->bar[j] = PCIReadU32(i.u8[2], i.u8[1], i.u8[0], 0x10 + 0x04 * j);
+}
+
+I64 AC97Init()
+{
+	I64 i, j;
+
+	ac97.present = FALSE;
+	j = PCIClassFind(0x040100, 0); //Class 04=multimedia, 01=audio.
+	if (j < 0)
+	{
+		"[AC'97] No audio device found; audio disabled.\n";
+		return -1;
+	}
+	AC97PCIInfoGet(j, &ac97.pci);
+
+	ac97.nam  = ac97.pci.bar[0] & 0xFFFFFF00;
+	ac97.nabm = ac97.pci.bar[1] & 0xFFFFFF00;
+
+	PCIWriteU8(j.u8[2], j.u8[1], j.u8[0], 0x4, 5); //Port IO on, MMIO off.
+
+	OutU32(ac97.nabm + AC97_GLOBAL_CTL, 0x03);
+	OutU16(ac97.nam + AC97_RESET, 0xFFFF);
+	OutU16(ac97.nam + AC97_PCM_VOL, 0x0000); //PCM out: max.
+
+	ac97.bdl = CAllocAligned(sizeof(CAC97BDL), 4096, sys_task->code_heap);
+	for (i = 0; i < AC97_MAX_BDLS; i++)
+	{
+		ac97.bdl->entries[i].addr	= CAllocAligned(AC97_PCM_BUF_SIZE, 4096, sys_task->code_heap);
+		ac97.bdl->entries[i].length	= AC97_BDL_BUF_SIZE / 2;
+		ac97.bdl->entries[i].flags	= 1 << 15; //IOC.
+	}
+	OutU32(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_BUFFER_DSC_ADDR, ac97.bdl);
+
+	ac97.present = TRUE;
+	AC97MasterVolumeSet(80);
+
+	OutU8(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_BUFFER_CNT, 0);
+	AC97BufferFill;
+	OutU8(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_BUFFER_CNT, 1);
+
+	Spawn(&AC97MixTask, , "AC97 Mixer", 1);
+	"[AC'97] Audio up: NAM 0x%04X NABM 0x%04X.\n", ac97.nam, ac97.nabm;
+
+	return 0;
+}
+
+AudioInit;
+AC97Init;

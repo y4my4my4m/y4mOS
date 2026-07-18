@@ -48,13 +48,18 @@ U0 DESettingsExit(CDEWidget *wg)
 	de_settings_done = TRUE;
 }
 
+U0 DESettingsVolume(CDEWidget *wg)
+{
+	AC97MasterVolumeSet(wg->val);
+}
+
 public U0 DESettings()
 {
 	CDEWinCtx	*ctx;
 	U8			 buf[STR_LEN];
 
 	de_settings_done = FALSE;
-	ctx = DEWinInit("Settings", 52, 30);
+	ctx = DEWinInit("Settings", 52, 36);
 
 	DELabel(ctx, 16, 12, "y4mOS Settings", TRUE);
 	StrPrint(buf, "%dx%d truecolor, ZealOS core V%.02f", GR_WIDTH, GR_HEIGHT, sys_os_version);
@@ -71,8 +76,12 @@ public U0 DESettings()
 	DEButton(ctx, 140, 162, 90,  22, "Reload",      &DESettingsReloadWall);
 	DEButton(ctx, 240, 162, 90,  22, "Gradient",    &DESettingsGradient);
 
-	DEButton(ctx, 12,  210, 100, 22, "Stop DE",    &DESettingsStopDE);
-	DEButton(ctx, 304, 210, 100, 22, "Exit (ESC)", &DESettingsExit);
+	DEPanel(ctx, 12, 208, 392, 44);
+	DELabel(ctx, 20, 214, "Audio", TRUE);
+	DESlider(ctx, 116, 214, 200, "Master volume", 0, 100, ac97.volume, &DESettingsVolume);
+
+	DEButton(ctx, 12,  262, 100, 22, "Stop DE",    &DESettingsStopDE);
+	DEButton(ctx, 304, 262, 100, 22, "Exit (ESC)", &DESettingsExit);
 
 	while (!de_settings_done && DEWinPoll(ctx))
 		Sleep(30);

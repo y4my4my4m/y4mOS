@@ -102,13 +102,17 @@ U0 DEMenuTask()
 {//Launcher menu, runs in its own task so the WinMgr never blocks.
 	I64 i = PopUpPickList(
 			"New Terminal\0"
-			"Settings\0"
+			"ZealAmp\0"
+			"Calculator\0"
+			"Calendar\0"
 			"Image Viewer\0"
+			"Settings\0"
 			"File Manager\0"
 			"Task Manager\0"
 			"PNG Demo\0"
 			"TrueColor Demo\0"
 			"About y4mOS\0"
+			"Reboot\0"
 			"Stop DE\0");
 
 	switch (i)
@@ -117,31 +121,45 @@ U0 DEMenuTask()
 			User;
 			break;
 		case 1:
-			User("DESettings;\n");
+			User("Cd(\"::/Apps/ZealAmp\");;ExeFile(\"Run\");\n");
 			break;
 		case 2:
-			User("DEViewImage;\n");
+			User("DECalc;\n");
 			break;
 		case 3:
-			User("FileMgr;\n");
+			User("DECalendar;\n");
 			break;
 		case 4:
-			User("TaskRep;\n");
+			User("DEViewImage;\n");
 			break;
 		case 5:
-			User("PNGDemo;\n");
+			User("DESettings;\n");
 			break;
 		case 6:
-			User("ExeFile(\"::/Demo/Graphics/TrueColor/TrueColor\");\n");
+			User("FileMgr;\n");
 			break;
 		case 7:
+			User("TaskRep;\n");
+			break;
+		case 8:
+			User("PNGDemo;\n");
+			break;
+		case 9:
+			User("ExeFile(\"::/Demo/Graphics/TrueColor/TrueColor\");\n");
+			break;
+		case 10:
 			PopUpOk("\n     y4mOS\n\n"
 					"ZealOS, heavily modified:\n"
 					"1280x720 boot, truecolor,\n"
-					"native PNG, desktop environment.\n"
+					"native PNG + AC97 audio,\n"
+					"desktop environment.\n"
 					"No ELFs were harmed.\n\n");
 			break;
-		case 8:
+		case 11:
+			if (PopUpNoYes("Reboot y4mOS?"))
+				Reboot;
+			break;
+		case 12:
 			DEStop;
 			break;
 	}
@@ -286,13 +304,49 @@ U0 DEWinPolicyEnforce()
 	}
 }
 
+U0 DEAltTab()
+{//<ALT-TAB>: cycle focus through the taskbar's stable task list.
+	I64 i, cur = -1;
+
+	if (!de.bar_count)
+		return;
+	for (i = 0; i < de.bar_count; i++)
+		if (de.bar_tasks[i] == sys_focus_task)
+		{
+			cur = i;
+			break;
+		}
+	i = (cur + 1) % de.bar_count;
+	if (TaskValidate(de.bar_tasks[i]))
+	{
+		WinFocus(de.bar_tasks[i]);
+		WinToTop(de.bar_tasks[i]);
+	}
+}
+
 U0 DETaskMain()
-{//Background DE task: window policy enforcement.
+{//Background DE task: window policy enforcement + ALT-TAB switching.
+	I64	 cnt = 0;
+	Bool tab_latch = FALSE;
+
 	de.task = Fs;
 	while (de.on)
 	{
-		DEWinPolicyEnforce;
-		Sleep(200);
+		if (Bt(kbd.down_bitmap, SC_ALT) && Bt(kbd.down_bitmap, SC_TAB))
+		{
+			if (!tab_latch)
+			{
+				tab_latch = TRUE;
+				DEAltTab;
+			}
+		}
+		else if (!Bt(kbd.down_bitmap, SC_TAB))
+			tab_latch = FALSE;
+
+		if (!(cnt & 3)) //Every ~200ms.
+			DEWinPolicyEnforce;
+		cnt++;
+		Sleep(50);
 	}
 	de.task = NULL;
 }

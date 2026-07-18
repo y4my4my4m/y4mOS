@@ -1,0 +1,646 @@
+//ZealAmp for y4mOS - Winamp-style audio player.
+//Port of y4my4m's ZealAmp Player32.ZC, rewritten for the y4mOS truecolor
+//graphics pipeline: the skin renders with plain GrBlot() into the window's
+//z-clipped draw_it DC - no more raw text.fb_alias framebuffer pokes, so the
+//window drags, overlaps and stacks like any other.
+//
+//Audio: native AC'97 driver + mixer (System/AC97.ZC), 48kHz U32 (L16|R16)
+//frames. Plays MP3 via the native pure-ZealC decoder (MP3.ZC - dr_mp3 ELF
+//blob replaced entirely), plus 16-bit PCM WAV (any rate, mono or stereo),
+//plus a built-in test-tone generator. <ESC> exits, T = tone.
+
+#define ZA_IMG_MAIN		zamp.images[0]
+#define ZA_IMG_CBUTTONS	zamp.images[1]
+#define ZA_IMG_TEXT		zamp.images[2]
+#define ZA_IMG_NUMBERS	zamp.images[3]
+#define ZA_IMG_PLAYPAUS	zamp.images[4]
+#define ZA_IMG_MONOSTER	zamp.images[5]
+#define ZA_IMG_POSBAR	zamp.images[6]
+
+#define ZA_BTN_NULL		0
+#define ZA_BTN_PREV		1
+#define ZA_BTN_PLAY		2
+#define ZA_BTN_PAUSE	3
+#define ZA_BTN_STOP		4
+#define ZA_BTN_NEXT		5
+#define ZA_BTN_EJECT	6
+
+#define ZA_ACTION_NULL		0
+#define ZA_ACTION_PICK_FILE	1
+
+#define ZA_RATE			48000
+
+class CZAmpMedia
+{
+	U8		 title[256];
+	U32		 channels, sample_rate_khz;
+	U32		*pcm_data;		//U32 frames: L16 | R16 << 16, 48kHz.
+	I64		 pcm_frames;
+	I64		 fifo_frame, seek_frame, seek_to_frame;
+	I64		 runtime_mins, runtime_secs;
+	Bool	 paused, stopped, loading, seeking;
+};
+
+class CZAmpMarquee
+{
+	U8	text[256];
+	I64	len, pos, ticks;
+};
+
+class CZAmp
+{
+	CZAmpMedia		 media;
+	CZAmpMarquee	 marquee;
+	CTask			*win_task, *feed_task;
+	CDC				**images;
+	I64				 pressing_button, prev_lb_state;
+	I64				 stream_id;
+	Bool			 quit;
+} zamp;
+
+U8 *ZA_TEXT_ROW_1 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ\"@";
+U8 *ZA_TEXT_ROW_2 = "0123456789  :()-'!_+\\/[]^&%.=\d#";
+U8 *ZA_TEXT_ROW_3 = "   ?*";
+
+U0 ZADraw5x6Char(CDC *dc, I64 x, I64 y, U8 ch)
+{//One glyph from the skin's 5x6 bitmap font strip.
+	CDC *char_dc;
+	U8	 substr[2];
+	U8	*hit;
+	I64	 sx = -1, sy;
+
+	if (ch == ' ')
+		return;
+	if ('a' <= ch <= 'z')
+		ch += 'A' - 'a';
+	substr[0] = ch;
+	substr[1] = 0;
+	if (hit = StrFind(substr, ZA_TEXT_ROW_1))
+	{
+		sx = 5 * (hit - ZA_TEXT_ROW_1);
+		sy = 0;
+	}
+	else if (hit = StrFind(substr, ZA_TEXT_ROW_2))
+	{
+		sx = 5 * (hit - ZA_TEXT_ROW_2);
+		sy = 6;
+	}
+	else if (hit = StrFind(substr, ZA_TEXT_ROW_3))
+	{
+		sx = 5 * (hit - ZA_TEXT_ROW_3);
+		sy = 12;
+	}
+	if (sx >= 0)
+	{
+		char_dc = DCNew(5, 6);
+		GrBlot(char_dc, -sx, -sy, ZA_IMG_TEXT);
+		GrBlot(dc, x, y, char_dc);
+		DCDel(char_dc);
+	}
+}
+
+U0 ZADraw5x6Text(CDC *dc, I64 x, I64 y, U8 *str)
+{
+	while (*str)
+	{
+		ZADraw5x6Char(dc, x, y, *str);
+		str++;
+		x += 5;
+	}
+}
+
+U0 ZAMarqueeSet(U8 *str)
+{
+	StrCopy(zamp.marquee.text, str);
+	zamp.marquee.len = StrLen(zamp.marquee.text);
+	zamp.marquee.pos = 0;
+	zamp.marquee.ticks = 0;
+}
+
+U0 ZADrawMarquee(CDC *dc, I64 x, I64 y)
+{
+	I64 i, idx;
+
+	if (!zamp.marquee.len)
+		return;
+	for (i = 0; i < 31; i++)
+	{
+		idx = (zamp.marquee.pos + i) % zamp.marquee.len;
+		ZADraw5x6Char(dc, x + i * 5, y, zamp.marquee.text[idx]);
+	}
+	zamp.marquee.ticks++;
+	if (zamp.marquee.ticks > 6)
+	{
+		zamp.marquee.ticks = 0;
+		zamp.marquee.pos = (zamp.marquee.pos + 1) % zamp.marquee.len;
+	}
+}
+
+Bool ZAHovered(I64 x, I64 y, I64 w, I64 h)
+{//Window-relative rect vs live mouse.
+	I64 mx = mouse.pos.x - zamp.win_task->pix_left;
+	I64 my = mouse.pos.y - zamp.win_task->pix_top;
+
+	return x <= mx < x + w && y <= my < y + h;
+}
+
+U0 ZASeekTo(I64 frame)
+{
+	zamp.media.seek_frame = frame;
+	audio.output_frames[zamp.stream_id] = 0;
+	zamp.media.fifo_frame = 0;
+	FifoI64Flush(audio.output[zamp.stream_id].data);
+}
+
+U0 ZADrawPosBar(CDC *dc, I64 x, I64 y)
+{
+	CDC *knob = DCNew(28, 10);
+	F64  scale;
+	I64  j;
+
+	if (!zamp.media.pcm_data || !zamp.media.pcm_frames)
+	{
+		DCDel(knob);
+		return;
+	}
+	scale = 220.0 / zamp.media.pcm_frames;
+	if (!zamp.media.seeking)
+	{
+		GrBlot(knob, -250, 0, ZA_IMG_POSBAR);
+		GrBlot(dc, x + ToI64(scale * (zamp.media.seek_frame + audio.output_frames[zamp.stream_id])), y, knob);
+	}
+	else
+	{
+		GrBlot(knob, -278, 0, ZA_IMG_POSBAR);
+		j = ClampI64(mouse.pos.x - zamp.win_task->pix_left - x - 14, 0, 220);
+		GrBlot(dc, x + j, y, knob);
+		zamp.media.seek_to_frame = ClampI64(ToI64(j / scale), 0, zamp.media.pcm_frames - 1);
+	}
+	DCDel(knob);
+}
+
+U0 ZADrawControlsActive(CDC *dc, I64 x, I64 y)
+{//Press/release handling + pressed-state art. Runs in the WinMgr draw pass,
+//polling the live mouse exactly like the original.
+	CDC *control_dc = DCNew(23, 18);
+
+	if (!mouse.lb && zamp.prev_lb_state)
+	{//Release: fire the action if still hovered.
+		switch (zamp.pressing_button)
+		{
+			case ZA_BTN_PLAY:
+				if (ZAHovered(x + 23, y, 23, 18))
+				{
+					zamp.media.paused = FALSE;
+					zamp.media.stopped = FALSE;
+				}
+				break;
+			case ZA_BTN_PAUSE:
+				if (ZAHovered(x + 23 * 2, y, 23, 18))
+					zamp.media.paused = !zamp.media.paused;
+				break;
+			case ZA_BTN_STOP:
+				if (ZAHovered(x + 23 * 3, y, 23, 18))
+				{
+					zamp.media.stopped = TRUE;
+					ZASeekTo(0);
+				}
+				break;
+			case ZA_BTN_EJECT:
+				if (ZAHovered(x + 121, y + 1, 22, 15))
+					zamp.win_task->user_data = ZA_ACTION_PICK_FILE;
+				break;
+		}
+		zamp.pressing_button = ZA_BTN_NULL;
+		if (zamp.media.seeking && zamp.media.seek_to_frame)
+			ZASeekTo(zamp.media.seek_to_frame);
+		zamp.media.seeking = FALSE;
+	}
+
+	if (mouse.lb && !zamp.prev_lb_state)
+	{//Press: latch which button went down.
+		if (ZAHovered(x, y, 23, 18))
+			zamp.pressing_button = ZA_BTN_PREV;
+		if (ZAHovered(x + 23, y, 23, 18))
+			zamp.pressing_button = ZA_BTN_PLAY;
+		if (ZAHovered(x + 23 * 2, y, 23, 18))
+			zamp.pressing_button = ZA_BTN_PAUSE;
+		if (ZAHovered(x + 23 * 3, y, 23, 18))
+			zamp.pressing_button = ZA_BTN_STOP;
+		if (ZAHovered(x + 23 * 4, y, 23, 18))
+			zamp.pressing_button = ZA_BTN_NEXT;
+		if (ZAHovered(x + 121, y + 1, 22, 15))
+			zamp.pressing_button = ZA_BTN_EJECT;
+		if (ZAHovered(21, 74, 248, 10))
+			zamp.media.seeking = TRUE;
+	}
+
+	if (zamp.pressing_button && zamp.pressing_button != ZA_BTN_EJECT)
+	{//Pressed art from row 2 of CBUTTONS.
+		if (ZAHovered(x + 23 * (zamp.pressing_button - 1), y, 23, 18))
+		{
+			DCFill(control_dc);
+			GrBlot(control_dc, -23 * (zamp.pressing_button - 1), -17, ZA_IMG_CBUTTONS);
+			GrBlot(dc, x + 23 * (zamp.pressing_button - 1), y, control_dc);
+		}
+	}
+	else if (zamp.pressing_button == ZA_BTN_EJECT && ZAHovered(x + 121, y + 1, 22, 15))
+	{
+		DCFill(control_dc);
+		GrBlot(control_dc, -113, -16, ZA_IMG_CBUTTONS);
+		control_dc->color = TRANSPARENT;
+		GrRect(control_dc, 0, 16, 32, 32);
+		GrBlot(dc, x + 121, y + 1, control_dc);
+	}
+
+	zamp.prev_lb_state = mouse.lb;
+	DCDel(control_dc);
+}
+
+U0 ZADrawControlsIdle(CDC *dc, I64 x, I64 y)
+{//Baked once onto the main skin at init.
+	CDC *controls_dc = DCNew(114, 17);
+	CDC *eject_dc = DCNew(22, 15);
+
+	GrBlot(controls_dc, 0, 0, ZA_IMG_CBUTTONS);
+	GrBlot(eject_dc, -113, -1, ZA_IMG_CBUTTONS);
+	GrBlot(dc, x, y, controls_dc);
+	GrBlot(dc, x + 121, y + 1, eject_dc);
+	DCDel(controls_dc);
+	DCDel(eject_dc);
+}
+
+U0 ZADrawMonoStereo(CDC *dc, I64 x, I64 y)
+{
+	CDC *mono_dc = DCNew(29, 12);
+	CDC *stereo_dc = DCNew(29, 12);
+
+	DCFill(mono_dc);
+	DCFill(stereo_dc);
+	switch (zamp.media.channels)
+	{
+		case 1:
+			GrBlot(mono_dc, -29, 0, ZA_IMG_MONOSTER);
+			GrBlot(stereo_dc, 0, -12, ZA_IMG_MONOSTER);
+			break;
+		case 2:
+			GrBlot(mono_dc, -29, -12, ZA_IMG_MONOSTER);
+			GrBlot(stereo_dc, 0, 0, ZA_IMG_MONOSTER);
+			break;
+		default:
+			GrBlot(mono_dc, -29, -12, ZA_IMG_MONOSTER);
+			GrBlot(stereo_dc, 0, -12, ZA_IMG_MONOSTER);
+	}
+	GrBlot(dc, x, y, mono_dc);
+	GrBlot(dc, x + 29, y, stereo_dc);
+	DCDel(mono_dc);
+	DCDel(stereo_dc);
+}
+
+U0 ZADrawTimeElapsed(CDC *dc)
+{
+	CDC *num_dc;
+	I64  i, secs;
+	U8	 min_buf[3], sec_buf[3];
+
+	if (zamp.media.stopped || !zamp.media.pcm_data)
+		return;
+	if (zamp.media.paused && !Blink(.5))
+		return;
+	secs = (zamp.media.seek_frame + audio.output_frames[zamp.stream_id]) / ZA_RATE;
+	StrPrint(min_buf, "%02d", secs / 60 % 100);
+	StrPrint(sec_buf, "%02d", secs % 60);
+
+	num_dc = DCNew(9, 13);
+	for (i = 0; i < 2; i++)
+	{
+		DCFill(num_dc);
+		GrBlot(num_dc, -9 * (min_buf[i] - '0'), 0, ZA_IMG_NUMBERS);
+		GrBlot(dc, 50 + 12 * i, 27, num_dc);
+	}
+	for (i = 0; i < 2; i++)
+	{
+		DCFill(num_dc);
+		GrBlot(num_dc, -9 * (sec_buf[i] - '0'), 0, ZA_IMG_NUMBERS);
+		GrBlot(dc, 81 + 12 * i, 27, num_dc);
+	}
+	DCDel(num_dc);
+}
+
+U0 ZADrawPlayPauseStopped(CDC *dc)
+{
+	CDC *state_dc = DCNew(9, 9);
+	I64  sx = 18; //Stopped.
+
+	if (!zamp.media.paused && !zamp.media.stopped)
+		sx = 0; //Playing.
+	else if (zamp.media.paused)
+		sx = 9;
+	DCFill(state_dc);
+	GrBlot(state_dc, -sx, 0, ZA_IMG_PLAYPAUS);
+	GrBlot(dc, 28, 28, state_dc);
+	DCDel(state_dc);
+}
+
+U0 ZADrawVolume(CDC *dc)
+{//Thin accent indicator over the skin's volume slot; click strip to set.
+	I64 x = 107, y = 62, w = 68;
+
+	dc->color = ColorRGB(0x30, 0xFF, 0x60);
+	GrRect(dc, x, y, w * ac97.volume / 100, 2);
+	if (mouse.lb && !zamp.prev_lb_state && ZAHovered(x, y - 4, w, 10))
+		AC97MasterVolumeSet((mouse.pos.x - zamp.win_task->pix_left - x) * 100 / w);
+}
+
+U0 ZADrawPlayer(CTask *task, CDC *dc)
+{//draw_it: pure truecolor DC ops, window-relative, z-clipped. That's the
+//whole point of the port - GrBlot instead of framebuffer pokes.
+	if (zamp.media.loading)
+		return;
+	GrBlot(dc, 0, 0, ZA_IMG_MAIN);
+	ZADrawMarquee(dc, 113, 29);
+	ZADrawMonoStereo(dc, 212, 43);
+	ZADrawPlayPauseStopped(dc);
+	ZADrawTimeElapsed(dc);
+	ZADrawVolume(dc);
+	ZADrawControlsActive(dc, 22, 91);
+	ZADrawPosBar(dc, 21, 74);
+}
+
+U0 ZAFeedTask()
+{//Refill the mixer FIFO from decoded PCM.
+	I64 i;
+
+	while (TRUE)
+	{
+		i = 0;
+		if (FifoI64Count(audio.output[zamp.stream_id].data) < AC97_BDL_BUF_SIZE &&
+			zamp.media.pcm_data && !zamp.media.paused && !zamp.media.stopped)
+		{
+			while (zamp.media.seek_frame + zamp.media.fifo_frame < zamp.media.pcm_frames &&
+				   i < AC97_BDL_BUF_SIZE)
+			{
+				FifoI64Ins(audio.output[zamp.stream_id].data,
+						   zamp.media.pcm_data[zamp.media.seek_frame + zamp.media.fifo_frame]);
+				zamp.media.fifo_frame++;
+				i++;
+			}
+		}
+		Sleep(1);
+	}
+}
+
+U0 ZAMediaSet(U32 *pcm, I64 frames, I64 channels, I64 src_khz, U8 *title)
+{
+	U8 buf[300];
+
+	zamp.media.stopped = TRUE; //Park the feed task before swapping buffers.
+	Sleep(5);
+	Free(zamp.media.pcm_data);
+	zamp.media.pcm_data		= pcm;
+	zamp.media.pcm_frames	= frames;
+	zamp.media.channels		= channels;
+	zamp.media.sample_rate_khz = src_khz;
+	zamp.media.runtime_mins	= frames / ZA_RATE / 60;
+	zamp.media.runtime_secs	= frames / ZA_RATE % 60;
+	StrCopy(zamp.media.title, title);
+	StrPrint(buf, "1. %s (%02d:%02d) *** ", title, zamp.media.runtime_mins, zamp.media.runtime_secs);
+	ZAMarqueeSet(buf);
+	ZASeekTo(0);
+	zamp.media.stopped = FALSE;
+	zamp.media.paused = FALSE;
+}
+
+U0 ZAPcmSet(I16 *s, I64 in_frames, I64 channels, I64 rate, U8 *title)
+{//Shared tail for WAV + MP3: nearest-sample resample to 48kHz, widen mono,
+//pack into U32 (L16|R16) frames and hand to the player.
+	I64	 out_frames = in_frames * ZA_RATE / rate, i, src;
+	U32	*pcm = MAlloc(out_frames * sizeof(U32));
+
+	for (i = 0; i < out_frames; i++)
+	{
+		src = i * rate / ZA_RATE;
+		if (channels == 1)
+		{
+			pcm[i].i16[0] = s[src];
+			pcm[i].i16[1] = s[src];
+		}
+		else
+		{
+			pcm[i].i16[0] = s[src * channels];
+			pcm[i].i16[1] = s[src * channels + 1];
+		}
+	}
+	ZAMediaSet(pcm, out_frames, channels, rate / 1000, title);
+}
+
+Bool ZAWavLoad(U8 *filename)
+{//16-bit PCM WAV -> 48kHz stereo U32 frames. Mono widened, rate resampled.
+	U8	*raw, *p, *end, *data = NULL;
+	I64	 size, chunk_size, data_size = 0;
+	I64	 channels = 0, rate = 0, bits = 0, in_frames, out_frames, i, src;
+	I16	*s;
+	U32	*pcm;
+	U8	 title[256];
+
+	raw = FileRead(filename, &size);
+	if (!raw)
+		return FALSE;
+	if (size < 44 || MemCompare(raw, "RIFF", 4) || MemCompare(raw + 8, "WAVE", 4))
+	{
+		Free(raw);
+		PopUpOk("Not a RIFF/WAVE file.");
+		return FALSE;
+	}
+	p = raw + 12;
+	end = raw + size;
+	while (p + 8 <= end)
+	{//Chunk walk.
+		chunk_size = *(p + 4)(U32 *);
+		if (chunk_size < 0 || p + 8 + chunk_size > end)
+			break;
+		if (!MemCompare(p, "fmt ", 4))
+		{
+			if (*(p + 8)(U16 *) != 1)
+			{
+				Free(raw);
+				PopUpOk("Compressed WAV unsupported; 16-bit PCM only.");
+				return FALSE;
+			}
+			channels = *(p + 10)(U16 *);
+			rate	 = *(p + 12)(U32 *);
+			bits	 = *(p + 22)(U16 *);
+		}
+		else if (!MemCompare(p, "data", 4))
+		{
+			data = p + 8;
+			data_size = chunk_size;
+		}
+		p += 8 + chunk_size + (chunk_size & 1);
+	}
+	if (!data || !channels || !rate || bits != 16)
+	{
+		Free(raw);
+		PopUpOk("Need 16-bit PCM WAV with fmt+data chunks.");
+		return FALSE;
+	}
+
+	s = data;
+	in_frames = data_size / (2 * channels);
+	StrCopy(title, filename);
+	ZAPcmSet(s, in_frames, channels, rate, title);
+	Free(raw);
+
+	return TRUE;
+}
+
+Bool ZAMp3Load(U8 *filename)
+{//Native MPEG-1 Layer III decode (MP3.ZC), then into the 48kHz pipeline.
+	U8	*raw;
+	I16	*s16;
+	I64	 size, frames, rate, channels;
+
+	raw = FileRead(filename, &size);
+	if (!raw)
+		return FALSE;
+	ZAMarqueeSet("DECODING MP3 - PURE ZEALC, NO ELF - PLEASE WAIT *** ");
+	s16 = MP3Decode(raw, size, &frames, &rate, &channels);
+	Free(raw);
+	if (!s16)
+	{
+		PopUpOk("MP3 decode failed (MPEG-1 Layer III only).");
+		ZAMarqueeSet("MP3 DECODE FAILED *** ");
+		return FALSE;
+	}
+	ZAPcmSet(s16, frames, channels, rate, filename);
+	Free(s16);
+
+	return TRUE;
+}
+
+Bool ZAOpenFile(U8 *filename)
+{//Dispatch on extension: .MP3 -> native decoder, everything else -> WAV.
+	I64 len = StrLen(filename);
+	U8	c1, c2, c3;
+
+	if (len > 4 && filename[len - 4] == '.')
+	{
+		c1 = filename[len - 3];
+		c2 = filename[len - 2];
+		c3 = filename[len - 1];
+		if ('a' <= c1 <= 'z') c1 -= 32;
+		if ('a' <= c2 <= 'z') c2 -= 32;
+		if ('a' <= c3 <= 'z') c3 -= 32;
+		if (c1 == 'M' && c2 == 'P' && c3 == '3')
+			return ZAMp3Load(filename);
+	}
+	return ZAWavLoad(filename);
+}
+
+F64 za_tone_freqs[4] = {261.63, 329.63, 392.0, 523.25}; //C E G C - global: no local array initializers in HolyC.
+
+U0 ZAToneLoad()
+{//Built-in test tone: little arpeggio loop, so audio is testable with zero
+//assets on disk.
+	I64	 frames = ZA_RATE * 4, i, note;
+	U32	*pcm = MAlloc(frames * sizeof(U32));
+	F64	 t, v;
+
+	for (i = 0; i < frames; i++)
+	{
+		note = i * 8 / frames % 4;
+		t = i(F64) / ZA_RATE;
+		v = 12000.0 * Sin(2 * pi * za_tone_freqs[note] * t);
+		pcm[i].i16[0] = ToI64(v);
+		pcm[i].i16[1] = ToI64(v);
+	}
+	ZAMediaSet(pcm, frames, 2, 48, "y4mOS TEST TONE");
+}
+
+public U0 ZealAmp()
+{
+	U8 *res;
+	I64 msg, a1, a2;
+
+	MemSet(&zamp, 0, sizeof(CZAmp));
+	zamp.win_task = Fs;
+	if (!FileFind("~/Music") && DriveIsWritable)
+		DirMake("~/Music");
+	SettingsPush;
+	StrCopy(Fs->task_title, "ZealAmp");
+	Fs->win_width = 35;
+	WinHorz(TEXT_COLS / 2 - 17, TEXT_COLS / 2 + 17);
+	Fs->win_height = 15;
+	WinVert(TEXT_ROWS / 2 - 7, TEXT_ROWS / 2 + 7);
+	WinFocus;
+	DocCursor(OFF);
+	DocClear;
+
+	zamp.images = CAlloc(sizeof(CDC *) * 8);
+	ZA_IMG_MAIN		= PNGRead("::/Apps/ZealAmp/Images/MAIN.PNG");
+	ZA_IMG_CBUTTONS	= PNGRead("::/Apps/ZealAmp/Images/CBUTTONS.PNG");
+	ZA_IMG_TEXT		= PNGRead("::/Apps/ZealAmp/Images/TEXT.PNG");
+	ZA_IMG_NUMBERS	= PNGRead("::/Apps/ZealAmp/Images/NUMBERS.PNG");
+	ZA_IMG_PLAYPAUS	= PNGRead("::/Apps/ZealAmp/Images/PLAYPAUS.PNG");
+	ZA_IMG_MONOSTER	= PNGRead("::/Apps/ZealAmp/Images/MONOSTER.PNG");
+	ZA_IMG_POSBAR	= PNGRead("::/Apps/ZealAmp/Images/POSBAR.PNG");
+	if (!ZA_IMG_MAIN)
+	{
+		"ZealAmp: skin PNGs not found under ::/Apps/ZealAmp/Images/.\n";
+		SettingsPop;
+		return;
+	}
+	ZADrawControlsIdle(ZA_IMG_MAIN, 19, 90);
+
+	ZAMarqueeSet("ZealAmp on y4mOS - truecolor, native MP3+WAV, no ELF *** EJECT loads a song, T = test tone *** ");
+	zamp.media.stopped = TRUE;
+	zamp.stream_id = AudioAvailableOutputStreamGet;
+	if (zamp.stream_id < 0)
+		zamp.stream_id = 0;
+	if (!ac97.present)
+		ZAMarqueeSet("No AC97 device - UI demo mode. Add -device AC97,audiodev=snd0 to QEMU *** ");
+
+	Fs->draw_it = &ZADrawPlayer;
+	zamp.feed_task = Spawn(&ZAFeedTask, , "ZealAmp Feed", 1);
+
+	while (!zamp.quit)
+	{
+		switch (Fs->user_data)
+		{
+			case ZA_ACTION_PICK_FILE:
+				Fs->user_data = ZA_ACTION_NULL;
+				res = PopUpPickFile("~/Music");
+				WinFocus;
+				if (res)
+				{
+					if (*res)
+						ZAOpenFile(res);
+					Free(res);
+				}
+				break;
+		}
+		while (msg = MessageScan(&a1, &a2))
+			if (msg == MESSAGE_KEY_DOWN)
+			{
+				if (a1 == CH_ESC || a1 == CH_SHIFT_ESC)
+					zamp.quit = TRUE;
+				else if (a1 == 't' || a1 == 'T')
+					ZAToneLoad; //Instant audio test.
+			}
+		Sleep(30);
+	}
+
+	//Teardown.
+	Fs->draw_it = NULL;
+	Kill(zamp.feed_task);
+	zamp.media.stopped = TRUE;
+	FifoI64Flush(audio.output[zamp.stream_id].data);
+	Free(zamp.media.pcm_data);
+	for (a1 = 0; a1 < 7; a1++)
+		if (zamp.images[a1])
+			DCDel(zamp.images[a1]);
+	Free(zamp.images);
+	DocCursor(ON);
+	DocClear;
+	SettingsPop;
+}

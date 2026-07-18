@@ -5,6 +5,8 @@ Cd(__DIR__);;
 #include "Widgets"
 #include "Settings"
 #include "Viewer"
+#include "Calc"
+#include "Calendar"
 
 Cd("..");;
 

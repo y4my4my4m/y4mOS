@@ -1,0 +1,5 @@
+Cd(__DIR__);;
+#include "MP3Tables"
+#include "MP3"
+#include "ZealAmp"
+ZealAmp;

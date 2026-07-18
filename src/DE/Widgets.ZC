@@ -18,6 +18,7 @@
 #define DEWT_BUTTON	2
 #define DEWT_CHECK	3
 #define DEWT_SLIDER	4
+#define DEWT_INPUT	5
 
 #define DE_WIDGET_TEXT_LEN	48
 
@@ -39,6 +40,7 @@ class CDEWinCtx
 	CTask		*task;
 	CDEWidget	*head, *tail;
 	CDEWidget	*grab;			//Slider being dragged.
+	CDEWidget	*focus;			//Text input receiving keys.
 	I64			 old_inhibit;
 };
 
@@ -106,6 +108,17 @@ CDEWidget *DESlider(CDEWinCtx *ctx, I64 x, I64 y, I64 w, U8 *text,
 	wg->hi = hi;
 	wg->val = ClampI64(val, lo, hi);
 	wg->on_change = on_change;
+	return wg;
+}
+
+CDEWidget *DEInput(CDEWinCtx *ctx, I64 x, I64 y, I64 w, U8 *default_text,
+				   U0 (*on_submit)(CDEWidget *wg))
+{//Single-line text input. Click to focus, type, <ENTER> fires on_submit.
+//wg->val doubles as the text length.
+	CDEWidget *wg = DEWidgetAdd(ctx, DEWT_INPUT, x, y, w, 18, default_text);
+
+	wg->val = StrLen(wg->text);
+	wg->on_click = on_submit;
 	return wg;
 }
 
@@ -186,6 +199,26 @@ U0 DEWidgetsDrawIt(CTask *task, CDC *dc)
 						dc->color = de_theme.text_dim;
 					GrPrint(dc, wg->x + 20, wg->y + 3, "%s", wg->text);
 					break;
+				case DEWT_INPUT:
+					dc->color = de_theme.win_bg;
+					GrRect(dc, wg->x, wg->y, wg->w, wg->h);
+					if (ctx->focus == wg)
+						dc->color = de_theme.accent;
+					else if (hot)
+						dc->color = de_theme.panel_edge;
+					else
+						dc->color = de_theme.bttn;
+					GrRect(dc, wg->x, wg->y, wg->w, 1);
+					GrRect(dc, wg->x, wg->y + wg->h - 1, wg->w, 1);
+					GrRect(dc, wg->x, wg->y, 1, wg->h);
+					GrRect(dc, wg->x + wg->w - 1, wg->y, 1, wg->h);
+					dc->color = de_theme.text;
+					if (ctx->focus == wg && Blink)
+						StrPrint(buf, "%s_", wg->text);
+					else
+						StrPrint(buf, "%s", wg->text);
+					GrPrint(dc, wg->x + 5, wg->y + (wg->h - FONT_HEIGHT) / 2, "%s", buf);
+					break;
 				case DEWT_SLIDER:
 					StrPrint(buf, "%s: %d", wg->text, wg->val);
 					dc->color = de_theme.text_dim;
@@ -245,12 +278,14 @@ Bool DEWinPoll(CDEWinCtx *ctx)
 		switch (m)
 		{
 			case MESSAGE_MS_L_DOWN:
+				ctx->focus = NULL; //Click anywhere unfocuses text inputs.
 				wg = ctx->head;
 				while (wg)
 				{//Only interactive types take hits - panels/labels under the
 				//click must not swallow it.
 					if (wg->visible &&
-						(wg->type == DEWT_BUTTON || wg->type == DEWT_CHECK || wg->type == DEWT_SLIDER) &&
+						(wg->type == DEWT_BUTTON || wg->type == DEWT_CHECK ||
+						 wg->type == DEWT_SLIDER || wg->type == DEWT_INPUT) &&
 						wg->x <= a1 < wg->x + wg->w && wg->y <= a2 < wg->y + wg->h)
 					{
 						switch (wg->type)
@@ -269,6 +304,9 @@ Bool DEWinPoll(CDEWinCtx *ctx)
 								ctx->grab = wg;
 								DESliderTrack(ctx, a1);
 								break;
+							case DEWT_INPUT:
+								ctx->focus = wg;
+								break;
 						}
 						break;
 					}
@@ -286,6 +324,26 @@ Bool DEWinPoll(CDEWinCtx *ctx)
 			case MESSAGE_KEY_DOWN:
 				if (a1 == CH_ESC || a1 == CH_SHIFT_ESC)
 					alive = FALSE;
+				else if (ctx->focus)
+				{//Route typing into the focused text input.
+					wg = ctx->focus;
+					if (a1 == CH_BACKSPACE)
+					{
+						if (wg->val > 0)
+							wg->text[--wg->val] = 0;
+					}
+					else if (a1 == '\n')
+					{
+						ctx->focus = NULL;
+						if (wg->on_click)
+							(*wg->on_click)(wg); //Submit.
+					}
+					else if (' ' <= a1 < 0x7F && wg->val < DE_WIDGET_TEXT_LEN - 2)
+					{
+						wg->text[wg->val++] = a1;
+						wg->text[wg->val] = 0;
+					}
+				}
 				break;
 		}
 	}

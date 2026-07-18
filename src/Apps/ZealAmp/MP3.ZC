@@ -1,0 +1,1211 @@
+//y4mOS native MP3 decoder - MPEG-1 Layer III, pure ZealC. No ELF, no FFI.
+//Hand-ported from PDMP3 (public domain, Krister Lagerstrom / Erik Hofman /
+//technosaurus); tables in MP3Tables.ZC are machine-extracted from the same.
+//F64 math throughout; trig/window tables computed at first use.
+//
+//Entry point: MP3Decode(buf,size,&frames,&rate,&channels) -> MAlloced I16
+//buffer of interleaved samples (nch=2: L,R,L,R...). NULL on failure.
+//
+//Fixed vs upstream: intensity-short used '=' where it meant '*' and integer
+//ratios; corrected to match the long-block path.
+
+#define MP3_OK			 0
+#define MP3_ERR			-1
+#define MP3_NEED_MORE	-10
+
+#define MP3_EOF			0xFFFFFFFF
+#define MP3_INBUF_SIZE	16384
+
+#define MP3_LN2			0.6931471805599453
+#define MP3_INV_SQRT_2	0.7071067811865475
+
+//--- Bitstream / frame state (single decoder instance) ----------------------
+U8	mp3_in[MP3_INBUF_SIZE];
+I64	mp3_istart, mp3_iend, mp3_processed;
+
+//Frame header.
+I64	mp3_h_id, mp3_h_layer, mp3_h_protection_bit, mp3_h_bitrate_index,
+	mp3_h_sampling_frequency, mp3_h_padding_bit, mp3_h_mode, mp3_h_mode_extension;
+
+//Side info. [2][2] = [granule][channel].
+I64	mp3_si_main_data_begin;
+I64	mp3_si_scfsi[2][4];
+I64	mp3_si_part2_3_length[2][2], mp3_si_big_values[2][2], mp3_si_global_gain[2][2],
+	mp3_si_scalefac_compress[2][2], mp3_si_win_switch_flag[2][2],
+	mp3_si_block_type[2][2], mp3_si_mixed_block_flag[2][2],
+	mp3_si_table_select[4][3], mp3_si_subblock_gain[4][3], //[gr*2+ch][x]
+	mp3_si_region0_count[2][2], mp3_si_region1_count[2][2],
+	mp3_si_preflag[2][2], mp3_si_scalefac_scale[2][2],
+	mp3_si_count1table_select[2][2], mp3_si_count1[2][2];
+
+//Main data.
+I64	mp3_md_scalefac_l[4][21];   //[gr*2+ch][sfb]
+I64	mp3_md_scalefac_s[4][36]; //[gr*2+ch][sfb*3+win]
+F64	mp3_md_is[4][576];       //[gr*2+ch][i]
+
+U32	mp3_out[2][576];
+
+//Bit reservoirs (one BYTE per entry, like upstream).
+U8	mp3_main_data_vec[2 * 1024 + 8];
+I64	mp3_main_data_idx, mp3_main_data_bit, mp3_main_data_top;
+U8	mp3_side_vec[36 + 4];
+I64	mp3_side_idx, mp3_side_bit;
+
+//DSP statics.
+F64	mp3_pow43tab[8207];
+F64	mp3_imdct_win[4][36];
+F64	mp3_store[64][18];       //[ch*32+sb][i]
+F64	mp3_v_vec[2][1024];
+F64	mp3_synth_nwin[64][32];
+Bool	mp3_tabs_init, mp3_hsynth_reset, mp3_synth_reset;
+
+F64 MP3Pow2(F64 x)
+{
+	return Exp(x * MP3_LN2);
+}
+
+U0 MP3TabsInit()
+{
+	I64 i, j;
+
+	if (mp3_tabs_init)
+		return;
+	for (i = 1; i < 8207; i++)
+		mp3_pow43tab[i] = Exp(4.0 / 3.0 * Ln(i));
+	mp3_pow43tab[0] = 0;
+
+	for (i = 0;  i < 36; i++) mp3_imdct_win[0][i] = Sin(pi / 36 * (i + 0.5));
+	for (i = 0;  i < 18; i++) mp3_imdct_win[1][i] = Sin(pi / 36 * (i + 0.5));
+	for (i = 18; i < 24; i++) mp3_imdct_win[1][i] = 1.0;
+	for (i = 24; i < 30; i++) mp3_imdct_win[1][i] = Sin(pi / 12 * (i + 0.5 - 18.0));
+	for (i = 30; i < 36; i++) mp3_imdct_win[1][i] = 0.0;
+	for (i = 0;  i < 12; i++) mp3_imdct_win[2][i] = Sin(pi / 12 * (i + 0.5));
+	for (i = 12; i < 36; i++) mp3_imdct_win[2][i] = 0.0;
+	for (i = 0;  i < 6;  i++) mp3_imdct_win[3][i] = 0.0;
+	for (i = 6;  i < 12; i++) mp3_imdct_win[3][i] = Sin(pi / 12 * (i + 0.5 - 6.0));
+	for (i = 12; i < 18; i++) mp3_imdct_win[3][i] = 1.0;
+	for (i = 18; i < 36; i++) mp3_imdct_win[3][i] = Sin(pi / 36 * (i + 0.5));
+
+	for (i = 0; i < 64; i++)
+		for (j = 0; j < 32; j++)
+			mp3_synth_nwin[i][j] = Cos((16 + i)(F64) * (2 * j + 1) * (pi / 64.0));
+
+	mp3_tabs_init = TRUE;
+}
+
+F64 MP3Pow43(I64 is_pos)
+{
+	if (is_pos > 8206)
+		is_pos = 8206;
+	return mp3_pow43tab[is_pos];
+}
+
+//--- Input ring buffer -------------------------------------------------------
+I64 MP3InbufFilled()
+{
+	if (mp3_istart <= mp3_iend)
+		return mp3_iend - mp3_istart;
+	return MP3_INBUF_SIZE - mp3_istart + mp3_iend;
+}
+
+I64 MP3InbufFree()
+{
+	if (mp3_iend < mp3_istart)
+		return mp3_istart - mp3_iend;
+	return MP3_INBUF_SIZE - mp3_iend + mp3_istart;
+}
+
+I64 MP3GetByte()
+{
+	I64 val = MP3_EOF;
+
+	if (mp3_istart != mp3_iend)
+	{
+		val = mp3_in[mp3_istart++];
+		if (mp3_istart == MP3_INBUF_SIZE)
+			mp3_istart = 0;
+		mp3_processed++;
+	}
+	return val;
+}
+
+I64 MP3GetBytes(I64 no_of_bytes, U8 *vec)
+{
+	I64 i, val;
+
+	for (i = 0; i < no_of_bytes; i++)
+	{
+		val = MP3GetByte;
+		if (val == MP3_EOF)
+			return MP3_EOF;
+		vec[i] = val;
+	}
+	return MP3_OK;
+}
+
+I64 MP3Feed(U8 *in, I64 size)
+{
+	I64 res, free = MP3InbufFree;
+
+	if (size > free)
+		return MP3_ERR;
+	if (mp3_iend < mp3_istart)
+	{
+		res = mp3_istart - mp3_iend;
+		if (size < res)
+			res = size;
+		MemCopy(&mp3_in[mp3_iend], in, res);
+		mp3_iend += res;
+	}
+	else
+	{
+		res = MP3_INBUF_SIZE - mp3_iend;
+		if (size < res)
+			res = size;
+		if (res)
+		{
+			MemCopy(&mp3_in[mp3_iend], in, res);
+			mp3_iend += res;
+			size -= res;
+		}
+		if (size)
+		{
+			MemCopy(mp3_in, &in[res], size);
+			mp3_iend = size;
+		}
+	}
+	return MP3_OK;
+}
+
+//--- Bit readers -------------------------------------------------------------
+I64 MP3GetMainBit()
+{
+	I64 tmp = mp3_main_data_vec[mp3_main_data_idx] >> (7 - mp3_main_data_bit) & 1;
+
+	mp3_main_data_idx += (mp3_main_data_bit + 1) >> 3;
+	mp3_main_data_bit = (mp3_main_data_bit + 1) & 7;
+	return tmp;
+}
+
+I64 MP3GetMainBits(I64 n)
+{
+	I64 tmp;
+
+	if (!n)
+		return 0;
+	tmp = mp3_main_data_vec[mp3_main_data_idx] << 24 |
+		  mp3_main_data_vec[mp3_main_data_idx + 1] << 16 |
+		  mp3_main_data_vec[mp3_main_data_idx + 2] << 8 |
+		  mp3_main_data_vec[mp3_main_data_idx + 3];
+	tmp = tmp << mp3_main_data_bit & 0xFFFFFFFF; //32-bit semantics like C.
+	tmp = tmp >> (32 - n);
+	mp3_main_data_idx += (mp3_main_data_bit + n) >> 3;
+	mp3_main_data_bit = (mp3_main_data_bit + n) & 7;
+	return tmp;
+}
+
+I64 MP3GetMainPos()
+{
+	return mp3_main_data_idx * 8 + mp3_main_data_bit;
+}
+
+U0 MP3SetMainPos(I64 bit_pos)
+{
+	mp3_main_data_idx = bit_pos >> 3;
+	mp3_main_data_bit = bit_pos & 7;
+}
+
+I64 MP3GetSideBits(I64 n)
+{
+	I64 tmp;
+
+	tmp = mp3_side_vec[mp3_side_idx] << 24 | mp3_side_vec[mp3_side_idx + 1] << 16 |
+		  mp3_side_vec[mp3_side_idx + 2] << 8 | mp3_side_vec[mp3_side_idx + 3];
+	tmp = tmp << mp3_side_bit & 0xFFFFFFFF;
+	tmp = tmp >> (32 - n);
+	mp3_side_idx += (mp3_side_bit + n) >> 3;
+	mp3_side_bit = (mp3_side_bit + n) & 7;
+	return tmp;
+}
+
+//--- Header / side info / main data ------------------------------------------
+I64 MP3ReadHeader()
+{
+	I64 b1, b2, b3, b4, header;
+
+	b1 = MP3GetByte;
+	b2 = MP3GetByte;
+	b3 = MP3GetByte;
+	b4 = MP3GetByte;
+	if (b1 == MP3_EOF || b2 == MP3_EOF || b3 == MP3_EOF || b4 == MP3_EOF)
+		return MP3_ERR;
+	header = b1 << 24 | b2 << 16 | b3 << 8 | b4;
+	while (header & 0xFFF00000 != 0xFFF00000)
+	{
+		b1 = b2;
+		b2 = b3;
+		b3 = b4;
+		b4 = MP3GetByte;
+		if (b4 == MP3_EOF)
+			return MP3_ERR;
+		header = b1 << 24 | b2 << 16 | b3 << 8 | b4;
+	}
+	mp3_h_id				 = header >> 19 & 1;
+	mp3_h_layer				 = header >> 17 & 3;
+	mp3_h_protection_bit	 = header >> 16 & 1;
+	mp3_h_bitrate_index		 = header >> 12 & 0xF;
+	mp3_h_sampling_frequency = header >> 10 & 3;
+	mp3_h_padding_bit		 = header >> 9 & 1;
+	mp3_h_mode				 = header >> 6 & 3;
+	mp3_h_mode_extension	 = header >> 4 & 3;
+	if (mp3_h_id != 1)
+		return MP3_ERR;
+	if (mp3_h_bitrate_index == 0 || mp3_h_bitrate_index == 15)
+		return MP3_ERR;
+	if (mp3_h_sampling_frequency == 3)
+		return MP3_ERR;
+	if (mp3_h_layer == 0)
+		return MP3_ERR;
+	mp3_h_layer = 4 - mp3_h_layer; //Now 3 == Layer III.
+	return MP3_OK;
+}
+
+I64 MP3SearchHeader()
+{
+	I64 pos = mp3_processed, mark = mp3_istart, res = MP3_NEED_MORE, cnt = 0;
+
+	while (MP3InbufFilled > 4)
+	{
+		res = MP3ReadHeader;
+		if (mp3_h_layer == 3 && res == MP3_OK)
+			break;
+		mark++;
+		if (mark == MP3_INBUF_SIZE)
+			mark = 0;
+		mp3_istart = mark;
+		mp3_processed = pos;
+		cnt++;
+		if (cnt > 2 * 576)
+			return MP3_ERR;
+	}
+	return res;
+}
+
+I64 MP3FrameSize()
+{
+	return 144 * mp3_bitrates[mp3_h_bitrate_index] /
+		   mp3_srates[mp3_h_sampling_frequency] + mp3_h_padding_bit;
+}
+
+U0 MP3GetSideinfo(I64 sideinfo_size)
+{
+	if (MP3GetBytes(sideinfo_size, mp3_side_vec) != MP3_OK)
+		return;
+	mp3_side_idx = 0;
+	mp3_side_bit = 0;
+}
+
+I64 MP3ReadAudioL3()
+{
+	I64 framesize, sideinfo_size, nch, ch, gr, scfsi_band, region, window;
+
+	if (mp3_h_mode == 3) //Single channel.
+		nch = 1;
+	else
+		nch = 2;
+	framesize = MP3FrameSize;
+	if (framesize > 2000)
+		return MP3_ERR;
+	if (nch == 1)
+		sideinfo_size = 17;
+	else
+		sideinfo_size = 32;
+
+	MP3GetSideinfo(sideinfo_size);
+
+	mp3_si_main_data_begin = MP3GetSideBits(9);
+	if (mp3_h_mode == 3)
+		MP3GetSideBits(5); //Private bits.
+	else
+		MP3GetSideBits(3);
+	for (ch = 0; ch < nch; ch++)
+		for (scfsi_band = 0; scfsi_band < 4; scfsi_band++)
+			mp3_si_scfsi[ch][scfsi_band] = MP3GetSideBits(1);
+	for (gr = 0; gr < 2; gr++)
+	{
+		for (ch = 0; ch < nch; ch++)
+		{
+			mp3_si_part2_3_length[gr][ch]	 = MP3GetSideBits(12);
+			mp3_si_big_values[gr][ch]		 = MP3GetSideBits(9);
+			mp3_si_global_gain[gr][ch]		 = MP3GetSideBits(8);
+			mp3_si_scalefac_compress[gr][ch] = MP3GetSideBits(4);
+			mp3_si_win_switch_flag[gr][ch]	 = MP3GetSideBits(1);
+			if (mp3_si_win_switch_flag[gr][ch] == 1)
+			{
+				mp3_si_block_type[gr][ch]		= MP3GetSideBits(2);
+				mp3_si_mixed_block_flag[gr][ch]	= MP3GetSideBits(1);
+				for (region = 0; region < 2; region++)
+					mp3_si_table_select[gr * 2 + ch][region] = MP3GetSideBits(5);
+				for (window = 0; window < 3; window++)
+					mp3_si_subblock_gain[gr * 2 + ch][window] = MP3GetSideBits(3);
+				if (mp3_si_block_type[gr][ch] == 2 && mp3_si_mixed_block_flag[gr][ch] == 0)
+					mp3_si_region0_count[gr][ch] = 8;
+				else
+					mp3_si_region0_count[gr][ch] = 7;
+				mp3_si_region1_count[gr][ch] = 20 - mp3_si_region0_count[gr][ch];
+			}
+			else
+			{
+				for (region = 0; region < 3; region++)
+					mp3_si_table_select[gr * 2 + ch][region] = MP3GetSideBits(5);
+				mp3_si_region0_count[gr][ch] = MP3GetSideBits(4);
+				mp3_si_region1_count[gr][ch] = MP3GetSideBits(3);
+				mp3_si_block_type[gr][ch] = 0;
+			}
+			mp3_si_preflag[gr][ch]			  = MP3GetSideBits(1);
+			mp3_si_scalefac_scale[gr][ch]	  = MP3GetSideBits(1);
+			mp3_si_count1table_select[gr][ch] = MP3GetSideBits(1);
+		}
+	}
+	return MP3_OK;
+}
+
+I64 MP3GetMainData(I64 main_data_size, I64 main_data_begin)
+{
+	I64 i;
+
+	if (main_data_begin > mp3_main_data_top)
+	{//Not enough data from previous frames: stash and skip this frame.
+		MP3GetBytes(main_data_size, &mp3_main_data_vec[mp3_main_data_top]);
+		mp3_main_data_idx = 0;
+		mp3_main_data_bit = 0;
+		mp3_main_data_top += main_data_size;
+		return MP3_NEED_MORE;
+	}
+	for (i = 0; i < main_data_begin; i++)
+		mp3_main_data_vec[i] = mp3_main_data_vec[mp3_main_data_top - main_data_begin + i];
+	MP3GetBytes(main_data_size, &mp3_main_data_vec[main_data_begin]);
+	mp3_main_data_idx = 0;
+	mp3_main_data_bit = 0;
+	mp3_main_data_top = main_data_begin + main_data_size;
+	return MP3_OK;
+}
+
+//--- Huffman -----------------------------------------------------------------
+I64 MP3HuffmanDecode(I64 table_num, I64 *x, I64 *y, I64 *v, I64 *w)
+{
+	I64	 point = 0, error = 1, bitsleft = 32,
+		 treelen = mp3_huff_treelen[table_num],
+		 linbits = mp3_huff_linbits[table_num],
+		 off	 = mp3_huff_offset[table_num];
+
+	if (!treelen || off < 0)
+	{
+		*x = 0; *y = 0; *v = 0; *w = 0;
+		return MP3_OK;
+	}
+	do
+	{
+		if (mp3_huffman_table[off + point] & 0xFF00 == 0)
+		{
+			error = 0;
+			*x = mp3_huffman_table[off + point] >> 4 & 0xF;
+			*y = mp3_huffman_table[off + point] & 0xF;
+			break;
+		}
+		if (MP3GetMainBit)
+		{//Go right in tree.
+			while (mp3_huffman_table[off + point] & 0xFF >= 250)
+				point += mp3_huffman_table[off + point] & 0xFF;
+			point += mp3_huffman_table[off + point] & 0xFF;
+		}
+		else
+		{//Go left in tree.
+			while (mp3_huffman_table[off + point] >> 8 >= 250)
+				point += mp3_huffman_table[off + point] >> 8;
+			point += mp3_huffman_table[off + point] >> 8;
+		}
+		bitsleft--;
+	}
+	while (bitsleft > 0 && point < treelen);
+	if (error)
+	{
+		*x = 0;
+		*y = 0;
+	}
+	if (table_num > 31)
+	{//Quadruple tables: sign handling.
+		*v = *y >> 3 & 1;
+		*w = *y >> 2 & 1;
+		*x = *y >> 1 & 1;
+		*y = *y & 1;
+		if (*v > 0 && MP3GetMainBit == 1)
+			*v = -*v;
+		if (*w > 0 && MP3GetMainBit == 1)
+			*w = -*w;
+		if (*x > 0 && MP3GetMainBit == 1)
+			*x = -*x;
+		if (*y > 0 && MP3GetMainBit == 1)
+			*y = -*y;
+	}
+	else
+	{
+		if (linbits > 0 && *x == 15)
+			*x += MP3GetMainBits(linbits);
+		if (*x > 0 && MP3GetMainBit == 1)
+			*x = -*x;
+		if (linbits > 0 && *y == 15)
+			*y += MP3GetMainBits(linbits);
+		if (*y > 0 && MP3GetMainBit == 1)
+			*y = -*y;
+	}
+	if (error)
+		return MP3_ERR;
+	return MP3_OK;
+}
+
+U0 MP3ReadHuffman(I64 part_2_start, I64 gr, I64 ch)
+{
+	I64 x, y, v, w, table_num, is_pos, bit_pos_end, sfreq;
+	I64 region_1_start, region_2_start;
+
+	if (mp3_si_part2_3_length[gr][ch] == 0)
+	{
+		for (is_pos = 0; is_pos < 576; is_pos++)
+			mp3_md_is[gr * 2 + ch][is_pos] = 0.0;
+		return;
+	}
+	bit_pos_end = part_2_start + mp3_si_part2_3_length[gr][ch] - 1;
+	if (mp3_si_win_switch_flag[gr][ch] == 1 && mp3_si_block_type[gr][ch] == 2)
+	{
+		region_1_start = 36;
+		region_2_start = 576;
+	}
+	else
+	{
+		sfreq = mp3_h_sampling_frequency;
+		region_1_start = mp3_sf_l[sfreq * 23 + mp3_si_region0_count[gr][ch] + 1];
+		region_2_start = mp3_sf_l[sfreq * 23 + mp3_si_region0_count[gr][ch] +
+								  mp3_si_region1_count[gr][ch] + 2];
+	}
+	for (is_pos = 0; is_pos < mp3_si_big_values[gr][ch] * 2; is_pos++)
+	{
+		if (is_pos < region_1_start)
+			table_num = mp3_si_table_select[gr * 2 + ch][0];
+		else if (is_pos < region_2_start)
+			table_num = mp3_si_table_select[gr * 2 + ch][1];
+		else
+			table_num = mp3_si_table_select[gr * 2 + ch][2];
+		MP3HuffmanDecode(table_num, &x, &y, &v, &w);
+		mp3_md_is[gr * 2 + ch][is_pos++] = x;
+		mp3_md_is[gr * 2 + ch][is_pos] = y;
+	}
+	table_num = mp3_si_count1table_select[gr][ch] + 32;
+	is_pos = mp3_si_big_values[gr][ch] * 2;
+	while (is_pos <= 572 && MP3GetMainPos <= bit_pos_end)
+	{
+		MP3HuffmanDecode(table_num, &x, &y, &v, &w);
+		mp3_md_is[gr * 2 + ch][is_pos++] = v;
+		if (is_pos >= 576)
+			break;
+		mp3_md_is[gr * 2 + ch][is_pos++] = w;
+		if (is_pos >= 576)
+			break;
+		mp3_md_is[gr * 2 + ch][is_pos++] = x;
+		if (is_pos >= 576)
+			break;
+		mp3_md_is[gr * 2 + ch][is_pos++] = y;
+	}
+	if (MP3GetMainPos > bit_pos_end + 1)
+		is_pos -= 4;
+	mp3_si_count1[gr][ch] = is_pos;
+	while (is_pos < 576)
+		mp3_md_is[gr * 2 + ch][is_pos++] = 0.0;
+	MP3SetMainPos(bit_pos_end + 1);
+}
+
+I64 MP3ReadMainL3()
+{
+	I64 framesize, sideinfo_size, main_data_size, gr, ch, nch, sfb, win,
+		slen1, slen2, nbits, part_2_start, res;
+
+	if (mp3_h_mode == 3)
+		nch = 1;
+	else
+		nch = 2;
+	framesize = MP3FrameSize;
+	if (framesize > 2000)
+		return MP3_ERR;
+	if (nch == 1)
+		sideinfo_size = 17;
+	else
+		sideinfo_size = 32;
+	main_data_size = framesize - sideinfo_size - 4;
+	if (mp3_h_protection_bit == 0)
+		main_data_size -= 2;
+	res = MP3GetMainData(main_data_size, mp3_si_main_data_begin);
+	if (res != MP3_OK)
+		return res;
+	for (gr = 0; gr < 2; gr++)
+	{
+		for (ch = 0; ch < nch; ch++)
+		{
+			part_2_start = MP3GetMainPos;
+			slen1 = mp3_scalefac_sizes[mp3_si_scalefac_compress[gr][ch] * 2];
+			slen2 = mp3_scalefac_sizes[mp3_si_scalefac_compress[gr][ch] * 2 + 1];
+			if (mp3_si_win_switch_flag[gr][ch] != 0 && mp3_si_block_type[gr][ch] == 2)
+			{
+				if (mp3_si_mixed_block_flag[gr][ch] != 0)
+				{
+					for (sfb = 0; sfb < 8; sfb++)
+						mp3_md_scalefac_l[gr * 2 + ch][sfb] = MP3GetMainBits(slen1);
+					for (sfb = 3; sfb < 12; sfb++)
+					{
+						if (sfb < 6)
+							nbits = slen1;
+						else
+							nbits = slen2;
+						for (win = 0; win < 3; win++)
+							mp3_md_scalefac_s[gr * 2 + ch][sfb * 3 + win] = MP3GetMainBits(nbits);
+					}
+				}
+				else
+				{
+					for (sfb = 0; sfb < 12; sfb++)
+					{
+						if (sfb < 6)
+							nbits = slen1;
+						else
+							nbits = slen2;
+						for (win = 0; win < 3; win++)
+							mp3_md_scalefac_s[gr * 2 + ch][sfb * 3 + win] = MP3GetMainBits(nbits);
+					}
+				}
+			}
+			else
+			{//Long blocks, with scfsi sharing between granules.
+				if (mp3_si_scfsi[ch][0] == 0 || gr == 0)
+				{
+					for (sfb = 0; sfb < 6; sfb++)
+						mp3_md_scalefac_l[gr * 2 + ch][sfb] = MP3GetMainBits(slen1);
+				}
+				else if (mp3_si_scfsi[ch][0] == 1 && gr == 1)
+				{
+					for (sfb = 0; sfb < 6; sfb++)
+						mp3_md_scalefac_l[2 + ch][sfb] = mp3_md_scalefac_l[ch][sfb];
+				}
+				if (mp3_si_scfsi[ch][1] == 0 || gr == 0)
+				{
+					for (sfb = 6; sfb < 11; sfb++)
+						mp3_md_scalefac_l[gr * 2 + ch][sfb] = MP3GetMainBits(slen1);
+				}
+				else if (mp3_si_scfsi[ch][1] == 1 && gr == 1)
+				{
+					for (sfb = 6; sfb < 11; sfb++)
+						mp3_md_scalefac_l[2 + ch][sfb] = mp3_md_scalefac_l[ch][sfb];
+				}
+				if (mp3_si_scfsi[ch][2] == 0 || gr == 0)
+				{
+					for (sfb = 11; sfb < 16; sfb++)
+						mp3_md_scalefac_l[gr * 2 + ch][sfb] = MP3GetMainBits(slen2);
+				}
+				else if (mp3_si_scfsi[ch][2] == 1 && gr == 1)
+				{
+					for (sfb = 11; sfb < 16; sfb++)
+						mp3_md_scalefac_l[2 + ch][sfb] = mp3_md_scalefac_l[ch][sfb];
+				}
+				if (mp3_si_scfsi[ch][3] == 0 || gr == 0)
+				{
+					for (sfb = 16; sfb < 21; sfb++)
+						mp3_md_scalefac_l[gr * 2 + ch][sfb] = MP3GetMainBits(slen2);
+				}
+				else if (mp3_si_scfsi[ch][3] == 1 && gr == 1)
+				{
+					for (sfb = 16; sfb < 21; sfb++)
+						mp3_md_scalefac_l[2 + ch][sfb] = mp3_md_scalefac_l[ch][sfb];
+				}
+			}
+			MP3ReadHuffman(part_2_start, gr, ch);
+		}
+	}
+	return MP3_OK;
+}
+
+I64 MP3ReadFrame()
+{
+	if (MP3SearchHeader != MP3_OK)
+		return MP3_ERR;
+	if (mp3_h_protection_bit == 0)
+	{//Skip CRC.
+		if (MP3GetByte == MP3_EOF || MP3GetByte == MP3_EOF)
+			return MP3_ERR;
+	}
+	if (mp3_h_layer != 3)
+		return MP3_ERR;
+	if (MP3ReadAudioL3 != MP3_OK)
+		return MP3_ERR;
+	return MP3ReadMainL3;
+}
+
+//--- Requantize / reorder / stereo -------------------------------------------
+U0 MP3RequantizeLong(I64 gr, I64 ch, I64 is_pos, I64 sfb)
+{
+	F64 tmp1, tmp2, tmp3, sf_mult, pf_x_pt;
+
+	if (mp3_si_scalefac_scale[gr][ch])
+		sf_mult = 1.0;
+	else
+		sf_mult = 0.5;
+	pf_x_pt = mp3_si_preflag[gr][ch] * mp3_pretab[sfb];
+	tmp1 = MP3Pow2(-(sf_mult * (mp3_md_scalefac_l[gr * 2 + ch][sfb] + pf_x_pt)));
+	tmp2 = MP3Pow2(0.25 * (mp3_si_global_gain[gr][ch] - 210));
+	if (mp3_md_is[gr * 2 + ch][is_pos] < 0.0)
+		tmp3 = -MP3Pow43(ToI64(-mp3_md_is[gr * 2 + ch][is_pos]));
+	else
+		tmp3 = MP3Pow43(ToI64(mp3_md_is[gr * 2 + ch][is_pos]));
+	mp3_md_is[gr * 2 + ch][is_pos] = tmp1 * tmp2 * tmp3;
+}
+
+U0 MP3RequantizeShort(I64 gr, I64 ch, I64 is_pos, I64 sfb, I64 win)
+{
+	F64 tmp1, tmp2, tmp3, sf_mult;
+
+	if (mp3_si_scalefac_scale[gr][ch])
+		sf_mult = 1.0;
+	else
+		sf_mult = 0.5;
+	tmp1 = MP3Pow2(-(sf_mult * mp3_md_scalefac_s[gr * 2 + ch][sfb * 3 + win]));
+	tmp2 = MP3Pow2(0.25 * (mp3_si_global_gain[gr][ch] - 210.0 -
+						   8.0 * mp3_si_subblock_gain[gr * 2 + ch][win]));
+	if (mp3_md_is[gr * 2 + ch][is_pos] < 0.0)
+		tmp3 = -MP3Pow43(ToI64(-mp3_md_is[gr * 2 + ch][is_pos]));
+	else
+		tmp3 = MP3Pow43(ToI64(mp3_md_is[gr * 2 + ch][is_pos]));
+	mp3_md_is[gr * 2 + ch][is_pos] = tmp1 * tmp2 * tmp3;
+}
+
+U0 MP3Requantize(I64 gr, I64 ch)
+{
+	I64 sfb, next_sfb, sfreq = mp3_h_sampling_frequency, i, j, win, win_len;
+
+	if (mp3_si_win_switch_flag[gr][ch] == 1 && mp3_si_block_type[gr][ch] == 2)
+	{
+		if (mp3_si_mixed_block_flag[gr][ch] != 0)
+		{//Two long-block subbands first.
+			sfb = 0;
+			next_sfb = mp3_sf_l[sfreq * 23 + sfb + 1];
+			for (i = 0; i < 36; i++)
+			{
+				if (i == next_sfb)
+				{
+					sfb++;
+					next_sfb = mp3_sf_l[sfreq * 23 + sfb + 1];
+				}
+				MP3RequantizeLong(gr, ch, i, sfb);
+			}
+			sfb = 3;
+			next_sfb = mp3_sf_s[sfreq * 14 + sfb + 1] * 3;
+			win_len = mp3_sf_s[sfreq * 14 + sfb + 1] - mp3_sf_s[sfreq * 14 + sfb];
+			i = 36;
+			while (i < mp3_si_count1[gr][ch])
+			{
+				if (i == next_sfb)
+				{
+					sfb++;
+					next_sfb = mp3_sf_s[sfreq * 14 + sfb + 1] * 3;
+					win_len = mp3_sf_s[sfreq * 14 + sfb + 1] - mp3_sf_s[sfreq * 14 + sfb];
+				}
+				for (win = 0; win < 3; win++)
+					for (j = 0; j < win_len; j++)
+					{
+						MP3RequantizeShort(gr, ch, i, sfb, win);
+						i++;
+					}
+			}
+		}
+		else
+		{//Only short blocks.
+			sfb = 0;
+			next_sfb = mp3_sf_s[sfreq * 14 + sfb + 1] * 3;
+			win_len = mp3_sf_s[sfreq * 14 + sfb + 1] - mp3_sf_s[sfreq * 14 + sfb];
+			i = 0;
+			while (i < mp3_si_count1[gr][ch])
+			{
+				if (i == next_sfb)
+				{
+					sfb++;
+					next_sfb = mp3_sf_s[sfreq * 14 + sfb + 1] * 3;
+					win_len = mp3_sf_s[sfreq * 14 + sfb + 1] - mp3_sf_s[sfreq * 14 + sfb];
+				}
+				for (win = 0; win < 3; win++)
+					for (j = 0; j < win_len; j++)
+					{
+						MP3RequantizeShort(gr, ch, i, sfb, win);
+						i++;
+					}
+			}
+		}
+	}
+	else
+	{//Only long blocks.
+		sfb = 0;
+		next_sfb = mp3_sf_l[sfreq * 23 + sfb + 1];
+		for (i = 0; i < mp3_si_count1[gr][ch]; i++)
+		{
+			if (i == next_sfb)
+			{
+				sfb++;
+				next_sfb = mp3_sf_l[sfreq * 23 + sfb + 1];
+			}
+			MP3RequantizeLong(gr, ch, i, sfb);
+		}
+	}
+}
+
+U0 MP3Reorder(I64 gr, I64 ch)
+{
+	I64 sfreq = mp3_h_sampling_frequency, i, j, next_sfb, sfb, win_len, win;
+	F64 re[576];
+
+	if (!(mp3_si_win_switch_flag[gr][ch] == 1 && mp3_si_block_type[gr][ch] == 2))
+		return;
+	if (mp3_si_mixed_block_flag[gr][ch] != 0)
+		sfb = 3;
+	else
+		sfb = 0;
+	next_sfb = mp3_sf_s[sfreq * 14 + sfb + 1] * 3;
+	win_len = mp3_sf_s[sfreq * 14 + sfb + 1] - mp3_sf_s[sfreq * 14 + sfb];
+	if (sfb == 0)
+		i = 0;
+	else
+		i = 36;
+	while (i < 576)
+	{
+		if (i == next_sfb)
+		{
+			for (j = 0; j < 3 * win_len; j++)
+				mp3_md_is[gr * 2 + ch][3 * mp3_sf_s[sfreq * 14 + sfb] + j] = re[j];
+			if (i >= mp3_si_count1[gr][ch])
+				return;
+			sfb++;
+			next_sfb = mp3_sf_s[sfreq * 14 + sfb + 1] * 3;
+			win_len = mp3_sf_s[sfreq * 14 + sfb + 1] - mp3_sf_s[sfreq * 14 + sfb];
+		}
+		for (win = 0; win < 3; win++)
+			for (j = 0; j < win_len; j++)
+			{
+				re[j * 3 + win] = mp3_md_is[gr * 2 + ch][i];
+				i++;
+			}
+	}
+	for (j = 0; j < 3 * win_len; j++)
+		mp3_md_is[gr * 2 + ch][3 * mp3_sf_s[sfreq * 14 + 12] + j] = re[j];
+}
+
+U0 MP3IntensityLong(I64 gr, I64 sfb)
+{
+	I64 i, sfreq, sfb_start, sfb_stop, is_pos;
+	F64 is_ratio_l, is_ratio_r, left, right;
+
+	is_pos = mp3_md_scalefac_l[gr * 2][sfb];
+	if (is_pos == 7)
+		return;
+	sfreq = mp3_h_sampling_frequency;
+	sfb_start = mp3_sf_l[sfreq * 23 + sfb];
+	sfb_stop = mp3_sf_l[sfreq * 23 + sfb + 1];
+	if (is_pos == 6)
+	{
+		is_ratio_l = 1.0;
+		is_ratio_r = 0.0;
+	}
+	else
+	{
+		is_ratio_l = mp3_is_ratios[is_pos] / (1.0 + mp3_is_ratios[is_pos]);
+		is_ratio_r = 1.0 / (1.0 + mp3_is_ratios[is_pos]);
+	}
+	for (i = sfb_start; i < sfb_stop; i++)
+	{
+		left  = is_ratio_l * mp3_md_is[gr * 2][i];
+		right = is_ratio_r * mp3_md_is[gr * 2][i];
+		mp3_md_is[gr * 2][i] = left;
+		mp3_md_is[gr * 2 + 1][i] = right;
+	}
+}
+
+U0 MP3IntensityShort(I64 gr, I64 sfb)
+{
+	I64 sfb_start, sfb_stop, is_pos, i, sfreq, win, win_len;
+	F64 is_ratio_l, is_ratio_r, left, right;
+
+	sfreq = mp3_h_sampling_frequency;
+	win_len = mp3_sf_s[sfreq * 14 + sfb + 1] - mp3_sf_s[sfreq * 14 + sfb];
+	for (win = 0; win < 3; win++)
+	{
+		is_pos = mp3_md_scalefac_s[gr * 2][sfb * 3 + win];
+		if (is_pos != 7)
+		{
+			sfb_start = mp3_sf_s[sfreq * 14 + sfb] * 3 + win_len * win;
+			sfb_stop = sfb_start + win_len;
+			if (is_pos == 6)
+			{
+				is_ratio_l = 1.0;
+				is_ratio_r = 0.0;
+			}
+			else
+			{
+				is_ratio_l = mp3_is_ratios[is_pos] / (1.0 + mp3_is_ratios[is_pos]);
+				is_ratio_r = 1.0 / (1.0 + mp3_is_ratios[is_pos]);
+			}
+			for (i = sfb_start; i < sfb_stop; i++)
+			{//Upstream had '=' typos here; this mirrors the long-block math.
+				left  = is_ratio_l * mp3_md_is[gr * 2][i];
+				right = is_ratio_r * mp3_md_is[gr * 2][i];
+				mp3_md_is[gr * 2][i] = left;
+				mp3_md_is[gr * 2 + 1][i] = right;
+			}
+		}
+	}
+}
+
+U0 MP3Stereo(I64 gr)
+{
+	I64 max_pos, i, sfreq, sfb;
+	F64 left, right;
+
+	if (mp3_h_mode != 1 || mp3_h_mode_extension == 0)
+		return;
+	if (mp3_h_mode_extension & 2)
+	{//Middle/side stereo.
+		if (mp3_si_count1[gr][0] > mp3_si_count1[gr][1])
+			max_pos = mp3_si_count1[gr][0];
+		else
+			max_pos = mp3_si_count1[gr][1];
+		for (i = 0; i < max_pos; i++)
+		{
+			left  = (mp3_md_is[gr * 2][i] + mp3_md_is[gr * 2 + 1][i]) * MP3_INV_SQRT_2;
+			right = (mp3_md_is[gr * 2][i] - mp3_md_is[gr * 2 + 1][i]) * MP3_INV_SQRT_2;
+			mp3_md_is[gr * 2][i] = left;
+			mp3_md_is[gr * 2 + 1][i] = right;
+		}
+	}
+	if (mp3_h_mode_extension & 1)
+	{//Intensity stereo.
+		sfreq = mp3_h_sampling_frequency;
+		if (mp3_si_win_switch_flag[gr][0] == 1 && mp3_si_block_type[gr][0] == 2)
+		{
+			if (mp3_si_mixed_block_flag[gr][0] != 0)
+			{
+				for (sfb = 0; sfb < 8; sfb++)
+					if (mp3_sf_l[sfreq * 23 + sfb] >= mp3_si_count1[gr][1])
+						MP3IntensityLong(gr, sfb);
+				for (sfb = 3; sfb < 12; sfb++)
+					if (mp3_sf_s[sfreq * 14 + sfb] * 3 >= mp3_si_count1[gr][1])
+						MP3IntensityShort(gr, sfb);
+			}
+			else
+			{
+				for (sfb = 0; sfb < 12; sfb++)
+					if (mp3_sf_s[sfreq * 14 + sfb] * 3 >= mp3_si_count1[gr][1])
+						MP3IntensityShort(gr, sfb);
+			}
+		}
+		else
+		{
+			for (sfb = 0; sfb < 21; sfb++)
+				if (mp3_sf_l[sfreq * 23 + sfb] >= mp3_si_count1[gr][1])
+					MP3IntensityLong(gr, sfb);
+		}
+	}
+}
+
+//--- Synthesis ---------------------------------------------------------------
+U0 MP3Antialias(I64 gr, I64 ch)
+{
+	I64 sb, i, sblim, ui, li;
+	F64 ub, lb;
+
+	if (mp3_si_win_switch_flag[gr][ch] == 1 && mp3_si_block_type[gr][ch] == 2 &&
+		mp3_si_mixed_block_flag[gr][ch] == 0)
+		return;
+	if (mp3_si_win_switch_flag[gr][ch] == 1 && mp3_si_block_type[gr][ch] == 2 &&
+		mp3_si_mixed_block_flag[gr][ch] == 1)
+		sblim = 2;
+	else
+		sblim = 32;
+	for (sb = 1; sb < sblim; sb++)
+		for (i = 0; i < 8; i++)
+		{
+			li = 18 * sb - 1 - i;
+			ui = 18 * sb + i;
+			lb = mp3_md_is[gr * 2 + ch][li] * mp3_cs[i] - mp3_md_is[gr * 2 + ch][ui] * mp3_ca[i];
+			ub = mp3_md_is[gr * 2 + ch][ui] * mp3_cs[i] + mp3_md_is[gr * 2 + ch][li] * mp3_ca[i];
+			mp3_md_is[gr * 2 + ch][li] = lb;
+			mp3_md_is[gr * 2 + ch][ui] = ub;
+		}
+}
+
+U0 MP3IMDCTWin(F64 *in, F64 *out, I64 block_type)
+{
+	I64 i, m, n, p;
+	F64 sum, tin[18];
+
+	for (i = 0; i < 36; i++)
+		out[i] = 0.0;
+	for (i = 0; i < 18; i++)
+		tin[i] = in[i];
+	if (block_type == 2)
+	{//Three short blocks.
+		n = 12;
+		for (i = 0; i < 3; i++)
+			for (p = 0; p < n; p++)
+			{
+				sum = 0.0;
+				for (m = 0; m < n / 2; m++)
+					sum += tin[i + 3 * m] * Cos(pi / (2 * n) * (2 * p + 1 + n / 2) * (2 * m + 1));
+				out[6 * i + p + 6] += sum * mp3_imdct_win[block_type][p];
+			}
+	}
+	else
+	{
+		n = 36;
+		for (p = 0; p < n; p++)
+		{
+			sum = 0.0;
+			for (m = 0; m < n / 2; m++)
+				sum += in[m] * Cos(pi / (2 * n) * (2 * p + 1 + n / 2) * (2 * m + 1));
+			out[p] = sum * mp3_imdct_win[block_type][p];
+		}
+	}
+}
+
+U0 MP3HybridSynthesis(I64 gr, I64 ch)
+{
+	I64 sb, i, j, bt;
+	F64 rawout[36];
+
+	if (mp3_hsynth_reset)
+	{
+		for (j = 0; j < 2; j++)
+			for (sb = 0; sb < 32; sb++)
+				for (i = 0; i < 18; i++)
+					mp3_store[j * 32 + sb][i] = 0.0;
+		mp3_hsynth_reset = FALSE;
+	}
+	for (sb = 0; sb < 32; sb++)
+	{
+		if (mp3_si_win_switch_flag[gr][ch] == 1 &&
+			mp3_si_mixed_block_flag[gr][ch] == 1 && sb < 2)
+			bt = 0;
+		else
+			bt = mp3_si_block_type[gr][ch];
+		MP3IMDCTWin(&mp3_md_is[gr * 2 + ch][sb * 18], rawout, bt);
+		for (i = 0; i < 18; i++)
+		{
+			mp3_md_is[gr * 2 + ch][sb * 18 + i] = rawout[i] + mp3_store[ch * 32 + sb][i];
+			mp3_store[ch * 32 + sb][i] = rawout[i + 18];
+		}
+	}
+}
+
+U0 MP3FrequencyInversion(I64 gr, I64 ch)
+{
+	I64 sb, i;
+
+	for (sb = 1; sb < 32; sb += 2)
+		for (i = 1; i < 18; i += 2)
+			mp3_md_is[gr * 2 + ch][sb * 18 + i] = -mp3_md_is[gr * 2 + ch][sb * 18 + i];
+}
+
+U0 MP3SubbandSynthesis(I64 gr, I64 ch, U32 *outdata)
+{
+	F64 u_vec[512], s_vec[32], sum;
+	I64 samp, i, j, ss, nch;
+
+	if (mp3_h_mode == 3)
+		nch = 1;
+	else
+		nch = 2;
+	if (mp3_synth_reset)
+	{
+		for (i = 0; i < 2; i++)
+			for (j = 0; j < 1024; j++)
+				mp3_v_vec[i][j] = 0.0;
+		mp3_synth_reset = FALSE;
+	}
+	for (ss = 0; ss < 18; ss++)
+	{
+		for (i = 1023; i > 63; i--)
+			mp3_v_vec[ch][i] = mp3_v_vec[ch][i - 64];
+		for (i = 0; i < 32; i++)
+			s_vec[i] = mp3_md_is[gr * 2 + ch][i * 18 + ss];
+		for (i = 0; i < 64; i++)
+		{
+			sum = 0.0;
+			for (j = 0; j < 32; j++)
+				sum += mp3_synth_nwin[i][j] * s_vec[j];
+			mp3_v_vec[ch][i] = sum;
+		}
+		for (i = 0; i < 8; i++)
+			for (j = 0; j < 32; j++)
+			{
+				u_vec[i * 64 + j]	   = mp3_v_vec[ch][i * 128 + j];
+				u_vec[i * 64 + j + 32] = mp3_v_vec[ch][i * 128 + j + 96];
+			}
+		for (i = 0; i < 512; i++)
+			u_vec[i] = u_vec[i] * mp3_synth_dtbl[i];
+		for (i = 0; i < 32; i++)
+		{
+			sum = 0.0;
+			for (j = 0; j < 16; j++)
+				sum += u_vec[j * 32 + i];
+			samp = ToI64(sum * 32767.0);
+			if (samp > 32767)
+				samp = 32767;
+			else if (samp < -32767)
+				samp = -32767;
+			samp &= 0xFFFF;
+			if (ch == 0)
+			{
+				if (nch == 1)
+					outdata[32 * ss + i] = samp << 16 | samp;
+				else
+					outdata[32 * ss + i] = samp << 16;
+			}
+			else
+				outdata[32 * ss + i] |= samp;
+		}
+	}
+}
+
+I64 MP3DecodeL3()
+{
+	I64 gr, ch, nch;
+
+	if (mp3_h_mode == 3)
+		nch = 1;
+	else
+		nch = 2;
+	for (gr = 0; gr < 2; gr++)
+	{
+		for (ch = 0; ch < nch; ch++)
+		{
+			MP3Requantize(gr, ch);
+			MP3Reorder(gr, ch);
+		}
+		MP3Stereo(gr);
+		for (ch = 0; ch < nch; ch++)
+		{
+			MP3Antialias(gr, ch);
+			MP3HybridSynthesis(gr, ch);
+			MP3FrequencyInversion(gr, ch);
+			MP3SubbandSynthesis(gr, ch, &mp3_out[gr][0]);
+		}
+	}
+	return MP3_OK;
+}
+
+//--- Top level ---------------------------------------------------------------
+public I16 *MP3Decode(U8 *src, I64 src_size, I64 *_frames, I64 *_rate, I64 *_channels)
+{//Decode a whole MPEG-1 Layer III stream. Returns MAlloced interleaved I16
+//samples (nch==2: L,R,...), sets frame count, sample rate and channels.
+//Returns NULL if no frames could be decoded.
+	I64	 src_pos = 0, res, snapshot_pos, snapshot_istart, chunk;
+	I64	 out_frames = 0, out_cap, nch = 2, i, gr, s;
+	I16	*out, *grown;
+	Bool got_format = FALSE;
+
+	MP3TabsInit;
+	mp3_istart = 0;
+	mp3_iend = 0;
+	mp3_processed = 0;
+	mp3_main_data_top = 0;
+	mp3_main_data_idx = 0;
+	mp3_main_data_bit = 0;
+	mp3_hsynth_reset = TRUE;
+	mp3_synth_reset = TRUE;
+
+	out_cap = src_size * 12 / 2 + 65536; //Grows on demand.
+	out = MAlloc(out_cap * sizeof(I16));
+
+	while (TRUE)
+	{
+		//Keep the ring buffer fed.
+		while (src_pos < src_size)
+		{
+			chunk = MP3InbufFree - 1;
+			if (chunk <= 0)
+				break;
+			if (chunk > src_size - src_pos)
+				chunk = src_size - src_pos;
+			if (chunk > 4096)
+				chunk = 4096;
+			MP3Feed(&src[src_pos], chunk);
+			src_pos += chunk;
+		}
+		if (MP3InbufFilled < 2 * 576 && src_pos >= src_size)
+			break; //Out of data.
+
+		snapshot_pos = mp3_processed;
+		snapshot_istart = mp3_istart;
+		res = MP3ReadFrame;
+		if (res == MP3_OK)
+		{
+			if (!got_format)
+			{
+				if (mp3_h_mode == 3)
+					nch = 1;
+				else
+					nch = 2;
+				*_rate = mp3_srates[mp3_h_sampling_frequency];
+				*_channels = nch;
+				got_format = TRUE;
+			}
+			MP3DecodeL3;
+			//Append both granules.
+			if ((out_frames + 1152) * nch > out_cap)
+			{
+				out_cap *= 2;
+				grown = MAlloc(out_cap * sizeof(I16));
+				MemCopy(grown, out, out_frames * nch * sizeof(I16));
+				Free(out);
+				out = grown;
+			}
+			for (gr = 0; gr < 2; gr++)
+				for (i = 0; i < 576; i++)
+				{
+					s = mp3_out[gr][i];
+					if (nch == 1)
+						out[out_frames * nch] = s & 0xFFFF;
+					else
+					{
+						out[out_frames * 2]		= s >> 16 & 0xFFFF;
+						out[out_frames * 2 + 1]	= s & 0xFFFF;
+					}
+					out_frames++;
+				}
+		}
+		else if (res == MP3_NEED_MORE)
+		{
+			mp3_processed = snapshot_pos;
+			mp3_istart = snapshot_istart;
+			if (src_pos >= src_size)
+				break;
+		}
+		else
+		{//Frame error: skip a byte and resync, or give up at stream end.
+			if (MP3InbufFilled < 8 && src_pos >= src_size)
+				break;
+			if (MP3GetByte == MP3_EOF)
+				break;
+		}
+	}
+
+	if (!out_frames || !got_format)
+	{
+		Free(out);
+		return NULL;
+	}
+	*_frames = out_frames;
+
+	return out;
+}

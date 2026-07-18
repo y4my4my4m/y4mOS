@@ -1,0 +1,194 @@
+//y4mOS Calculator - DE-native widget app (erythros Calculator.app, reborn
+//in pure ZealC on the y4mOS widget toolkit). Run with DECalc; <ESC> exits.
+
+class CDECalcState
+{
+	F64		 acc;
+	U8		 entry[24];
+	I64		 entry_len;
+	U8		 op;		//0, '+', '-', '*', '/'
+	Bool	 fresh;		//Next digit starts a new entry.
+	Bool	 done;
+	CDEWidget *display;
+} de_calc;
+
+U0 DECalcDisplaySet(U8 *s)
+{
+	I64 len = StrLen(s);
+
+	if (len > DE_WIDGET_TEXT_LEN - 1)
+		len = DE_WIDGET_TEXT_LEN - 1;
+	MemCopy(de_calc.display->text, s, len);
+	de_calc.display->text[len] = 0;
+}
+
+U0 DECalcShowNum(F64 v)
+{
+	U8	buf[48];
+	I64 i;
+
+	StrPrint(buf, "%15.8f", v);
+	i = StrLen(buf) - 1;
+	while (i > 0 && buf[i] == '0')
+		buf[i--] = 0;
+	if (i > 0 && buf[i] == '.')
+		buf[i] = 0;
+	i = 0;
+	while (buf[i] == ' ')
+		i++;
+	DECalcDisplaySet(&buf[i]);
+}
+
+F64 DECalcEntryVal()
+{
+	if (!de_calc.entry_len)
+		return de_calc.acc;
+	return Str2F64(de_calc.entry);
+}
+
+U0 DECalcApply()
+{
+	F64 v = DECalcEntryVal;
+
+	switch (de_calc.op)
+	{
+		case '+':	de_calc.acc += v;	break;
+		case '-':	de_calc.acc -= v;	break;
+		case '*':	de_calc.acc *= v;	break;
+		case '/':
+			if (v == 0)
+			{
+				DECalcDisplaySet("Divide by zero");
+				de_calc.acc = 0;
+				de_calc.op = 0;
+				de_calc.entry_len = 0;
+				de_calc.entry[0] = 0;
+				de_calc.fresh = TRUE;
+				return;
+			}
+			de_calc.acc /= v;
+			break;
+		default:
+			de_calc.acc = v;
+	}
+	de_calc.op = 0;
+	de_calc.entry_len = 0;
+	de_calc.entry[0] = 0;
+	de_calc.fresh = TRUE;
+	DECalcShowNum(de_calc.acc);
+}
+
+U0 DECalcKey(CDEWidget *wg)
+{//One handler for the whole pad; the key lives in wg->user_data.
+	U8 k = wg->user_data;
+	U8 tmp[24];
+
+	if ('0' <= k <= '9' || k == '.')
+	{
+		if (de_calc.fresh)
+		{
+			de_calc.entry_len = 0;
+			de_calc.fresh = FALSE;
+		}
+		if (k == '.' && StrFirstOcc(de_calc.entry, "."))
+			return;
+		if (de_calc.entry_len < 22)
+		{
+			de_calc.entry[de_calc.entry_len++] = k;
+			de_calc.entry[de_calc.entry_len] = 0;
+			DECalcDisplaySet(de_calc.entry);
+		}
+	}
+	else switch (k)
+	{
+		case 'C':
+			de_calc.acc = 0;
+			de_calc.op = 0;
+			de_calc.entry_len = 0;
+			de_calc.entry[0] = 0;
+			de_calc.fresh = TRUE;
+			DECalcDisplaySet("0");
+			break;
+		case 'N': //Negate.
+			if (de_calc.entry_len)
+			{
+				if (de_calc.entry[0] == '-')
+				{
+					MemCopy(tmp, &de_calc.entry[1], de_calc.entry_len); //Incl. terminator.
+					MemCopy(de_calc.entry, tmp, de_calc.entry_len);
+					de_calc.entry_len--;
+				}
+				else if (de_calc.entry_len < 21)
+				{
+					tmp[0] = '-';
+					MemCopy(&tmp[1], de_calc.entry, de_calc.entry_len + 1);
+					MemCopy(de_calc.entry, tmp, de_calc.entry_len + 2);
+					de_calc.entry_len++;
+				}
+				DECalcDisplaySet(de_calc.entry);
+			}
+			else
+			{
+				de_calc.acc = -de_calc.acc;
+				DECalcShowNum(de_calc.acc);
+			}
+			break;
+		case '=':
+			DECalcApply;
+			break;
+		case '+':
+		case '-':
+		case '*':
+		case '/':
+			DECalcApply;
+			de_calc.op = k;
+			break;
+		case 'Q':
+			de_calc.done = TRUE;
+			break;
+	}
+}
+
+CDEWidget *DECalcBttn(CDEWinCtx *ctx, I64 col, I64 row, U8 *text, U8 key)
+{
+	CDEWidget *wg = DEButton(ctx, 14 + col * 52, 60 + row * 30, 46, 24, text, &DECalcKey);
+
+	wg->user_data = key;
+	return wg;
+}
+
+public U0 DECalc()
+{
+	CDEWinCtx *ctx;
+
+	MemSet(&de_calc, 0, sizeof(CDECalcState));
+	ctx = DEWinInit("Calculator", 30, 26);
+
+	DEPanel(ctx, 12, 14, 202, 34);
+	de_calc.display = DELabel(ctx, 20, 27, "0", TRUE);
+
+	DECalcBttn(ctx, 0, 0, "7", '7');
+	DECalcBttn(ctx, 1, 0, "8", '8');
+	DECalcBttn(ctx, 2, 0, "9", '9');
+	DECalcBttn(ctx, 3, 0, "/", '/');
+	DECalcBttn(ctx, 0, 1, "4", '4');
+	DECalcBttn(ctx, 1, 1, "5", '5');
+	DECalcBttn(ctx, 2, 1, "6", '6');
+	DECalcBttn(ctx, 3, 1, "*", '*');
+	DECalcBttn(ctx, 0, 2, "1", '1');
+	DECalcBttn(ctx, 1, 2, "2", '2');
+	DECalcBttn(ctx, 2, 2, "3", '3');
+	DECalcBttn(ctx, 3, 2, "-", '-');
+	DECalcBttn(ctx, 0, 3, "0", '0');
+	DECalcBttn(ctx, 1, 3, ".", '.');
+	DECalcBttn(ctx, 2, 3, "=", '=');
+	DECalcBttn(ctx, 3, 3, "+", '+');
+	DECalcBttn(ctx, 0, 4, "C", 'C');
+	DECalcBttn(ctx, 1, 4, "+/-", 'N');
+	DECalcBttn(ctx, 3, 4, "Exit", 'Q');
+
+	while (!de_calc.done && DEWinPoll(ctx))
+		Sleep(30);
+
+	DEWinExit(ctx);
+}

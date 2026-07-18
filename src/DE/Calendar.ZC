@@ -1,0 +1,145 @@
+//y4mOS Calendar - DE-native month view (erythros Calendar.applet, reborn
+//native). Custom truecolor draw_it, themed. <LEFT>/<RIGHT> change month,
+//<HOME> jumps to today, <ESC> exits. Run with DECalendar;
+
+I64 de_cal_dim[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+U8 *de_cal_mon_names[12] = {
+	"January", "February", "March", "April", "May", "June", "July",
+	"August", "September", "October", "November", "December"};
+U8 *de_cal_dow_names = "Su Mo Tu We Th Fr Sa";
+
+class CDECalGlobals
+{
+	I64 year, mon;			//Shown month, mon 0-11.
+	I64 today_year, today_mon, today_day;
+} de_cal;
+
+I64 DECalDaysInMonth(I64 year, I64 mon)
+{
+	if (mon == 1 && (year % 4 == 0 && year % 100 != 0 || year % 400 == 0))
+		return 29;
+	return de_cal_dim[mon];
+}
+
+I64 DECalFirstDow(I64 year, I64 mon)
+{//Day of week (0=Sunday) of the 1st of the month.
+	CDateStruct ds;
+
+	MemSet(&ds, 0, sizeof(CDateStruct));
+	ds.year = year;
+	ds.mon = mon + 1;
+	ds.day_of_mon = 1;
+	Date2Struct(&ds, Struct2Date(&ds));
+
+	return ds.day_of_week;
+}
+
+U0 DECalDraw(CTask *task, CDC *dc)
+{
+	I64 cw = 40, ch = 22, gx = 14, gy = 58;
+	I64 days, dow, day, row, col;
+	U8	buf[64];
+
+	dc->color = de_theme.win_bg;
+	GrRect(dc, 0, 0, task->pix_width, task->pix_height);
+
+	//Header: month + year.
+	StrPrint(buf, "%s %d", de_cal_mon_names[de_cal.mon], de_cal.year);
+	dc->color = de_theme.accent;
+	GrPrint(dc, gx + (7 * cw - StrLen(buf) * FONT_WIDTH) / 2, 14, "%s", buf);
+
+	//Day-of-week header row.
+	dc->color = de_theme.text_dim;
+	for (col = 0; col < 7; col++)
+		GrPrint(dc, gx + col * cw + (cw - 2 * FONT_WIDTH) / 2, 38, "%c%c",
+				de_cal_dow_names[col * 3], de_cal_dow_names[col * 3 + 1]);
+
+	days = DECalDaysInMonth(de_cal.year, de_cal.mon);
+	dow  = DECalFirstDow(de_cal.year, de_cal.mon);
+	for (day = 1; day <= days; day++)
+	{
+		row = (dow + day - 1) / 7;
+		col = (dow + day - 1) % 7;
+		if (de_cal.year == de_cal.today_year && de_cal.mon == de_cal.today_mon &&
+			day == de_cal.today_day)
+		{//Today: accent cell.
+			dc->color = de_theme.accent_dim;
+			GrRect(dc, gx + col * cw - 4, gy + row * ch - 4, cw - 4, ch - 2);
+			dc->color = de_theme.text;
+		}
+		else if (col == 0 || col == 6)
+			dc->color = de_theme.text_dim; //Weekend.
+		else
+			dc->color = de_theme.text;
+		StrPrint(buf, "%2d", day);
+		GrPrint(dc, gx + col * cw, gy + row * ch, "%s", buf);
+	}
+
+	dc->color = de_theme.text_dim;
+	GrPrint(dc, gx, task->pix_height - 16, "<- -> month   HOME today   ESC exit");
+}
+
+public U0 DECalendar()
+{
+	CDateStruct ds;
+	I64			ch, sc;
+	Bool		done = FALSE;
+
+	Date2Struct(&ds, Now);
+	de_cal.today_year = ds.year;
+	de_cal.today_mon  = ds.mon - 1;
+	de_cal.today_day  = ds.day_of_mon;
+	de_cal.year = de_cal.today_year;
+	de_cal.mon  = de_cal.today_mon;
+
+	SettingsPush;
+	StrCopy(Fs->task_title, "Calendar");
+	WinHorz(MaxI64(1, (TEXT_COLS - 40) / 2), MaxI64(1, (TEXT_COLS - 40) / 2) + 39);
+	WinVert(MaxI64(1, (TEXT_ROWS - 26) / 2), MaxI64(1, (TEXT_ROWS - 26) / 2) + 25);
+	WinFocus;
+	DocCursor(OFF);
+	DocClear;
+	Fs->draw_it = &DECalDraw;
+
+	while (!done)
+	{
+		ch = KeyGet(&sc);
+		switch (ch)
+		{
+			case 0:
+				switch (sc.u8[0])
+				{
+					case SC_CURSOR_LEFT:
+						de_cal.mon--;
+						if (de_cal.mon < 0)
+						{
+							de_cal.mon = 11;
+							de_cal.year--;
+						}
+						break;
+					case SC_CURSOR_RIGHT:
+						de_cal.mon++;
+						if (de_cal.mon > 11)
+						{
+							de_cal.mon = 0;
+							de_cal.year++;
+						}
+						break;
+					case SC_HOME:
+						de_cal.year = de_cal.today_year;
+						de_cal.mon  = de_cal.today_mon;
+						break;
+				}
+				break;
+			case CH_ESC:
+			case CH_SHIFT_ESC:
+				done = TRUE;
+				break;
+		}
+	}
+
+	Fs->draw_it = NULL;
+	DocCursor(ON);
+	DocClear;
+	SettingsPop;
+}
