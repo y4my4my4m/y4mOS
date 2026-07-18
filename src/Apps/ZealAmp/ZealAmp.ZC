@@ -36,10 +36,15 @@ class CZAmpMedia
 	U32		 channels, sample_rate_khz;
 	I64		 bitrate_kbps;
 	U32		*pcm_data;		//U32 frames: L16 | R16 << 16, 48kHz.
-	I64		 pcm_frames;
+	I64		 pcm_frames;	//Frames DECODED so far (grows while streaming).
+	I64		 pcm_cap;		//Allocated capacity in frames.
 	I64		 fifo_frame, seek_frame, seek_to_frame;
 	I64		 runtime_mins, runtime_secs;
 	Bool	 paused, stopped, loading, seeking;
+	//MP3 streaming (decode-ahead): compressed file kept, decoded on the fly.
+	U8		*mp3_src;
+	I64		 mp3_size, src_rate;
+	Bool	 is_mp3, decoding;
 };
 
 class CZAmpMarquee
@@ -52,12 +57,14 @@ class CZAmp
 {
 	CZAmpMedia		 media;
 	CZAmpMarquee	 marquee;
-	CTask			*win_task, *feed_task;
+	CTask			*win_task, *feed_task, *decode_task;
 	CDC				**images;
 	I64				 pressing_button, prev_lb_state;
 	I64				 stream_id;
 	Bool			 quit;
 } zamp;
+
+extern U0 ZAMediaFree();
 
 U8 *ZA_TEXT_ROW_1 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ\"@";
 U8 *ZA_TEXT_ROW_2 = "0123456789  :()-'!_+\\/[]^&%.=\d#";
@@ -171,14 +178,16 @@ U0 ZADrawPosBar(CDC *dc, I64 x, I64 y)
 {
 	CDC *knob = DCNew(28, 10);
 	F64  scale;
-	I64  j;
+	I64  j, total;
 
-	if (!zamp.media.pcm_data || !zamp.media.pcm_frames)
+	//Stable timeline: full estimated length for MP3 (pcm_cap), exact for WAV.
+	total = zamp.media.pcm_cap;
+	if (!zamp.media.pcm_data || total <= 0)
 	{
 		DCDel(knob);
 		return;
 	}
-	scale = 220.0 / zamp.media.pcm_frames;
+	scale = 220.0 / total;
 	if (!zamp.media.seeking)
 	{
 		GrBlot(knob, -250, 0, ZA_IMG_POSBAR);
@@ -189,7 +198,7 @@ U0 ZADrawPosBar(CDC *dc, I64 x, I64 y)
 		GrBlot(knob, -278, 0, ZA_IMG_POSBAR);
 		j = ClampI64(mouse.pos.x - zamp.win_task->pix_left - x - 14, 0, 220);
 		GrBlot(dc, x + j, y, knob);
-		zamp.media.seek_to_frame = ClampI64(ToI64(j / scale), 0, zamp.media.pcm_frames - 1);
+		zamp.media.seek_to_frame = ClampI64(ToI64(j / scale), 0, total - 1);
 	}
 	DCDel(knob);
 }
@@ -406,18 +415,36 @@ U0 ZAFeedTask()
 	}
 }
 
+U0 ZAMediaFree()
+{//Stop playback/decode and release the current track's buffers.
+	zamp.media.stopped = TRUE;
+	zamp.media.decoding = FALSE;
+	Sleep(20); //Let feed + decode tasks notice.
+	if (TaskValidate(zamp.decode_task))
+	{
+		Kill(zamp.decode_task);
+		zamp.decode_task = NULL;
+	}
+	Free(zamp.media.pcm_data);
+	zamp.media.pcm_data = NULL;
+	Free(zamp.media.mp3_src);
+	zamp.media.mp3_src = NULL;
+	zamp.media.pcm_frames = 0;
+	zamp.media.pcm_cap = 0;
+	zamp.media.is_mp3 = FALSE;
+}
+
 U0 ZAMediaSet(U32 *pcm, I64 frames, I64 channels, I64 src_khz, U8 *title)
-{
+{//WAV/tone: a complete pre-decoded buffer. Takes ownership of pcm.
 	U8 buf[300];
 
-	zamp.media.stopped = TRUE; //Park the feed task before swapping buffers.
-	Sleep(5);
-	Free(zamp.media.pcm_data);
+	ZAMediaFree;
 	zamp.media.pcm_data		= pcm;
 	zamp.media.pcm_frames	= frames;
+	zamp.media.pcm_cap		= frames;
 	zamp.media.channels		= channels;
 	zamp.media.sample_rate_khz = src_khz;
-	zamp.media.bitrate_kbps	= 0; //Loaders fill in after.
+	zamp.media.bitrate_kbps	= 0;
 	zamp.media.runtime_mins	= frames / ZA_RATE / 60;
 	zamp.media.runtime_secs	= frames / ZA_RATE % 60;
 	StrCopy(zamp.media.title, title);
@@ -426,6 +453,75 @@ U0 ZAMediaSet(U32 *pcm, I64 frames, I64 channels, I64 src_khz, U8 *title)
 	ZASeekTo(0);
 	zamp.media.stopped = FALSE;
 	zamp.media.paused = FALSE;
+}
+
+U0 ZADecodeTask()
+{//Decode-ahead: pull MP3 frames, linear-resample to 48kHz, append to pcm_data.
+//Playback (feed task) reads pcm_frames as it grows, so audio starts instantly.
+	F64	 phase = 0.0, step;
+	I64	 rate, i, si, n, produced, last_l = 0, last_r = 0, cl, cr, nl, nr;
+	I16	*frame_pcm;
+	F64	 frac;
+
+	frame_pcm = MAlloc(1152 * 2 * sizeof(I16));
+	while (zamp.media.decoding)
+	{
+		produced = MP3StreamFrame;
+		if (!produced)
+			break; //EOF.
+		rate = mp3_stream_rate;
+		zamp.media.channels = mp3_stream_channels;
+		zamp.media.sample_rate_khz = rate / 1000;
+		step = rate(F64) / ZA_RATE;
+		//Flatten this frame's mp3_out (2 granules x 576) to interleaved I16.
+		for (i = 0; i < 1152; i++)
+		{
+			n = mp3_out[i / 576][i % 576];
+			if (mp3_stream_channels == 1)
+			{
+				frame_pcm[i * 2]	 = n & 0xFFFF;
+				frame_pcm[i * 2 + 1] = n & 0xFFFF;
+			}
+			else
+			{
+				frame_pcm[i * 2]	 = n >> 16 & 0xFFFF;
+				frame_pcm[i * 2 + 1] = n & 0xFFFF;
+			}
+		}
+		//Linear-resample this 1152-sample frame into pcm_data, carrying phase
+		//and the previous frame's last sample across the boundary.
+		while (phase < 1152.0)
+		{
+			si = phase;
+			frac = phase - si;
+			if (si == 0)
+			{
+				cl = last_l;
+				cr = last_r;
+			}
+			else
+			{
+				cl = frame_pcm[(si - 1) * 2];
+				cr = frame_pcm[(si - 1) * 2 + 1];
+			}
+			nl = frame_pcm[si * 2];
+			nr = frame_pcm[si * 2 + 1];
+			if (zamp.media.pcm_frames >= zamp.media.pcm_cap)
+				break; //Buffer full (shouldn't happen; sized to duration).
+			zamp.media.pcm_data[zamp.media.pcm_frames].i16[0] = ToI64(cl + (nl - cl) * frac);
+			zamp.media.pcm_data[zamp.media.pcm_frames].i16[1] = ToI64(cr + (nr - cr) * frac);
+			zamp.media.pcm_frames++;
+			phase += step;
+		}
+		phase -= 1152.0;
+		last_l = frame_pcm[1151 * 2];
+		last_r = frame_pcm[1151 * 2 + 1];
+		if (!(zamp.media.pcm_frames & 0x3FFF))
+			Sleep(1); //Yield so the feed task and UI run.
+	}
+	Free(frame_pcm);
+	zamp.media.decoding = FALSE;
+	zamp.decode_task = NULL;
 }
 
 U0 ZAPcmSet(I16 *s, I64 in_frames, I64 channels, I64 rate, U8 *title)
@@ -545,41 +641,54 @@ Bool ZAWavBuf(U8 *raw, I64 size, U8 *filename)
 	return TRUE;
 }
 
-U0 ZAMp3Progress(I64 pct)
-{
-	U8 buf[64];
-
-	StrPrint(buf, "DECODING MP3: %d%% *** ", ClampI64(pct, 0, 100));
-	ZAMarqueeSet(buf);
-}
-
-Bool ZAMp3Buf(U8 *raw, I64 size, U8 *filename)
-{//Native MPEG-1 Layer III decode (MP3.ZC), then into the 48kHz pipeline.
-	I16	*s16;
-	I64	 frames, rate, channels;
+Bool ZAMp3Open(U8 *raw, I64 size, U8 *filename)
+{//Start decode-ahead MP3 streaming: keep the compressed file, decode one
+//frame to learn the format + prove it's valid, then let ZADecodeTask run.
+	I64	 bitrate, est_secs, est_frames;
 	U8	 title[300];
 
-	ZAMarqueeSet("DECODING MP3 - PURE ZEALC, NO ELF - PLEASE WAIT *** ");
-	mp3_progress_cb = &ZAMp3Progress;
-	s16 = MP3Decode(raw, size, &frames, &rate, &channels);
-	mp3_progress_cb = NULL;
-	if (!s16)
+	MP3StreamInit(raw, size);
+	if (!MP3StreamFrame)
 	{
 		PopUpOk("MP3 decode failed (MPEG-1 Layer III only).");
-		ZAMarqueeSet("MP3 DECODE FAILED *** ");
 		return FALSE;
 	}
+	bitrate = mp3_bitrates[mp3_h_bitrate_index];
+	//Duration estimate from average bitrate, +8s margin for VBR/rounding.
+	est_secs = size * 8 / MaxI64(1, bitrate) + 8;
+	est_frames = est_secs * ZA_RATE;
+
+	ZAMediaFree; //Clears old track, parks tasks.
+	zamp.media.mp3_src	 = raw; //Take ownership (caller must not free).
+	zamp.media.mp3_size	 = size;
+	zamp.media.is_mp3	 = TRUE;
+	zamp.media.src_rate	 = mp3_stream_rate;
+	zamp.media.channels	 = mp3_stream_channels;
+	zamp.media.sample_rate_khz = mp3_stream_rate / 1000;
+	zamp.media.bitrate_kbps	= bitrate / 1000;
+	zamp.media.pcm_cap	 = est_frames;
+	zamp.media.pcm_data	 = MAlloc(est_frames * sizeof(U32));
+	zamp.media.pcm_frames = 0;
+	zamp.media.runtime_mins = est_secs / 60;
+	zamp.media.runtime_secs = est_secs % 60;
 	ZAMp3Title(raw, size, filename, title);
-	ZAPcmSet(s16, frames, channels, rate, title);
-	zamp.media.bitrate_kbps = mp3_bitrates[mp3_h_bitrate_index] / 1000;
-	Free(s16);
+	StrCopy(zamp.media.title, title);
+	StrPrint(title, "1. %s *** ", zamp.media.title);
+	ZAMarqueeSet(title);
+	ZASeekTo(0);
+	zamp.media.stopped = FALSE;
+	zamp.media.paused = FALSE;
+	//Re-init the stream (first frame was a probe) and start decode-ahead.
+	MP3StreamInit(raw, size);
+	zamp.media.decoding = TRUE;
+	zamp.decode_task = Spawn(&ZADecodeTask, NULL, "ZealAmp Decode", 2);
 
 	return TRUE;
 }
 
 Bool ZAOpenFile(U8 *filename)
 {//Dispatch by CONTENT, not extension - RedSea/FAT copies can mangle names.
-//"RIFF" -> WAV; anything else is handed to the MP3 sync-scanner.
+//"RIFF" -> WAV (fully decoded); anything else -> streaming MP3 decode.
 	U8	*raw;
 	I64	 size;
 	Bool ok;
@@ -592,10 +701,16 @@ Bool ZAOpenFile(U8 *filename)
 		return FALSE;
 	}
 	if (!MemCompare(raw, "RIFF", 4))
-		ok = ZAWavBuf(raw, size, filename);
+	{
+		ok = ZAWavBuf(raw, size, filename); //Copies samples out.
+		Free(raw);
+	}
 	else
-		ok = ZAMp3Buf(raw, size, filename);
-	Free(raw);
+	{
+		ok = ZAMp3Open(raw, size, filename); //On success, owns raw for streaming.
+		if (!ok)
+			Free(raw);
+	}
 
 	return ok;
 }
@@ -696,10 +811,10 @@ public U0 ZealAmp()
 
 	//Teardown.
 	Fs->draw_it = NULL;
-	Kill(zamp.feed_task);
-	zamp.media.stopped = TRUE;
+	ZAMediaFree; //Stops decode task, frees pcm + mp3_src.
+	if (TaskValidate(zamp.feed_task))
+		Kill(zamp.feed_task);
 	FifoI64Flush(audio.output[zamp.stream_id].data);
-	Free(zamp.media.pcm_data);
 	for (a1 = 0; a1 < 7; a1++)
 		if (zamp.images[a1])
 			DCDel(zamp.images[a1]);

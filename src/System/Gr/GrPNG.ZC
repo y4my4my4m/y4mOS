@@ -1115,11 +1115,8 @@ U32 PNGPix32(U8 *p, I64 fmt)
 	return 0;
 }
 
-public CDC *PNGRead(U8 *filename, I64 alpha_thresh=128)
-{//Decode a PNG file into a truecolor DC. Pixels with alpha < alpha_thresh
-//become PIXF_TRANSPARENT, so GrBlot() skips them. Returns NULL on error.
-//Supports non-interlaced 8/16-bit gray, gray+alpha, RGB and RGBA.
-	upng_t	*upng = upng_new_from_file(filename);
+CDC *PNGDecodeToDC(upng_t *upng, I64 alpha_thresh, CTask *task)
+{//Shared body: decode an already-opened upng into a truecolor DC.
 	CDC		*dc = NULL;
 	U32		 pix, *dst;
 	U8		*ptr;
@@ -1133,7 +1130,7 @@ public CDC *PNGRead(U8 *filename, I64 alpha_thresh=128)
 		h = upng_get_height(upng);
 		step = upng_get_bpp(upng) / 8;
 		ptr = upng_get_buffer(upng);
-		dc = DCNew(w, h);
+		dc = DCNew(w, h, task);
 		for (i = 0; i < h; i++)
 		{
 			dst = dc->body + i * dc->width_internal;
@@ -1150,6 +1147,21 @@ public CDC *PNGRead(U8 *filename, I64 alpha_thresh=128)
 	upng_Free(upng);
 
 	return dc;
+}
+
+public CDC *PNGRead(U8 *filename, I64 alpha_thresh=128)
+{//Decode a PNG file into a truecolor DC. Pixels with alpha < alpha_thresh
+//become PIXF_TRANSPARENT, so GrBlot() skips them. Returns NULL on error.
+//Supports non-interlaced 8/16-bit gray, gray+alpha, RGB and RGBA.
+	return PNGDecodeToDC(upng_new_from_file(filename), alpha_thresh, Fs);
+}
+
+public CDC *PNGReadBuf(U8 *buf, I64 size, I64 alpha_thresh=128, CTask *task=NULL)
+{//Decode a PNG already in memory (e.g. an HTTP body) into a truecolor DC.
+//Does not free buf. task owns the returned DC (NULL = Fs).
+	if (!task)
+		task = Fs;
+	return PNGDecodeToDC(upng_new_from_bytes(buf, size), alpha_thresh, task);
 }
 
 public U32 *PNGReadRGBA(U8 *filename, I64 *_width=NULL, I64 *_height=NULL, CTask *task=NULL)

@@ -35,16 +35,31 @@
 #define GXW_SELECT		5
 #define GXW_AREA		6
 
+#define GXO_IMG			4
+#define GX_IMG_CACHE	48
+#define GX_IMG_MAXW		480
+#define GX_IMG_MAXH		360
+
 class CGxOp
 {
 	I64				 type, x, y, w, h;
 	CColorROPU32	 fg, bg;
 	U8				*text;		//MAlloc'ed; freed on reset.
-	CDC				*sc;		//Scaled heading run.
+	CDC				*sc;		//Scaled heading run, or cached image (not owned).
 	U8				*href;		//Link target (DOM attr memory).
 	CZNode			*node;		//Widget node.
 	I64				 wkind;
+	U8				*img_url;	//GXO_IMG: absolute URL (MAlloc'ed).
 	Bool			 bold, ul, has_bg;
+};
+
+//Decoded-image cache, keyed by absolute URL. Persists across relayout so we
+//fetch each image once. CDCs owned here, freed on page change.
+class CGxImg
+{
+	U8	*url;
+	CDC	*dc;		//NULL = fetched-and-failed (don't retry); absent = todo.
+	Bool fetched;
 };
 
 class CGxGlobals
@@ -68,7 +83,55 @@ class CGxGlobals
 	Bool	 run_link, busy; //busy: layout in flux; draw_it must not read ops.
 	I64		 last_wheel;
 	U8		*pending_nav;	//StrNew'd target set by click handlers.
+	//Cancellable fetch: ZincLoad runs in a child task.
+	CTask	*load_task;
+	U8		 load_url[256];
+	Bool	 loading, cancel;
+	//Image cache + async fetch.
+	CGxImg	 img[GX_IMG_CACHE];
+	I64		 img_count;
+	CTask	*img_task;
+	Bool	 img_dirty;		//An image finished; relayout wanted.
+	Bool	 img_busy;		//Img task is mid fetch/decode; don't free cache.
 } gx;
+
+CGxImg *GxImgFind(U8 *url)
+{
+	I64 i;
+
+	for (i = 0; i < gx.img_count; i++)
+		if (!StrCompare(gx.img[i].url, url))
+			return &gx.img[i];
+	return NULL;
+}
+
+CGxImg *GxImgGet(U8 *url)
+{//Find or create a cache slot for url.
+	CGxImg *e = GxImgFind(url);
+
+	if (e)
+		return e;
+	if (gx.img_count >= GX_IMG_CACHE)
+		return NULL;
+	e = &gx.img[gx.img_count++];
+	e->url = StrNew(url);
+	e->dc = NULL;
+	e->fetched = FALSE;
+	return e;
+}
+
+U0 GxImgCacheFree()
+{
+	I64 i;
+
+	for (i = 0; i < gx.img_count; i++)
+	{
+		Free(gx.img[i].url);
+		if (gx.img[i].dc)
+			DCDel(gx.img[i].dc);
+	}
+	gx.img_count = 0;
+}
 
 CColorROPU32 GxPen(I64 vga, CColorROPU32 def)
 {//VGA index -> truecolor pen. Pages assume a light background; our chrome is
@@ -90,7 +153,9 @@ U0 GxOpsReset()
 	for (i = 0; i < gx.op_count; i++)
 	{
 		Free(gx.ops[i].text);
-		if (gx.ops[i].sc)
+		Free(gx.ops[i].img_url);
+		//GXO_IMG sc is borrowed from the image cache - don't free it here.
+		if (gx.ops[i].sc && gx.ops[i].type != GXO_IMG)
 			DCDel(gx.ops[i].sc);
 	}
 	gx.op_count = 0;
@@ -370,8 +435,50 @@ U0 GxNode(CZNode *node, CZStyle *inherited, I64 scale)
 	}
 	if (!StrCompare(node->tag, "img"))
 	{
-		attr = ZNodeAttr(node, "alt");
+		U8		*src = ZNodeAttr(node, "src"), *abs;
+		CGxImg	*ce;
+		I64		 iw, ih;
+
 		GxRunFlush;
+		if (src && *src)
+		{
+			abs = ZincResolveLink(src); //MAlloc'ed absolute URL.
+			ce = GxImgGet(abs);
+			if (ce && ce->dc)
+			{//Decoded: reserve real (fit-scaled) size, blit in draw_it.
+				iw = ce->dc->width;
+				ih = ce->dc->height;
+				if (iw > gx.wrap_w - gx.x)
+				{
+					ih = ih * (gx.wrap_w - gx.x) / iw;
+					iw = gx.wrap_w - gx.x;
+				}
+				if (gx.x + iw > gx.wrap_w && gx.x > GX_MARGIN)
+					GxNewline(0);
+				op = GxOpAdd(GXO_IMG, gx.x, gx.y, iw, ih);
+				if (op)
+					op->sc = ce->dc; //Borrowed from cache; not freed on reset.
+				gx.x += iw + FONT_WIDTH;
+				if (ih + GX_LINE_LEAD > gx.line_h)
+					gx.line_h = ih + GX_LINE_LEAD;
+				Free(abs);
+				return;
+			}
+			//Not yet decoded: placeholder box; the img task will fetch it.
+			op = GxOpAdd(GXO_IMG, gx.x, gx.y, 80, 40);
+			if (op)
+			{
+				op->img_url = abs; //Owned by op; freed on reset.
+				op->fg = de_theme.panel;
+			}
+			else
+				Free(abs);
+			gx.x += 80 + FONT_WIDTH;
+			if (40 + GX_LINE_LEAD > gx.line_h)
+				gx.line_h = 40 + GX_LINE_LEAD;
+			return;
+		}
+		attr = ZNodeAttr(node, "alt");
 		op = GxOpAdd(GXO_RECT, gx.x, gx.y, 60, 16);
 		if (op)
 			op->fg = de_theme.panel;
@@ -537,7 +644,10 @@ U0 GxDrawChrome(CDC *dc)
 	dc->color = de_theme.text;
 	GrPrint(dc, bx + 9, ty, "<");
 	GrPrint(dc, bx + 39, ty, ">");
-	GrPrint(dc, bx + 69, ty, "R");
+	if (gx.loading)
+		GrPrint(dc, bx + 69, ty, "X"); //Stop while loading.
+	else
+		GrPrint(dc, bx + 69, ty, "R");
 	GrPrint(dc, bx + 99, ty, "H");
 
 	//URL box.
@@ -621,6 +731,20 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 				if (op->sc)
 					GrBlot(dc, op->x, oy, op->sc);
 				break;
+			case GXO_IMG:
+				if (op->sc)
+					GrBlot(dc, op->x, oy, op->sc); //Decoded image.
+				else
+				{//Placeholder while the image task fetches it.
+					dc->color = de_theme.panel;
+					GrRect(dc, op->x, oy, op->w, op->h);
+					dc->color = de_theme.panel_edge;
+					GrRect(dc, op->x, oy, op->w, 1);
+					GrRect(dc, op->x, oy + op->h - 1, op->w, 1);
+					dc->color = de_theme.text_dim;
+					GrPrint(dc, op->x + 4, oy + op->h / 2 - 4, "img");
+				}
+				break;
 			case GXO_WIDGET:
 				if (op->wkind == GXW_SUBMIT || op->wkind == GXW_BUTTON)
 					dc->color = de_theme.bttn;
@@ -678,6 +802,76 @@ U0 GxNavTo(U8 *target_new)
 {//Takes ownership of target_new.
 	Free(gx.pending_nav);
 	gx.pending_nav = target_new;
+}
+
+U0 GxLoadTask()
+{//Fetch + parse the page in a child task so the main UI can cancel it.
+	ZincLoad(gx.load_url);
+	gx.loading = FALSE;
+	gx.load_task = NULL;
+}
+
+U0 GxImgTask()
+{//Background: fetch + decode each pending <img> once, cache by URL, then
+//flag a relayout so real dimensions are used. PNG only (our decoder).
+	I64			 i, iw, ih, sf;
+	CGxImg		*ce;
+	CHttpResponse *r;
+	CDC			*dc, *scaled;
+
+	while (TRUE)
+	{
+		if (gx.busy || gx.loading)
+		{
+			Sleep(30);
+			goto img_loop;
+		}
+		//Find a cache entry that still needs fetching (created during layout).
+		ce = NULL;
+		for (i = 0; i < gx.img_count; i++)
+			if (!gx.img[i].fetched)
+			{
+				ce = &gx.img[i];
+				break;
+			}
+		if (!ce)
+		{
+			Sleep(80);
+			goto img_loop;
+		}
+		ce->fetched = TRUE; //Mark first: fetch once even on failure.
+		gx.img_busy = TRUE; //Cache must not be freed under us now.
+		if (!StrNICompare(ce->url, "http", 4))
+		{
+			r = HttpGet(ce->url);
+			if (r && r->status == 200 && r->body_length > 8 &&
+				r->body[1] == 'P' && r->body[2] == 'N' && r->body[3] == 'G')
+			{//PNG magic (0x89 'P' 'N' 'G'). Decode into a cache-owned DC.
+				dc = PNGReadBuf(r->body, r->body_length, 255, sys_task);
+				if (dc)
+				{
+					iw = dc->width;
+					ih = dc->height;
+					if (iw > GX_IMG_MAXW || ih > GX_IMG_MAXH)
+					{//Downscale oversize images once, up front.
+						sf = MinI64(GX_IMG_MAXW * 1000 / iw, GX_IMG_MAXH * 1000 / ih);
+						scaled = DEDCScaleNew(dc, MaxI64(1, iw * sf / 1000),
+											  MaxI64(1, ih * sf / 1000), sys_task);
+						DCDel(dc);
+						dc = scaled;
+					}
+					ce->dc = dc;
+					gx.img_dirty = TRUE;
+				}
+			}
+			if (r)
+				HttpResponseFree(r);
+		}
+		gx.img_busy = FALSE;
+img_loop:
+		if (gx.quit)
+			break;
+	}
 }
 
 U0 GxUrlSet(U8 *url)
@@ -806,14 +1000,50 @@ public U0 ZincGX(U8 *start_url=NULL)
 		current = StrNew("zinc:welcome");
 
 	Fs->draw_it = &GxDrawIt;
+	gx.img_task = Spawn(&GxImgTask, NULL, "ZincGX Images", 3);
 
 	while (!gx.quit)
 	{
+		//A background image finished decoding: relayout to use its real size.
+		if (gx.img_dirty && !gx.fetch && !gx.loading)
+		{
+			gx.img_dirty = FALSE;
+			GxLayout;
+		}
+
 		if (gx.fetch)
 		{
 			gx.busy = TRUE; //Ops reference the old DOM; park the drawer.
 			GxOpsReset;
-			ZincLoad(current);
+			while (gx.img_busy) //Wait out any in-flight image fetch.
+				Sleep(5);
+			GxImgCacheFree; //New page: drop old decoded images.
+			//Fetch in a child task so ESC / Stop can cancel a slow load.
+			StrCopy(gx.load_url, current);
+			gx.loading = TRUE;
+			gx.cancel = FALSE;
+			StrCopy(zinc_note, "Loading...");
+			gx.load_task = Spawn(&GxLoadTask, NULL, "ZincGX Load", 4);
+			while (gx.loading)
+			{
+				while (msg = MessageScan(&a1, &a2))
+					if (msg == MESSAGE_MS_L_DOWN)
+					{//Stop button lives where Reload normally is.
+						if (a2 < GX_CHROME_H && 64 <= a1 < 90)
+							gx.cancel = TRUE;
+					}
+					else if (msg == MESSAGE_KEY_DOWN && (a1 == CH_ESC || a1 == CH_SHIFT_ESC))
+						gx.cancel = TRUE;
+				if (gx.cancel && TaskValidate(gx.load_task))
+				{
+					Kill(gx.load_task);
+					gx.load_task = NULL;
+					gx.loading = FALSE;
+					ZincSetPage(current, "<p>Load cancelled.</p>");
+					StrCopy(zinc_note, "Cancelled.");
+				}
+				Sleep(20);
+			}
 			gx.fetch = FALSE;
 			if (zinc_js && zinc_js->navigate && nav_chain < 5)
 			{
@@ -975,7 +1205,12 @@ gx_next:
 
 	//Teardown.
 	Fs->draw_it = NULL;
+	if (TaskValidate(gx.img_task))
+		Kill(gx.img_task);
+	if (TaskValidate(gx.load_task))
+		Kill(gx.load_task);
 	GxOpsReset;
+	GxImgCacheFree;
 	Free(gx.ops);
 	ZincPageFree;
 	Free(current);
