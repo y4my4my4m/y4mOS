@@ -16,6 +16,26 @@ U0 DESettingsChrome(CDEWidget *wg)
 		GuiChromePalette;
 }
 
+U0 DESettingsMenuBar(CDEWidget *wg)
+{
+	GuiMenuBarModern(wg->checked);
+}
+
+U0 DESettingsGlass(CDEWidget *wg)
+{
+	de.glass = wg->checked;
+	if (!wg->checked)
+		WinOpaque;
+}
+
+U0 DESettingsSysLog(CDEWidget *wg)
+{
+	if (wg->checked)
+		LBts(&sys_task->display_flags, DISPLAYf_SHOW);
+	else
+		LBtr(&sys_task->display_flags, DISPLAYf_SHOW);
+}
+
 U0 DESettingsPickWall(CDEWidget *wg)
 {
 	U8 *file = PopUpPickFile("::/DE");
@@ -59,29 +79,33 @@ public U0 DESettings()
 	U8			 buf[STR_LEN];
 
 	de_settings_done = FALSE;
-	ctx = DEWinInit("Settings", 52, 36);
+	ctx = DEWinInit("Settings", 52, 44);
 
-	DELabel(ctx, 16, 12, "y4mOS Settings", TRUE);
+	DELabel(ctx, 16, 12, "YDE Settings", TRUE);
 	StrPrint(buf, "%dx%d truecolor, ZealOS core V%.02f", GR_WIDTH, GR_HEIGHT, sys_os_version);
 	DELabel(ctx, 16, 26, buf);
 
-	DEPanel(ctx, 12, 44, 392, 88);
+	DEPanel(ctx, 12, 44, 392, 136);
 	DELabel(ctx, 20, 50, "Appearance", TRUE);
 	DESlider(ctx, 20, 64, 240, "Accent hue", 0, 359, de_theme.hue, &DESettingsHue);
 	DECheck(ctx, 20, 104, "Truecolor window chrome", gr.tc_chrome, &DESettingsChrome);
+	DECheck(ctx, 20, 122, "Modern title bars", gr.tc_flat_menu, &DESettingsMenuBar);
+	DECheck(ctx, 20, 140, "Glass focused window", de.glass, &DESettingsGlass);
+	DECheck(ctx, 20, 158, "Show SysLog window",
+			Bt(&sys_task->display_flags, DISPLAYf_SHOW), &DESettingsSysLog);
 
-	DEPanel(ctx, 12, 140, 392, 60);
-	DELabel(ctx, 20, 146, "Wallpaper", TRUE);
-	DEButton(ctx, 20,  162, 110, 22, "Pick PNG...", &DESettingsPickWall);
-	DEButton(ctx, 140, 162, 90,  22, "Reload",      &DESettingsReloadWall);
-	DEButton(ctx, 240, 162, 90,  22, "Gradient",    &DESettingsGradient);
+	DEPanel(ctx, 12, 188, 392, 60);
+	DELabel(ctx, 20, 194, "Wallpaper", TRUE);
+	DEButton(ctx, 20,  210, 110, 22, "Pick PNG...", &DESettingsPickWall);
+	DEButton(ctx, 140, 210, 90,  22, "Reload",      &DESettingsReloadWall);
+	DEButton(ctx, 240, 210, 90,  22, "Gradient",    &DESettingsGradient);
 
-	DEPanel(ctx, 12, 208, 392, 44);
-	DELabel(ctx, 20, 214, "Audio", TRUE);
-	DESlider(ctx, 116, 214, 200, "Master volume", 0, 100, ac97.volume, &DESettingsVolume);
+	DEPanel(ctx, 12, 256, 392, 44);
+	DELabel(ctx, 20, 262, "Audio", TRUE);
+	DESlider(ctx, 116, 262, 200, "Master volume", 0, 100, ac97.volume, &DESettingsVolume);
 
-	DEButton(ctx, 12,  262, 100, 22, "Stop DE",    &DESettingsStopDE);
-	DEButton(ctx, 304, 262, 100, 22, "Exit (ESC)", &DESettingsExit);
+	DEButton(ctx, 12,  310, 100, 22, "Stop DE",    &DESettingsStopDE);
+	DEButton(ctx, 304, 310, 100, 22, "Exit (ESC)", &DESettingsExit);
 
 	while (!de_settings_done && DEWinPoll(ctx))
 		Sleep(30);

@@ -1,9 +1,9 @@
-//y4mOS boot splash - truecolor take on ZealOS's ZSplash. Gradient sky,
-//pixel-upscaled logotype, random motto. Any key closes.
-//Invoked from HomeSys.ZC in a PopUp task at first boot (after MakeDE, so the
-//DE toolkit and theme are already compiled).
+//YDE boot splash - truecolor gradient sky, pixel-upscaled logotype, random
+//motto. Any key (or a 12s timeout) closes it.
+//Invoked from StartOS.ZC in a PopUp task right after the WinMgr spawns, so
+//only System-level symbols may be used here (no DE toolkit yet).
 
-DefineListLoad("Y4M_MOTTOS",
+DefineListLoad("YDE_MOTTOS",
 	"Charter? What charter.\0"
 	"640x480 was a suggestion.\0"
 	"16 colors were not enough.\0"
@@ -12,25 +12,32 @@ DefineListLoad("Y4M_MOTTOS",
 	"Ring-0 all the way down.\0"
 	"Compiles itself at breakfast.\0");
 
-U8	*y4m_splash_motto;
-CDC *y4m_splash_logo;
+U8	*yde_splash_motto;
+CDC *yde_splash_logo;
 
-U0 Y4MSplashLogoMake()
-{//Render the name in the system font, then pixel-upscale 6x for the big
-//chunky logotype. Shadow pass first, color pass on top.
-	CDC *tmp = DCNew(5 * FONT_WIDTH + 1, FONT_HEIGHT + 1);
+U0 YDESplashLogoMake()
+{//Render the name in the system font, then pixel-upscale 8x for the big
+//chunky logotype. Shadow pass first, color pass on top. Self-contained
+//nearest-neighbor scale: the DE toolkit is not compiled yet.
+	I64	 sc = 8, x, y;
+	CDC *tmp = DCNew(3 * FONT_WIDTH + 1, FONT_HEIGHT + 1);
 
 	DCFill(tmp);
 	tmp->color = ColorRGB(0x22, 0x10, 0x3A);
-	GrPrint(tmp, 1, 1, "y4mOS");
+	GrPrint(tmp, 1, 1, "YDE");
 	tmp->color = ColorRGB(0xC8, 0x8F, 0xFF);
-	GrPrint(tmp, 0, 0, "y4mOS");
-	y4m_splash_logo = DEDCScaleNew(tmp, tmp->width * 6, tmp->height * 6);
-	y4m_splash_logo->flags &= ~DCF_NO_TRANSPARENTS; //Keep see-through gaps.
+	GrPrint(tmp, 0, 0, "YDE");
+
+	yde_splash_logo = DCNew(tmp->width * sc, tmp->height * sc);
+	for (y = 0; y < yde_splash_logo->height; y++)
+		for (x = 0; x < yde_splash_logo->width; x++)
+			yde_splash_logo->body[y * yde_splash_logo->width_internal + x] =
+				tmp->body[y / sc * tmp->width_internal + x / sc];
+	yde_splash_logo->flags &= ~DCF_NO_TRANSPARENTS; //Keep see-through gaps.
 	DCDel(tmp);
 }
 
-U0 Y4MSplashDraw(CTask *task, CDC *dc)
+U0 YDESplashDraw(CTask *task, CDC *dc)
 {
 	I64 w = task->pix_width, h = task->pix_height, y, r, g, b, ly;
 
@@ -43,34 +50,55 @@ U0 Y4MSplashDraw(CTask *task, CDC *dc)
 		GrRect(dc, 0, y, w, 1);
 	}
 
-	ly = (h - y4m_splash_logo->height) / 2 - 24;
-	GrBlot(dc, (w - y4m_splash_logo->width) / 2, ly, y4m_splash_logo);
+	ly = (h - yde_splash_logo->height) / 2 - 24;
+	GrBlot(dc, (w - yde_splash_logo->width) / 2, ly, yde_splash_logo);
 
 	dc->color = ColorRGB(0xE8, 0xEC, 0xF4);
 	GrPrint(dc, (w - StrLen(sys_os_version_str) * FONT_WIDTH) / 2,
-			ly + y4m_splash_logo->height + 20, "%s", sys_os_version_str);
+			ly + yde_splash_logo->height + 20, "%s", sys_os_version_str);
 	dc->color = ColorRGB(0x8A, 0x94, 0xA8);
-	GrPrint(dc, (w - StrLen(y4m_splash_motto) * FONT_WIDTH) / 2,
-			ly + y4m_splash_logo->height + 36, "%s", y4m_splash_motto);
+	GrPrint(dc, (w - StrLen(yde_splash_motto) * FONT_WIDTH) / 2,
+			ly + yde_splash_logo->height + 36, "%s", yde_splash_motto);
 	dc->color = ColorRGB(0x60, 0x68, 0x7C);
-	GrPrint(dc, (w - 21 * FONT_WIDTH) / 2, h - 24, "Press any key to boot");
+	GrPrint(dc, (w - 21 * FONT_WIDTH) / 2, h - 24, "Any key skips the wait");
 }
 
-U0 Y4MSplash()
+U0 YDESplash()
 {
-	y4m_splash_motto = MStrPrint("%Z", RandU8 % DefineCount("Y4M_MOTTOS"), "Y4M_MOTTOS");
-	Y4MSplashLogoMake;
+	I64	 msg, a1, a2;
+	F64	 t0 = tS;
+	Bool done = FALSE;
+
+	yde_splash_motto = MStrPrint("%Z", RandU8 % DefineCount("YDE_MOTTOS"), "YDE_MOTTOS");
+	YDESplashLogoMake;
+	if (!Fs->put_doc)
+		DocTermNew; //Pre-Home PopUp tasks come up bare.
+	LBts(&Fs->display_flags, DISPLAYf_SHOW);
 	WinBorder(OFF);
 	WinMax;
 	DocCursor(OFF);
 	DocClear;
-	Fs->draw_it = &Y4MSplashDraw;
+	Fs->draw_it = &YDESplashDraw;
 
-	CharGet(, FALSE);
+	WinToTop;
+	WinZBufUpdate;
+	while (!done && tS - t0 < 12.0)
+	{
+		while (msg = MessageScan(&a1, &a2))
+			if (msg == MESSAGE_KEY_DOWN)
+				done = TRUE;
+		WinMax;   //Boot tiling (WinTileVert) keeps resizing us; stay big...
+		WinToTop; //...and above the fresh terminals.
+		if (ac.task && TaskValidate(ac.task))
+			LBtr(&ac.task->display_flags, DISPLAYf_SHOW); //AC floats above all.
+		Sleep(60);
+	}
+	if (ac.task && TaskValidate(ac.task))
+		LBts(&ac.task->display_flags, DISPLAYf_SHOW);
 
 	Fs->draw_it = NULL;
-	DCDel(y4m_splash_logo);
-	Free(y4m_splash_motto);
+	DCDel(yde_splash_logo);
+	Free(yde_splash_motto);
 }
 
-Y4MSplash;
+YDESplash;

@@ -16,6 +16,57 @@ U0 GrUpdateTaskODEs(CTask *task)
 	sys_task_being_screen_updated = NULL;
 }
 
+extern Bool TextColorChar(CTask *task, I64 x, I64 y, I64 d, CColorROPU32 fg, CColorROPU32 bg, Bool allow_border);
+
+U0 GrFlatTitleRow(CTask *task, Bool focused)
+{//Modern flat truecolor title row, painted over the DolDoc border top line.
+//Layout mirrors $LK,"DocBorderNew",A="MN:DocBorderNew"$ so the MENU (far left) and [X] (far right)
+//click zones keep working. Toggle via $LK,"GuiMenuBarModern",A="MN:GuiMenuBarModern"$().
+	I64	 l = task->win_left - 1, r = task->win_right + 1, row = task->win_top - 1;
+	I64	 w = r - l + 1, i, n, tx;
+	CColorROPU32 bar, txt, chip_bg, chip_fg;
+	U8	*menu = "MENU", *close = "[X]", *title = task->task_title;
+
+	if (row < 0 || w < 14)
+		return;
+	bar = gr.tc_border_bg;
+	if (focused)
+		txt = gr.tc_border_fg;
+	else
+		txt = gr.tc_border_unfocus_fg;
+	for (i = 0; i < w; i++)
+		TextColorChar(Fs, l + i, row, ' ', txt, bar, TRUE);
+
+	n = StrLen(title);
+	if (n > w - 12)
+		n = w - 12;
+	tx = l + (w - n) / 2;
+	for (i = 0; i < n; i++)
+		TextColorChar(Fs, tx + i, row, title[i], txt, bar, TRUE);
+
+	if (task != sys_task && task != ac.task)
+	{//MENU chip, same cells DolDoc used.
+		if (focused)
+		{
+			chip_bg = gr.tc_border_fg;
+			chip_fg = gr.tc_border_bg;
+		}
+		else
+		{
+			chip_bg = gr.tc_border_unfocus_fg;
+			chip_fg = gr.tc_border_bg;
+		}
+		for (i = 0; i < 4; i++)
+			TextColorChar(Fs, l + i, row, menu[i], chip_fg, chip_bg, TRUE);
+	}
+	if (task != sys_task)
+	{//Close chip at the right edge.
+		for (i = 0; i < 3; i++)
+			TextColorChar(Fs, r - 2 + i, row, close[i],
+						  ColorRGB(0xFF, 0xE8, 0xE8), ColorRGB(0xB4, 0x40, 0x48), TRUE);
+	}
+}
+
 U0 GrUpdateTaskWin(CTask *task)
 { //Draw a win. Only Core0 tasks have a win.
 	CDC		*dc;
@@ -61,6 +112,11 @@ U0 GrUpdateTaskWin(CTask *task)
 		}
 		else if (!(task->win_inhibit & WIF_SELF_DOC))
 			DocUpdateTaskDocs(task);
+		//The flat title row must beat the border doc, which just re-rendered
+		//the classic MENU/title/[X] text over the top border line.
+		if (gr.tc_chrome && gr.tc_flat_menu &&
+			!Bt(&task->display_flags, DISPLAYf_NO_BORDER))
+			GrFlatTitleRow(task, task == sys_focus_task);
 		if (TaskValidate(task))
 		{
 			if (task->draw_it)
@@ -642,9 +698,10 @@ U0 GrWinLayerComposite()
 //background blends at translucent_alpha; glyph text stays opaque for readability.
 	CTask *t = gr.translucent_task;
 	I64  cl, cr, ct, cb, cx, cy, idx, cell, ch, fg, bg, a, ia,
-		 px, py, brow, sy, d, br, bgc, bl, w1 = gr.dc2->width_internal;
+		 px, py, brow, sy, sx, d, br, bgc, bl, w1 = gr.dc2->width_internal;
 	U64  bits;
-	U32 *dst_base = gr.dc2->body, *dstp;
+	U32 *dst_base = gr.dc2->body, *dstp, *wall_row;
+	CDC *wall = gr.translucent_bg;
 
 	if (!t || !TaskValidate(t) || !Bt(&t->display_flags, DISPLAYf_SHOW))
 		return;
@@ -674,6 +731,8 @@ U0 GrWinLayerComposite()
 		{
 			idx  = cy * TEXT_COLS + cx;
 			cell = gr.layer_base[idx];
+			if (!cell)
+				goto layer_next_cell; //Cell not owned by this window: leave dc2.
 			if (cell & ATTRF_TRUE_COLOR)
 			{
 				fg = gr.layer_fg[idx];
@@ -693,13 +752,21 @@ U0 GrWinLayerComposite()
 				brow = bits >> (py * 8) & 0xFF;
 				sy	 = cy * FONT_HEIGHT + py;
 				dstp = dst_base + sy * w1 + cx * FONT_WIDTH;
+				wall_row = NULL;
+				if (wall && sy < wall->height)
+					wall_row = wall->body + sy * wall->width_internal;
 				for (px = 0; px < FONT_WIDTH; px++)
 				{
 					if (brow & 1 << px)
 						dstp[px] = fg;
 					else
-					{
-						d	= dstp[px];
+					{//Blend base: the wallpaper if the DE registered one (the
+					//z-buffer left these cells unpainted), else what's in dc2.
+						sx = cx * FONT_WIDTH + px;
+						if (wall_row && sx < wall->width)
+							d = wall_row[sx];
+						else
+							d = dstp[px];
 						br	= ((bg >> 16 & 0xFF) * a + (d >> 16 & 0xFF) * ia) / 255;
 						bgc	= ((bg >> 8  & 0xFF) * a + (d >> 8  & 0xFF) * ia) / 255;
 						bl	= ((bg       & 0xFF) * a + (d       & 0xFF) * ia) / 255;
@@ -707,6 +774,7 @@ U0 GrWinLayerComposite()
 					}
 				}
 			}
+layer_next_cell:;
 		}
 	}
 }

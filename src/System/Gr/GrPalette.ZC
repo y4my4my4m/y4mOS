@@ -92,6 +92,12 @@ public U0 GuiChromePalette()
 	gr.tc_chrome = FALSE;
 }
 
+public U0 GuiMenuBarModern(Bool on=TRUE)
+{//Flat truecolor title rows (painted over the DolDoc border top line; the
+//MENU/[X] click zones keep working). Needs tc_chrome. FALSE = classic look.
+	gr.tc_flat_menu = on;
+}
+
 //Vibrant truecolor syntax-highlight scheme, indexed by the DOC_COLOR_* palette
 //slot the highlighter picks (see $LK,"highlight_hash_type_colors",A="MN:highlight_hash_type_colors"$). Independent of the
 //theme's 16 slots, so code can use colors the theme palette doesn't have.

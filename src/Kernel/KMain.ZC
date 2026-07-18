@@ -78,15 +78,15 @@ U0 SysGrInit()
 
 	//patch some chars
 	text.aux_font[10]	= text.font[10]; //"Return" symbol 
-	text.aux_font[255]	= text.font[255]; //Block symbol ÿ
+	text.aux_font[255]	= text.font[255]; //Block symbol ï¿½
 
-	for (i = '³'; i < 'Û'; i++)
+	for (i = 'ï¿½'; i < 'ï¿½'; i++)
 		text.aux_font[i] = text.font[i];
 
-	text.aux_font['©'] = text.font['©'];
+	text.aux_font['ï¿½'] = text.font['ï¿½'];
 	
-	text.border_chars[2] (I64) = 'ÄÍ³ºÚÉ¿»';
-	text.border_chars[10](U32) = 'ÀÈÙ¼';
+	text.border_chars[2] (I64) = 'ï¿½Í³ï¿½ï¿½É¿ï¿½';
+	text.border_chars[10](U32) = 'ï¿½ï¿½Ù¼';
 
 	text.cols = sys_framebuffer_width  / FONT_WIDTH;
 	text.rows = sys_framebuffer_height / FONT_HEIGHT;
@@ -153,7 +153,7 @@ U0 KMain()
 	//Before this point use $LK,"Sound",A="MN:Sound"$() and $LK,"Busy",A="MN:Busy"$()
 	//to debug.  After this point, use $LK,"RawPrint",A="MN:RawPrint"$()
 	LBts(&sys_run_level, RLf_RAW);
-	sys_os_version_str = MStrPrint("y4mOS V%0.2f.%d", sys_os_version, sys_os_version_sub);
+	sys_os_version_str = MStrPrint("YDE/ZealOS V%0.2f.%d", sys_os_version, sys_os_version_sub);
 	sys_os_version_nice = MStrPrint("%s\t%D %T\n", sys_os_version_str, sys_compile_time, sys_compile_time);
 	sys_os_version_full = MStrPrint("%s-%d.%d\n", sys_os_version_str, sys_compile_time.date, sys_compile_time.time);
 	"\n%s\n", sys_os_version_full;

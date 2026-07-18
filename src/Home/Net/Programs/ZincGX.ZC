@@ -1245,12 +1245,37 @@ U0 GxClickContent(I64 x, I64 y)
 					gx.relayout = TRUE;
 					break;
 				case GXW_SUBMIT:
+					s = ZNodeAttr(op->node, "onclick");
+					if (s && zinc_js)
+					{//A submit button may carry onclick too; run it first.
+						if (!JsRun(zinc_js, s))
+							ZincJsNote;
+						gx.relayout = TRUE;
+						if (zinc_js->navigate)
+						{
+							GxNavTo(StrNew(zinc_js->navigate));
+							zinc_js->navigate = NULL;
+							return;
+						}
+					}
 					sub = ZincFormSubmitUrl(op->node);
 					if (sub)
 						GxNavTo(sub);
 					break;
 				case GXW_BUTTON:
-					break; //onclick JS not wired in GX yet.
+					s = ZNodeAttr(op->node, "onclick");
+					if (s && zinc_js)
+					{
+						if (!JsRun(zinc_js, s))
+							ZincJsNote;
+						gx.relayout = TRUE; //DOM likely changed (innerHTML etc).
+						if (zinc_js->navigate)
+						{
+							GxNavTo(StrNew(zinc_js->navigate));
+							zinc_js->navigate = NULL;
+						}
+					}
+					break;
 			}
 			return;
 		}

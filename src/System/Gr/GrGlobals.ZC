@@ -14,7 +14,7 @@ public class CGrGlobals
 
 	//Truecolor window chrome. When tc_chrome, borders draw in these pre-resolved
 	//pixs instead of the palette border_attr. Set via $LK,"GuiChromeTrueColor",A="MN:GuiChromeTrueColor"$().
-	Bool		 tc_chrome, tc_syntax, pad_tc[6];
+	Bool		 tc_chrome, tc_syntax, tc_flat_menu, pad_tc[5];
 	U32			 tc_border_fg, tc_border_unfocus_fg, tc_border_bg, tc_title_fg, tc_title_bg, pad_tc2;
 
 	//Alpha overlays: truecolor DCs composited over the FINISHED screen each frame,
@@ -30,6 +30,10 @@ public class CGrGlobals
 	CTask		*translucent_task;
 	I64			 translucent_alpha;
 	U32			*layer_base, *layer_fg, *layer_bg;
+	//Optional blend base for the translucent window: usually the desktop
+	//wallpaper (set by the DE). Without it, cells the z-buffer assigned to the
+	//translucent window have nothing beneath them and blend against black.
+	CDC			*translucent_bg;
 
 	U16			*win_z_buf;
 
