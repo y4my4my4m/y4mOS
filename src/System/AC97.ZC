@@ -104,6 +104,28 @@ public I64 AudioSFXPlay(U32 *frames, I64 count)
 	return stream;
 }
 
+public U0 AC97ToneTest(I64 ms=1500, I64 hz=440)
+{//Queue a square-wave test tone on a free output stream.
+	I64  i, frames = 48000 * ms / 1000, half = 24000 / hz;
+	I16  s;
+	U32 *buf;
+
+	if (!ac97.present)
+		return;
+	buf = MAlloc(frames * sizeof(U32));
+	for (i = 0; i < frames; i++)
+	{
+		if (i / half & 1)
+			s = 0x2000;
+		else
+			s = -0x2000;
+		buf[i].i16[0] = s;
+		buf[i].i16[1] = s;
+	}
+	AudioSFXPlay(buf, frames);
+	Free(buf);
+}
+
 public U0 AC97MasterVolumeSet(I64 pct)
 {//0 = mute, 100 = max.
 	I64 att;
@@ -121,7 +143,7 @@ public U0 AC97MasterVolumeSet(I64 pct)
 U0 AC97OutputMix(U32 *buf, I64 length)
 {
 	I64 i, j, acc_l, acc_r, acc_streams;
-	U32 sample;
+	I64 sample;
 
 	for (i = 0; i < length / 4; i++)
 	{
@@ -149,15 +171,18 @@ U0 AC97OutputMix(U32 *buf, I64 length)
 	}
 }
 
+
 U0 AC97BufferFill()
 {
-	I64  idx = InU8(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_LAST_VALID_ENTRY) & (AC97_MAX_BDLS - 1);
+	I64  idx = InU8(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_LAST_VALID_ENTRY);
 	U32 *buf;
 
-	idx = (idx + 1) & (AC97_MAX_BDLS - 1); //Ring-safe; original overran entry 32.
-	buf = ac97.bdl->entries[idx].addr;
+	//Match the known-working driver EXACTLY: mix into the entry the hardware
+	//reports as last-valid, then advance the register. idx is a 5-bit hw field
+	//(0-31), so entries[idx] is in-bounds; ++idx is masked to 5 bits by the hw.
+	buf = ac97.bdl->entries[idx & (AC97_MAX_BDLS - 1)].addr;
 	AC97OutputMix(buf, AC97_BDL_BUF_SIZE);
-	OutU8(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_LAST_VALID_ENTRY, idx);
+	OutU8(ac97.nabm + AC97_PCM_OUTPUT_REG_BOX + AC97_LAST_VALID_ENTRY, idx + 1);
 }
 
 U0 AC97MixTask()

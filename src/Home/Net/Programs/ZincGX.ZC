@@ -804,9 +804,42 @@ U0 GxNavTo(U8 *target_new)
 	gx.pending_nav = target_new;
 }
 
-U0 GxLoadTask()
-{//Fetch + parse the page in a child task so the main UI can cancel it.
-	ZincLoad(gx.load_url);
+//Fetch results handed from the child fetch task to the main task. The body is
+//allocated on the SYS heap so it survives the child task's death (a child's
+//own heap is freed when it exits - which is why parsing must happen in the
+//main task, not here).
+U8	*gx_fetch_body;
+I64	 gx_fetch_status;
+Bool gx_fetch_html, gx_fetch_ok;
+
+U0 GxFetchTask()
+{//Blocking network fetch ONLY. No DOM parsing here (heap would die with us).
+	CHttpResponse	*r;
+	U8				*ct;
+
+	gx_fetch_body = NULL;
+	gx_fetch_status = 0;
+	gx_fetch_html = TRUE;
+	gx_fetch_ok = FALSE;
+	r = HttpGet(gx.load_url);
+	if (r && r->body)
+	{
+		gx_fetch_status = r->status;
+		gx_fetch_body = MAlloc(r->body_length + 1, sys_task);
+		MemCopy(gx_fetch_body, r->body, r->body_length + 1);
+		ct = HttpHeaderGet(r->headers, "Content-Type");
+		if (ct)
+		{
+			if (!StrIMatch("html", ct) && !StrIMatch("xhtml", ct))
+				gx_fetch_html = FALSE;
+			Free(ct);
+		}
+		if (!gx_fetch_html && gx_fetch_body[0] == '<')
+			gx_fetch_html = TRUE;
+		gx_fetch_ok = TRUE;
+	}
+	if (r)
+		HttpResponseFree(r);
 	gx.loading = FALSE;
 	gx.load_task = NULL;
 }
@@ -1018,31 +1051,72 @@ public U0 ZincGX(U8 *start_url=NULL)
 			while (gx.img_busy) //Wait out any in-flight image fetch.
 				Sleep(5);
 			GxImgCacheFree; //New page: drop old decoded images.
-			//Fetch in a child task so ESC / Stop can cancel a slow load.
-			StrCopy(gx.load_url, current);
-			gx.loading = TRUE;
-			gx.cancel = FALSE;
-			StrCopy(zinc_note, "Loading...");
-			gx.load_task = Spawn(&GxLoadTask, NULL, "ZincGX Load", 4);
-			while (gx.loading)
-			{
-				while (msg = MessageScan(&a1, &a2))
-					if (msg == MESSAGE_MS_L_DOWN)
-					{//Stop button lives where Reload normally is.
-						if (a2 < GX_CHROME_H && 64 <= a1 < 90)
-							gx.cancel = TRUE;
-					}
-					else if (msg == MESSAGE_KEY_DOWN && (a1 == CH_ESC || a1 == CH_SHIFT_ESC))
-						gx.cancel = TRUE;
-				if (gx.cancel && TaskValidate(gx.load_task))
+			zinc_note[0] = 0;
+			DocClear(Fs->display_doc);
+
+			if (!StrNICompare(current, "zinc:", 5))
+			{//Built-in page: parse directly in THIS (main) task's heap.
+				if (!StrICompare(current, "zinc:test"))
+					ZincSetPage(current, zinc_testpage);
+				else
+					ZincSetPage(current, zinc_welcome);
+				zinc_base_ok = FALSE;
+			}
+			else
+			{//Network fetch runs in a child so ESC / Stop can cancel it. The
+			//child only fetches; WE parse the DOM here so it lives in OUR heap.
+				StrCopy(gx.load_url, current);
+				gx.loading = TRUE;
+				gx.cancel = FALSE;
+				StrCopy(zinc_note, "Loading...");
+				gx.load_task = Spawn(&GxFetchTask, NULL, "ZincGX Fetch", 4);
+				while (gx.loading)
 				{
-					Kill(gx.load_task);
-					gx.load_task = NULL;
-					gx.loading = FALSE;
-					ZincSetPage(current, "<p>Load cancelled.</p>");
-					StrCopy(zinc_note, "Cancelled.");
+					while (msg = MessageScan(&a1, &a2))
+						if (msg == MESSAGE_MS_L_DOWN)
+						{//Stop button lives where Reload normally is.
+							if (a2 < GX_CHROME_H && 64 <= a1 < 90)
+								gx.cancel = TRUE;
+						}
+						else if (msg == MESSAGE_KEY_DOWN && (a1 == CH_ESC || a1 == CH_SHIFT_ESC))
+							gx.cancel = TRUE;
+					if (gx.cancel && TaskValidate(gx.load_task))
+					{
+						Kill(gx.load_task);
+						gx.load_task = NULL;
+						gx.loading = FALSE;
+						gx_fetch_ok = FALSE;
+						StrCopy(zinc_note, "Cancelled.");
+					}
+					else if (!gx.cancel && !TaskValidate(gx.load_task))
+					{//Fetch task died (e.g. faulted) without clearing loading.
+						gx.loading = FALSE;
+						gx_fetch_ok = FALSE;
+					}
+					Sleep(20);
 				}
-				Sleep(20);
+				//Parse the fetched body (or an error page) in the main heap.
+				if (gx.cancel)
+					ZincSetPage(current, "<p>Load cancelled.</p>");
+				else if (gx_fetch_ok && gx_fetch_body)
+				{
+					if (gx_fetch_status != 200)
+						StrPrint(zinc_note, "HTTP status %d", gx_fetch_status);
+					zinc_base_ok = (HttpUrlParse(current, &zinc_base) >= 0);
+					if (gx_fetch_html)
+						ZincSetPage(current, gx_fetch_body);
+					else
+						ZincSetPlainPage(current, gx_fetch_body);
+				}
+				else
+				{
+					StrCopy(zinc_note, "Fetch failed. See the Network Log.");
+					ZincSetPage(current, "<p>Could not load the page.</p>"
+						"<p>DNS, TCP, TLS or HTTP failed. For https, run "
+						"<b>CryptoSelfTest;</b> once in a terminal.</p>");
+				}
+				Free(gx_fetch_body); //SYS-heap copy; DOM kept its own copies.
+				gx_fetch_body = NULL;
 			}
 			gx.fetch = FALSE;
 			if (zinc_js && zinc_js->navigate && nav_chain < 5)

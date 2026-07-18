@@ -59,9 +59,11 @@ F64	mp3_cos_n36[18][36];     //decoder computes ~400M Cos() per song.
 F64	mp3_store[64][18];       //[ch*32+sb][i]
 F64	mp3_v_vec[2][1024];
 F64	mp3_synth_nwin[64][32];
-Bool	mp3_tabs_init, mp3_hsynth_reset, mp3_synth_reset;
+//ZealOS JIT does NOT zero uninitialized globals (task-heap alloc) - anything
+//read before first write MUST have an explicit initializer.
+Bool	mp3_tabs_init = FALSE, mp3_hsynth_reset = FALSE, mp3_synth_reset = FALSE;
 
-U0	(*mp3_progress_cb)(I64 pct); //Optional; called during MP3Decode.
+U0	(*mp3_progress_cb)(I64 pct) = NULL; //Optional; called during MP3Decode.
 
 F64 MP3Pow2(F64 x)
 {
@@ -92,7 +94,7 @@ U0 MP3TabsInit()
 
 	for (i = 0; i < 64; i++)
 		for (j = 0; j < 32; j++)
-			mp3_synth_nwin[i][j] = Cos((16 + i)(F64) * (2 * j + 1) * (pi / 64.0));
+			mp3_synth_nwin[i][j] = Cos(ToF64(16 + i) * (2 * j + 1) * (pi / 64.0));
 
 	for (i = 0; i < 6; i++) //IMDCT: m rows, p columns.
 		for (j = 0; j < 12; j++)

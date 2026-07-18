@@ -472,7 +472,7 @@ U0 ZADecodeTask()
 		rate = mp3_stream_rate;
 		zamp.media.channels = mp3_stream_channels;
 		zamp.media.sample_rate_khz = rate / 1000;
-		step = rate(F64) / ZA_RATE;
+		step = ToF64(rate) / ZA_RATE; //NOT rate(F64): ZealC ignores postfix casts -> int div -> 0.
 		//Flatten this frame's mp3_out (2 granules x 576) to interleaved I16.
 		for (i = 0; i < 1152; i++)
 		{
@@ -727,7 +727,7 @@ U0 ZAToneLoad()
 	for (i = 0; i < frames; i++)
 	{
 		note = i * 8 / frames % 4;
-		t = i(F64) / ZA_RATE;
+		t = ToF64(i) / ZA_RATE; //NOT i(F64): ZealC ignores postfix casts -> int div -> 0.
 		v = 12000.0 * Sin(2 * pi * za_tone_freqs[note] * t);
 		pcm[i].i16[0] = ToI64(v);
 		pcm[i].i16[1] = ToI64(v);
