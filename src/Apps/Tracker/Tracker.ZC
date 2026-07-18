@@ -50,7 +50,8 @@ class CTrGlobals
 	I64		 view_top;				//First grid row shown.
 	I64		 gen_step, gen_pos;		//Synth position (step / song order index).
 	I64		 stream;				//Mixer stream we own.
-	Bool	 playing, song_mode, quit;
+	U8		 file[256];				//Save/load path.
+	Bool	 playing, song_mode, quit, show_help;
 	CTask	*play_task, *win_task;
 	F64		 phase[TR_CHANNELS];
 	I64		 noise_hold[TR_CHANNELS], noise_val[TR_CHANNELS];
@@ -253,7 +254,7 @@ U0 TrDrawIt(CTask *task, CDC *dc)
 	dc->color = TrInstPen(tr.inst);
 	GrPrint(dc, 366, 8, "Voice %s", tr_inst_names[tr.inst]);
 	dc->color = de_theme.text_dim;
-	GrPrint(dc, 12, 22, "SPACE play  -/= pattern  F6/F7 order  F8 mode  F9/F10 file  ESC");
+	GrPrint(dc, 12, 22, "/ = HELP   SPACE play   -/= pattern   F9/F10 save/load   ESC quit");
 
 	//Playhead math (approximate: frames the mixer consumed so far).
 	if (tr.playing)
@@ -362,6 +363,37 @@ U0 TrDrawIt(CTask *task, CDC *dc)
 			GrPrint(dc, x, y, "%s", buf);
 		}
 	}
+
+	if (tr.show_help)
+	{//Keybind cheat sheet, drawn over everything.
+		x = 44;
+		y = 150;
+		dc->color = de_theme.panel;
+		GrRect(dc, x, y, 392, 252);
+		dc->color = de_theme.accent;
+		GrRect(dc, x, y, 392, 1);
+		GrRect(dc, x, y + 251, 392, 1);
+		GrRect(dc, x, y, 1, 252);
+		GrRect(dc, x + 391, y, 1, 252);
+		GrPrint(dc, x + 12, y + 8, "YTRACKER KEYS");
+		dc->color = de_theme.text;
+		GrPrint(dc, x + 12, y + 26,  "Arrows        move (Home/End = top/bottom)");
+		GrPrint(dc, x + 12, y + 40,  "ZSXDCVGBHNJM  notes, low octave");
+		GrPrint(dc, x + 12, y + 54,  "Q2W3ER5T6Y7U  notes, upper octave");
+		GrPrint(dc, x + 12, y + 68,  "PgUp / PgDn   octave up / down");
+		GrPrint(dc, x + 12, y + 82,  "F1..F5        voice: SIN P50 P25 TRI NSE");
+		GrPrint(dc, x + 12, y + 96,  ", / .         cell velocity down / up");
+		GrPrint(dc, x + 12, y + 110, "DEL or 0      clear cell");
+		GrPrint(dc, x + 12, y + 124, "- / =         previous / next pattern");
+		GrPrint(dc, x + 12, y + 138, "F6 / F7       song: append pat / remove last");
+		GrPrint(dc, x + 12, y + 152, "F8            play mode: song <-> pattern");
+		GrPrint(dc, x + 12, y + 166, "SPACE         play / stop");
+		GrPrint(dc, x + 12, y + 180, "[ / ]         tempo down / up");
+		GrPrint(dc, x + 12, y + 194, "F9 / F10      save as... / load...");
+		GrPrint(dc, x + 12, y + 208, "Click a cell  move the cursor there");
+		dc->color = de_theme.text_dim;
+		GrPrint(dc, x + 12, y + 230, "/ closes this help - ESC quits YTracker");
+	}
 }
 
 I64 TrKeyNote(I64 ch_in)
@@ -380,15 +412,37 @@ I64 TrKeyNote(I64 ch_in)
 }
 
 U0 TrSave()
-{
+{//Save As: prompt with the last path prefilled as the default.
+	U8	hdr[300];
+	U8 *name;
+
+	StrPrint(hdr, "Save song as (just ENTER keeps %s):", tr.file);
+	name = PopUpGetStr(hdr);
+
+	WinFocus(tr.win_task);
+	if (!name)
+		return;
+	if (*name)
+	{
+		StrCopy(tr.file, name);
+		if (StrLen(tr.file) > 4 && StrICompare(tr.file + StrLen(tr.file) - 4, ".DAT"))
+			CatPrint(tr.file, ".DAT");
+	}
+	Free(name);
 	tr.song.magic = 'YTK2';
-	FileWrite("~/TrackerSong.DAT", &tr.song, sizeof(CTrSong));
+	FileWrite(tr.file, &tr.song, sizeof(CTrSong));
 }
 
 U0 TrLoad()
-{
+{//Pick a song file; only YTK2 files are accepted.
 	I64		 size;
-	CTrSong *s = FileRead("~/TrackerSong.DAT", &size);
+	CTrSong *s;
+	U8		*name = PopUpPickFile("~");
+
+	WinFocus(tr.win_task);
+	if (!name)
+		return;
+	s = FileRead(name, &size);
 
 	if (s)
 	{
@@ -397,9 +451,13 @@ U0 TrLoad()
 			MemCopy(&tr.song, s, sizeof(CTrSong));
 			tr.song.bpm = ClampI64(tr.song.bpm, 40, 300);
 			tr.song.order_len = ClampI64(tr.song.order_len, 0, TR_ORDER_MAX);
+			StrCopy(tr.file, name);
 		}
+		else
+			PopUpOk("Not a YTracker song file.");
 		Free(s);
 	}
+	Free(name);
 }
 
 U0 TrClick(I64 x, I64 y)
@@ -424,6 +482,7 @@ public U0 YTracker()
 	tr.inst		= TRI_PULSE1;
 	tr.vel		= 100;
 	tr.win_task	= Fs;
+	StrCopy(tr.file, "~/TrackerSong.DAT");
 	tr.stream	= AudioAvailableOutputStreamGet;
 	if (tr.stream < 0)
 		tr.stream = 0;
@@ -460,6 +519,8 @@ public U0 YTracker()
 							tr.play_task = Spawn(&TrPlayTask, , "YTracker Synth", 1);
 						}
 					}
+					else if (a1 == '/')
+						tr.show_help = !tr.show_help;
 					else if (a1 == '-')
 						tr.edit_pat = (tr.edit_pat + TR_PATTERNS - 1) % TR_PATTERNS;
 					else if (a1 == '=')
