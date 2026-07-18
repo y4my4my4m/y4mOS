@@ -1,0 +1,595 @@
+// XMODEM / YMODEM file transfer for the ZealOS Telnet client
+// Public Domain
+
+// The transfer runs inside TerminalTask so it is the only reader of the
+// socket. The main (keyboard) task only sets term.xfer_mode to request a
+// transfer and term.xfer_abort to cancel one; it must not touch the socket
+// while term.xfer_mode is set. Status output goes through TermPutS, so this
+// file is included after TermPutS is defined in Telnet.ZC.
+
+#define XFER_NONE		0
+#define XFER_RECV		1
+#define XFER_SEND		2
+
+#define XPROTO_XMODEM	0
+#define XPROTO_YMODEM	1
+
+#define XM_SOH			0x01
+#define XM_STX			0x02
+#define XM_EOT			0x04
+#define XM_ACK			0x06
+#define XM_NAK			0x15
+#define XM_CAN			0x18
+#define XM_SUB			0x1A
+#define XM_CRC_REQ		'C'
+
+#define XFER_DOWNLOAD_DIR	"::/Tmp/Downloads"
+#define XFER_MAX_ERRORS		10
+
+// block-read results
+#define XBLK_OK			0
+#define XBLK_EOT		1
+#define XBLK_CAN		2
+#define XBLK_TIMEOUT	3
+#define XBLK_ERROR		4
+
+// Bytes TerminalTask already pulled off the socket before it noticed the
+// transfer request; consumed before any new socket reads.
+U8	*xfer_pre	  = NULL;
+I64  xfer_pre_len = 0;
+I64  xfer_pre_pos = 0;
+
+U0 XferPrint(U8 *fmt, ...)
+{ // status line onto the terminal grid, ANSI colors allowed
+	U8 *msg = StrPrintJoin(NULL, fmt, argc, argv);
+
+	TermPutS(msg);
+	Free(msg);
+}
+
+I64 XferGetByte(I64 ms)
+{ // next byte from prefill or socket; -1 on timeout/close
+	U8			 b;
+	I64			 r;
+	CTCPSocket	*tcp = term.sock;
+
+	if (xfer_pre_pos < xfer_pre_len)
+		return xfer_pre[xfer_pre_pos++];
+
+	tcp->timeout = ms;
+	r = TCPSocketReceive(term.sock, &b, 1);
+	if (r <= 0)
+		return -1;
+
+	return b;
+}
+
+U0 XferPutByte(U8 b)
+{
+	TCPSocketSend(term.sock, &b, 1);
+}
+
+U0 XferPurge()
+{ // drain line noise so the next block starts clean
+	while (XferGetByte(300) >= 0);
+}
+
+U0 XferCancel()
+{
+	XferPutByte(XM_CAN);
+	XferPutByte(XM_CAN);
+	XferPutByte(XM_CAN);
+	XferPurge;
+}
+
+U16 XferCRC16(U8 *data, I64 len)
+{ // CRC-16/XMODEM: poly 0x1021, init 0
+	I64 i, j, crc = 0;
+
+	for (i = 0; i < len; i++)
+	{
+		crc ^= (data[i] << 8);
+		for (j = 0; j < 8; j++)
+		{
+			if (crc & 0x8000)
+				crc = ((crc << 1) ^ 0x1021) & 0xFFFF;
+			else
+				crc = (crc << 1) & 0xFFFF;
+		}
+	}
+
+	return crc;
+}
+
+U0 XferSanitizeName(U8 *name)
+{ // ZealOS FileRead rejects spaces, '&', '~', '/'...: keep [A-Za-z0-9_.-]
+	U8 *p = name;
+
+	while (*p)
+	{
+		if (!('A' <= *p <= 'Z' || 'a' <= *p <= 'z' || '0' <= *p <= '9' ||
+			  *p == '.' || *p == '-' || *p == '_'))
+			*p = '_';
+		p++;
+	}
+}
+
+I64 XferReadBlock(I64 *_blk, U8 *data, I64 *_size, Bool crc_mode, I64 first_ms)
+{ // one SOH/STX block into data (up to 1024 bytes), validated
+	I64 c, i, n, blk, iblk, block_size, crc;
+
+	c = XferGetByte(first_ms);
+	if (c < 0)
+		return XBLK_TIMEOUT;
+	if (c == XM_EOT)
+		return XBLK_EOT;
+	if (c == XM_CAN)
+	{
+		if (XferGetByte(1000) == XM_CAN)
+			return XBLK_CAN;
+		return XBLK_ERROR;
+	}
+	if (c == XM_SOH)
+		block_size = 128;
+	else if (c == XM_STX)
+		block_size = 1024;
+	else
+		return XBLK_ERROR; // line noise
+
+	blk  = XferGetByte(2000);
+	iblk = XferGetByte(2000);
+	if (blk < 0 || iblk < 0 || blk + iblk != 0xFF)
+		return XBLK_ERROR;
+
+	for (i = 0; i < block_size; i++)
+	{
+		c = XferGetByte(2000);
+		if (c < 0)
+			return XBLK_ERROR;
+		data[i] = c;
+	}
+
+	if (crc_mode)
+	{
+		c = XferGetByte(2000);
+		n = XferGetByte(2000);
+		if (c < 0 || n < 0)
+			return XBLK_ERROR;
+		crc = ((c << 8) | n) & 0xFFFF;
+		if (crc != XferCRC16(data, block_size))
+			return XBLK_ERROR;
+	}
+	else
+	{
+		c = XferGetByte(2000);
+		if (c < 0)
+			return XBLK_ERROR;
+		n = 0;
+		for (i = 0; i < block_size; i++)
+			n += data[i];
+		if ((n & 0xFF) != c)
+			return XBLK_ERROR;
+	}
+
+	*_blk  = blk;
+	*_size = block_size;
+	return XBLK_OK;
+}
+
+Bool XferReceive()
+{ // download one file (XMODEM) or a batch (YMODEM); auto-detects which
+	U8	 block[1024];
+	U8	 fname[256], path[512];
+	U8	*data, *grown, *p;
+	I64  cap = 262144, len = 0;
+	I64  res, blk, bsize, expected = 1;
+	I64  errors = 0, handshakes = 0;
+	I64  file_size = -1, files_saved = 0, eot_naks = 0;
+	Bool crc_mode = TRUE, ymodem = FALSE, in_file = FALSE;
+
+	data = MAlloc(cap);
+	fname[0] = 0;
+
+	XferPrint("\r\n\x1B[1;36m[XFER]\x1B[0m Download: waiting for sender (ESC aborts)...\r\n");
+
+handshake:
+	if (term.xfer_abort)
+		goto user_abort;
+	crc_mode = handshakes < 12; // fall back to checksum mode if CRC gets no answer
+	if (crc_mode)
+		XferPutByte(XM_CRC_REQ);
+	else
+		XferPutByte(XM_NAK);
+	handshakes++;
+	res = XferReadBlock(&blk, block, &bsize, crc_mode, 3000);
+	if (res == XBLK_TIMEOUT)
+	{
+		if (handshakes >= 20)
+		{
+			XferPrint("\x1B[1;31m[XFER] No response from sender.\x1B[0m\r\n");
+			goto fail;
+		}
+		goto handshake;
+	}
+	goto have_block;
+
+next_block:
+	if (term.xfer_abort)
+		goto user_abort;
+	res = XferReadBlock(&blk, block, &bsize, crc_mode, 10000);
+
+have_block:
+	switch (res)
+	{
+		case XBLK_OK:
+			eot_naks = 0;
+			if (blk == 0 && !in_file)
+			{ // YMODEM header block: filename NUL size
+				if (!block[0])
+				{ // empty header = end of batch
+					XferPutByte(XM_ACK);
+					goto success;
+				}
+				ymodem = TRUE;
+				block[bsize - 1] = 0;
+				StrCopy(fname, block);
+				XferSanitizeName(fname);
+				p = block + StrLen(block) + 1;
+				file_size = -1;
+				if ('0' <= *p <= '9')
+					file_size = Str2I64(p);
+				expected = 1;
+				len = 0;
+				errors = 0;
+				XferPutByte(XM_ACK);
+				XferPutByte(XM_CRC_REQ); // start the data phase
+				XferPrint("\x1B[1;36m[XFER]\x1B[0m YMODEM file: %s (%d bytes)\r\n",
+						  fname, file_size);
+				goto next_block;
+			}
+			if (blk == (expected & 0xFF))
+			{
+				in_file = TRUE;
+				while (len + bsize > cap)
+				{
+					grown = MAlloc(cap * 2);
+					MemCopy(grown, data, len);
+					Free(data);
+					data = grown;
+					cap *= 2;
+				}
+				MemCopy(data + len, block, bsize);
+				len += bsize;
+				expected++;
+				errors = 0;
+				XferPutByte(XM_ACK);
+				if ((expected & 0x1F) == 0)
+					XferPrint("\x1B[1;36m[XFER]\x1B[0m %d bytes...\r\n", len);
+				goto next_block;
+			}
+			if (blk == ((expected - 1) & 0xFF))
+			{ // duplicate block: our ACK got lost
+				XferPutByte(XM_ACK);
+				goto next_block;
+			}
+			XferPrint("\x1B[1;31m[XFER] Block sequence error (got %d, wanted %d).\x1B[0m\r\n",
+					  blk, expected & 0xFF);
+			XferCancel;
+			goto fail;
+
+		case XBLK_EOT:
+			if (!eot_naks)
+			{ // standard EOT dance: NAK the first, ACK the second
+				eot_naks = 1;
+				XferPutByte(XM_NAK);
+				goto next_block;
+			}
+			XferPutByte(XM_ACK);
+			if (0 <= file_size <= len)
+				len = file_size; // YMODEM told us the exact size
+			else
+				while (len > 0 && data[len - 1] == XM_SUB)
+					len--;		 // XMODEM: strip pad bytes
+			goto save_file;
+
+		case XBLK_CAN:
+			XferPrint("\x1B[1;31m[XFER] Cancelled by remote.\x1B[0m\r\n");
+			goto fail;
+
+		case XBLK_TIMEOUT:
+		case XBLK_ERROR:
+			errors++;
+			if (errors >= XFER_MAX_ERRORS)
+			{
+				XferPrint("\x1B[1;31m[XFER] Too many errors.\x1B[0m\r\n");
+				XferCancel;
+				goto fail;
+			}
+			XferPurge;
+			if (!len && crc_mode)
+				XferPutByte(XM_CRC_REQ); // still in handshake/header phase
+			else
+				XferPutByte(XM_NAK);
+			goto next_block;
+	}
+
+save_file:
+	if (!files_saved && term.xfer_path[0] && StrFirstOcc(term.xfer_path, "/"))
+		StrCopy(path, term.xfer_path); // user gave a full path
+	else
+	{
+		DirMake(XFER_DOWNLOAD_DIR);
+		if (!files_saved && term.xfer_path[0])
+			StrPrint(path, "%s/%s", XFER_DOWNLOAD_DIR, term.xfer_path);
+		else if (fname[0])
+			StrPrint(path, "%s/%s", XFER_DOWNLOAD_DIR, fname);
+		else
+			StrPrint(path, "%s/DOWNLOAD.BIN", XFER_DOWNLOAD_DIR);
+	}
+	FileWrite(path, data, len);
+	files_saved++;
+	XferPrint("\x1B[1;32m[XFER] Saved %s (%d bytes).\x1B[0m\r\n", path, len);
+	if (ymodem)
+	{ // ask for the next file in the batch
+		in_file = FALSE;
+		eot_naks = 0;
+		fname[0] = 0;
+		file_size = -1;
+		expected = 1;
+		len = 0;
+		errors = 0;
+		XferPutByte(XM_CRC_REQ);
+		goto next_block;
+	}
+	goto success;
+
+user_abort:
+	XferCancel;
+	XferPrint("\x1B[1;31m[XFER] Aborted by user.\x1B[0m\r\n");
+
+fail:
+	Free(data);
+	return FALSE;
+
+success:
+	Free(data);
+	return files_saved > 0;
+}
+
+I64 XferSendBlock(U8 *data, I64 dsize, I64 blk, Bool crc_mode)
+{ // send one block until ACKed: 0=ok 1=remote cancel 2=too many errors 3=user abort
+	U8  pkt[1029];
+	I64 i, n, c, len, tries = 0;
+
+	if (dsize == 1024)
+		pkt[0] = XM_STX;
+	else
+		pkt[0] = XM_SOH;
+	pkt[1] = blk & 0xFF;
+	pkt[2] = 0xFF - (blk & 0xFF);
+	MemCopy(&pkt[3], data, dsize);
+	len = 3 + dsize;
+	if (crc_mode)
+	{
+		n = XferCRC16(data, dsize);
+		pkt[len++] = (n >> 8) & 0xFF;
+		pkt[len++] = n & 0xFF;
+	}
+	else
+	{
+		n = 0;
+		for (i = 0; i < dsize; i++)
+			n += data[i];
+		pkt[len++] = n & 0xFF;
+	}
+
+resend:
+	if (term.xfer_abort)
+		return 3;
+	TCPSocketSend(term.sock, pkt, len);
+	c = XferGetByte(10000);
+	if (c == XM_ACK)
+		return 0;
+	if (c == XM_CAN)
+	{
+		if (XferGetByte(1000) == XM_CAN)
+			return 1;
+	}
+	// NAK, 'C', junk or timeout: try again
+	tries++;
+	if (tries >= XFER_MAX_ERRORS)
+		return 2;
+	goto resend;
+}
+
+Bool XferSend()
+{ // upload term.xfer_path with XMODEM or YMODEM (term.xfer_proto)
+	U8	 dbuf[1024];
+	U8	 name[256];
+	U8	*fbuf, *p;
+	I64  fsize = 0;
+	I64  c, n, res, tries, blk, pos, dsize;
+	Bool crc_mode = TRUE, ymodem = (term.xfer_proto == XPROTO_YMODEM);
+
+	fbuf = FileRead(term.xfer_path, &fsize);
+	if (!fbuf)
+	{
+		XferPrint("\x1B[1;31m[XFER] Can't read %s.\x1B[0m\r\n", term.xfer_path);
+		return FALSE;
+	}
+
+	p = StrLastOcc(term.xfer_path, "/");
+	if (p)
+		StrCopy(name, p + 1);
+	else
+		StrCopy(name, term.xfer_path);
+	name[100] = 0; // must fit in the 128-byte YMODEM header with the size field
+
+	XferPrint("\r\n\x1B[1;36m[XFER]\x1B[0m Upload %s (%d bytes): waiting for receiver (ESC aborts)...\r\n",
+			  name, fsize);
+
+	// receiver starts the show: 'C' = CRC, NAK = checksum
+	tries = 0;
+wait_start:
+	if (term.xfer_abort)
+		goto user_abort;
+	c = XferGetByte(1000);
+	if (c == XM_CRC_REQ)
+		crc_mode = TRUE;
+	else if (c == XM_NAK)
+		crc_mode = FALSE;
+	else if (c == XM_CAN && XferGetByte(500) == XM_CAN)
+		goto remote_abort;
+	else
+	{
+		tries++;
+		if (tries >= 60)
+		{
+			XferPrint("\x1B[1;31m[XFER] No response from receiver.\x1B[0m\r\n");
+			goto fail;
+		}
+		goto wait_start;
+	}
+
+	if (ymodem && !crc_mode)
+	{ // YMODEM requires CRC; receiver is plain XMODEM-checksum
+		XferPrint("\x1B[1;36m[XFER]\x1B[0m Receiver is XMODEM, downgrading.\r\n");
+		ymodem = FALSE;
+	}
+
+	if (ymodem)
+	{ // block 0: filename NUL size
+		MemSet(dbuf, 0, 128);
+		StrCopy(dbuf, name);
+		StrPrint(dbuf + StrLen(name) + 1, "%d", fsize);
+		res = XferSendBlock(dbuf, 128, 0, crc_mode);
+		if (res)
+			goto block_failed;
+		// receiver re-arms with another 'C' before the data phase
+		tries = 0;
+wait_data_start:
+		if (term.xfer_abort)
+			goto user_abort;
+		c = XferGetByte(1000);
+		if (c == XM_CAN && XferGetByte(500) == XM_CAN)
+			goto remote_abort;
+		if (c != XM_CRC_REQ)
+		{
+			tries++;
+			if (tries >= 60)
+			{
+				XferPrint("\x1B[1;31m[XFER] Receiver never started data phase.\x1B[0m\r\n");
+				goto fail;
+			}
+			goto wait_data_start;
+		}
+	}
+
+	pos = 0;
+	blk = 1;
+	while (pos < fsize)
+	{
+		if (ymodem && fsize - pos > 128)
+			dsize = 1024;
+		else
+			dsize = 128;
+		n = fsize - pos;
+		if (n > dsize)
+			n = dsize;
+		MemSet(dbuf, XM_SUB, dsize);
+		MemCopy(dbuf, fbuf + pos, n);
+		res = XferSendBlock(dbuf, dsize, blk, crc_mode);
+		if (res)
+			goto block_failed;
+		pos += n;
+		blk++;
+		if ((blk & 0x1F) == 0)
+			XferPrint("\x1B[1;36m[XFER]\x1B[0m %d/%d bytes...\r\n", pos, fsize);
+	}
+
+	tries = 0;
+send_eot:
+	if (term.xfer_abort)
+		goto user_abort;
+	XferPutByte(XM_EOT);
+	c = XferGetByte(10000);
+	if (c != XM_ACK)
+	{ // NAK on the first EOT is the standard dance
+		tries++;
+		if (tries >= XFER_MAX_ERRORS)
+		{
+			XferPrint("\x1B[1;31m[XFER] EOT never acknowledged.\x1B[0m\r\n");
+			goto fail;
+		}
+		goto send_eot;
+	}
+
+	if (ymodem)
+	{ // close the batch with an empty header block
+		tries = 0;
+wait_final:
+		c = XferGetByte(1000);
+		if (c == XM_CRC_REQ || c == XM_NAK)
+		{
+			MemSet(dbuf, 0, 128);
+			XferSendBlock(dbuf, 128, 0, c == XM_CRC_REQ);
+		}
+		else if (c < 0 && tries < 10)
+		{
+			tries++;
+			goto wait_final;
+		}
+		// receiver that skips the final header is fine too
+	}
+
+	XferPrint("\x1B[1;32m[XFER] Sent %s (%d bytes).\x1B[0m\r\n", name, fsize);
+	Free(fbuf);
+	return TRUE;
+
+block_failed:
+	if (res == 1)
+		goto remote_abort;
+	if (res == 3)
+		goto user_abort;
+	XferPrint("\x1B[1;31m[XFER] Too many errors.\x1B[0m\r\n");
+	goto fail;
+
+remote_abort:
+	XferPrint("\x1B[1;31m[XFER] Cancelled by remote.\x1B[0m\r\n");
+	goto fail;
+
+user_abort:
+	XferCancel;
+	XferPrint("\x1B[1;31m[XFER] Aborted by user.\x1B[0m\r\n");
+
+fail:
+	Free(fbuf);
+	return FALSE;
+}
+
+U0 XferRun(U8 *pre, I64 pre_len)
+{ // called from TerminalTask; pre = bytes it already read off the socket
+	Bool		 ok;
+	CTCPSocket	*tcp = term.sock;
+	I64			 saved_timeout = tcp->timeout;
+
+	xfer_pre	 = pre;
+	xfer_pre_len = pre_len;
+	xfer_pre_pos = 0;
+
+	if (term.xfer_mode == XFER_RECV)
+		ok = XferReceive;
+	else
+		ok = XferSend;
+
+	tcp->timeout   = saved_timeout;
+	xfer_pre	   = NULL;
+	xfer_pre_len   = 0;
+	term.xfer_abort = FALSE;
+	term.xfer_mode  = XFER_NONE;
+
+	if (ok)
+		XferPrint("\x1B[1;32m[XFER] Transfer complete.\x1B[0m\r\n");
+	else
+		XferPrint("\x1B[1;31m[XFER] Transfer failed.\x1B[0m\r\n");
+}
