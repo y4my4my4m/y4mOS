@@ -34,6 +34,7 @@ class CZAmpMedia
 {
 	U8		 title[256];
 	U32		 channels, sample_rate_khz;
+	I64		 bitrate_kbps;
 	U32		*pcm_data;		//U32 frames: L16 | R16 << 16, 48kHz.
 	I64		 pcm_frames;
 	I64		 fifo_frame, seek_frame, seek_to_frame;
@@ -134,6 +135,20 @@ U0 ZADrawMarquee(CDC *dc, I64 x, I64 y)
 		zamp.marquee.ticks = 0;
 		zamp.marquee.pos = (zamp.marquee.pos + 1) % zamp.marquee.len;
 	}
+}
+
+U0 ZADrawBitRate(CDC *dc, I64 x, I64 y)
+{//kbps + kHz in the skin's 5x6 digits, like the original.
+	U8 buf[16];
+
+	if (!zamp.media.bitrate_kbps)
+		return;
+	StrPrint(buf, "%03d", zamp.media.bitrate_kbps % 1000);
+	if (buf[0] == '0')
+		buf[0] = ' ';
+	ZADraw5x6Text(dc, x, y, buf);
+	StrPrint(buf, "%02d", zamp.media.sample_rate_khz % 100);
+	ZADraw5x6Text(dc, x + 46, y, buf);
 }
 
 Bool ZAHovered(I64 x, I64 y, I64 w, I64 h)
@@ -359,6 +374,7 @@ U0 ZADrawPlayer(CTask *task, CDC *dc)
 		return;
 	GrBlot(dc, 0, 0, ZA_IMG_MAIN);
 	ZADrawMarquee(dc, 113, 29);
+	ZADrawBitRate(dc, 114, 45);
 	ZADrawMonoStereo(dc, 212, 43);
 	ZADrawPlayPauseStopped(dc);
 	ZADrawTimeElapsed(dc);
@@ -401,6 +417,7 @@ U0 ZAMediaSet(U32 *pcm, I64 frames, I64 channels, I64 src_khz, U8 *title)
 	zamp.media.pcm_frames	= frames;
 	zamp.media.channels		= channels;
 	zamp.media.sample_rate_khz = src_khz;
+	zamp.media.bitrate_kbps	= 0; //Loaders fill in after.
 	zamp.media.runtime_mins	= frames / ZA_RATE / 60;
 	zamp.media.runtime_secs	= frames / ZA_RATE % 60;
 	StrCopy(zamp.media.title, title);
@@ -434,21 +451,59 @@ U0 ZAPcmSet(I16 *s, I64 in_frames, I64 channels, I64 rate, U8 *title)
 	ZAMediaSet(pcm, out_frames, channels, rate / 1000, title);
 }
 
-Bool ZAWavLoad(U8 *filename)
-{//16-bit PCM WAV -> 48kHz stereo U32 frames. Mono widened, rate resampled.
-	U8	*raw, *p, *end, *data = NULL;
-	I64	 size, chunk_size, data_size = 0;
-	I64	 channels = 0, rate = 0, bits = 0, in_frames, out_frames, i, src;
-	I16	*s;
-	U32	*pcm;
-	U8	 title[256];
+U8 *ZABasename(U8 *path)
+{
+	U8 *p = path, *last = path;
 
-	raw = FileRead(filename, &size);
-	if (!raw)
-		return FALSE;
+	while (*p)
+	{
+		if (*p == '/')
+			last = p + 1;
+		p++;
+	}
+	return last;
+}
+
+U0 ZAMp3Title(U8 *raw, I64 size, U8 *filename, U8 *out)
+{//Prefer ID3v1 "Artist - Title" from the file tail, else the basename.
+	U8	*tag = raw + size - 128;
+	U8	 t[31], a[31];
+	I64	 i;
+
+	if (size > 128 && !MemCompare(tag, "TAG", 3))
+	{
+		MemCopy(t, tag + 3, 30);
+		t[30] = 0;
+		MemCopy(a, tag + 33, 30);
+		a[30] = 0;
+		i = 29;
+		while (i >= 0 && (t[i] == ' ' || t[i] == 0))
+			t[i--] = 0;
+		i = 29;
+		while (i >= 0 && (a[i] == ' ' || a[i] == 0))
+			a[i--] = 0;
+		if (*a && *t)
+		{
+			StrPrint(out, "%s - %s", a, t);
+			return;
+		}
+		if (*t)
+		{
+			StrCopy(out, t);
+			return;
+		}
+	}
+	StrCopy(out, ZABasename(filename));
+}
+
+Bool ZAWavBuf(U8 *raw, I64 size, U8 *filename)
+{//16-bit PCM WAV -> 48kHz stereo U32 frames. Mono widened, rate resampled.
+	U8	*p, *end, *data = NULL;
+	I64	 chunk_size, data_size = 0;
+	I64	 channels = 0, rate = 0, bits = 0, in_frames;
+
 	if (size < 44 || MemCompare(raw, "RIFF", 4) || MemCompare(raw + 8, "WAVE", 4))
 	{
-		Free(raw);
 		PopUpOk("Not a RIFF/WAVE file.");
 		return FALSE;
 	}
@@ -463,7 +518,6 @@ Bool ZAWavLoad(U8 *filename)
 		{
 			if (*(p + 8)(U16 *) != 1)
 			{
-				Free(raw);
 				PopUpOk("Compressed WAV unsupported; 16-bit PCM only.");
 				return FALSE;
 			}
@@ -480,61 +534,60 @@ Bool ZAWavLoad(U8 *filename)
 	}
 	if (!data || !channels || !rate || bits != 16)
 	{
-		Free(raw);
 		PopUpOk("Need 16-bit PCM WAV with fmt+data chunks.");
 		return FALSE;
 	}
 
-	s = data;
 	in_frames = data_size / (2 * channels);
-	StrCopy(title, filename);
-	ZAPcmSet(s, in_frames, channels, rate, title);
-	Free(raw);
+	ZAPcmSet(data(I16 *), in_frames, channels, rate, ZABasename(filename));
+	zamp.media.bitrate_kbps = rate * channels * 16 / 1000;
 
 	return TRUE;
 }
 
-Bool ZAMp3Load(U8 *filename)
+Bool ZAMp3Buf(U8 *raw, I64 size, U8 *filename)
 {//Native MPEG-1 Layer III decode (MP3.ZC), then into the 48kHz pipeline.
-	U8	*raw;
 	I16	*s16;
-	I64	 size, frames, rate, channels;
+	I64	 frames, rate, channels;
+	U8	 title[300];
 
-	raw = FileRead(filename, &size);
-	if (!raw)
-		return FALSE;
 	ZAMarqueeSet("DECODING MP3 - PURE ZEALC, NO ELF - PLEASE WAIT *** ");
 	s16 = MP3Decode(raw, size, &frames, &rate, &channels);
-	Free(raw);
 	if (!s16)
 	{
 		PopUpOk("MP3 decode failed (MPEG-1 Layer III only).");
 		ZAMarqueeSet("MP3 DECODE FAILED *** ");
 		return FALSE;
 	}
-	ZAPcmSet(s16, frames, channels, rate, filename);
+	ZAMp3Title(raw, size, filename, title);
+	ZAPcmSet(s16, frames, channels, rate, title);
+	zamp.media.bitrate_kbps = mp3_bitrates[mp3_h_bitrate_index] / 1000;
 	Free(s16);
 
 	return TRUE;
 }
 
 Bool ZAOpenFile(U8 *filename)
-{//Dispatch on extension: .MP3 -> native decoder, everything else -> WAV.
-	I64 len = StrLen(filename);
-	U8	c1, c2, c3;
+{//Dispatch by CONTENT, not extension - RedSea/FAT copies can mangle names.
+//"RIFF" -> WAV; anything else is handed to the MP3 sync-scanner.
+	U8	*raw;
+	I64	 size;
+	Bool ok;
 
-	if (len > 4 && filename[len - 4] == '.')
+	raw = FileRead(filename, &size);
+	if (!raw || size < 128)
 	{
-		c1 = filename[len - 3];
-		c2 = filename[len - 2];
-		c3 = filename[len - 1];
-		if ('a' <= c1 <= 'z') c1 -= 32;
-		if ('a' <= c2 <= 'z') c2 -= 32;
-		if ('a' <= c3 <= 'z') c3 -= 32;
-		if (c1 == 'M' && c2 == 'P' && c3 == '3')
-			return ZAMp3Load(filename);
+		Free(raw);
+		PopUpOk("Can't read that file.");
+		return FALSE;
 	}
-	return ZAWavLoad(filename);
+	if (!MemCompare(raw, "RIFF", 4))
+		ok = ZAWavBuf(raw, size, filename);
+	else
+		ok = ZAMp3Buf(raw, size, filename);
+	Free(raw);
+
+	return ok;
 }
 
 F64 za_tone_freqs[4] = {261.63, 329.63, 392.0, 523.25}; //C E G C - global: no local array initializers in HolyC.
@@ -555,6 +608,7 @@ U0 ZAToneLoad()
 		pcm[i].i16[1] = ToI64(v);
 	}
 	ZAMediaSet(pcm, frames, 2, 48, "y4mOS TEST TONE");
+	zamp.media.bitrate_kbps = 1536;
 }
 
 public U0 ZealAmp()

@@ -30,12 +30,13 @@ class CDEGlobals
 	CTask	*bar_tasks[DE_BAR_TASKS_MAX];
 	I64		 bar_x0[DE_BAR_TASKS_MAX], bar_x1[DE_BAR_TASKS_MAX], bar_count;
 	I64		 chip_x0, chip_x1;
-	Bool	 on;
+	Bool	 on, net_up;
 } de;
 
-CDC *DEDCScaleNew(CDC *src, I64 w, I64 h)
-{//Nearest-neighbor scale of a truecolor DC into a new DC.
-	CDC *res = DCNew(w, h);
+CDC *DEDCScaleNew(CDC *src, I64 w, I64 h, CTask *mem_task=NULL)
+{//Nearest-neighbor scale of a truecolor DC into a new DC. mem_task matters:
+//DCs made from short-lived app tasks die with them.
+	CDC *res = DCNew(w, h, mem_task);
 	I64  x, y, sy;
 	U32 *dst, *srow;
 
@@ -66,21 +67,15 @@ U0 DEWallpaperLoad(U8 *filename)
 	U32 *dst;
 
 	if (png)
-	{
-		if (png->width != GR_WIDTH || png->height != GR_HEIGHT)
-		{
-			de.wallpaper = DEDCScaleNew(png, GR_WIDTH, GR_HEIGHT);
-			DCDel(png);
-		}
-		else
-		{
-			png->flags |= DCF_NO_TRANSPARENTS;
-			de.wallpaper = png;
-		}
+	{//Always route through the scaler (1:1 = copy) so the final DC lives on
+	//the SYSTEM heap - callers may be short-lived app tasks (Settings!), and
+	//the wallpaper must outlive them or it turns to garbage.
+		de.wallpaper = DEDCScaleNew(png, GR_WIDTH, GR_HEIGHT, sys_task);
+		DCDel(png);
 	}
 	else
 	{//No PNG found: vertical navy->violet gradient.
-		de.wallpaper = DCNew(GR_WIDTH, GR_HEIGHT);
+		de.wallpaper = DCNew(GR_WIDTH, GR_HEIGHT, sys_task);
 		for (y = 0; y < GR_HEIGHT; y++)
 		{
 			r = 12 + 30 * y / GR_HEIGHT;
@@ -102,6 +97,7 @@ U0 DEMenuTask()
 {//Launcher menu, runs in its own task so the WinMgr never blocks.
 	I64 i = PopUpPickList(
 			"New Terminal\0"
+			"Web Browser\0"
 			"ZealAmp\0"
 			"Calculator\0"
 			"Calendar\0"
@@ -121,45 +117,53 @@ U0 DEMenuTask()
 			User;
 			break;
 		case 1:
-			User("Cd(\"::/Apps/ZealAmp\");;ExeFile(\"Run\");\n");
+			if (!de.net_up)
+			{//Compile net + TLS + Zinc into the System task once, system-wide.
+				Sys("ExeFile(\"::/DE/BrowserBoot\");");
+				de.net_up = TRUE;
+			}
+			User("Zinc;\n");
 			break;
 		case 2:
-			User("DECalc;\n");
+			User("Cd(\"::/Apps/ZealAmp\");;ExeFile(\"Run\");\n");
 			break;
 		case 3:
-			User("DECalendar;\n");
+			User("DECalc;\n");
 			break;
 		case 4:
-			User("DEViewImage;\n");
+			User("DECalendar;\n");
 			break;
 		case 5:
-			User("DESettings;\n");
+			User("DEViewImage;\n");
 			break;
 		case 6:
-			User("FileMgr;\n");
+			User("DESettings;\n");
 			break;
 		case 7:
-			User("TaskRep;\n");
+			User("FileMgr;\n");
 			break;
 		case 8:
-			User("PNGDemo;\n");
+			User("TaskRep;\n");
 			break;
 		case 9:
-			User("ExeFile(\"::/Demo/Graphics/TrueColor/TrueColor\");\n");
+			User("PNGDemo;\n");
 			break;
 		case 10:
+			User("ExeFile(\"::/Demo/Graphics/TrueColor/TrueColor\");\n");
+			break;
+		case 11:
 			PopUpOk("\n     y4mOS\n\n"
 					"ZealOS, heavily modified:\n"
 					"1280x720 boot, truecolor,\n"
-					"native PNG + AC97 audio,\n"
-					"desktop environment.\n"
+					"native PNG + AC97 + MP3,\n"
+					"TLS 1.3 web browser, DE.\n"
 					"No ELFs were harmed.\n\n");
 			break;
-		case 11:
+		case 12:
 			if (PopUpNoYes("Reboot y4mOS?"))
 				Reboot;
 			break;
-		case 12:
+		case 13:
 			DEStop;
 			break;
 	}
@@ -343,10 +347,10 @@ U0 DETaskMain()
 		else if (!Bt(kbd.down_bitmap, SC_TAB))
 			tab_latch = FALSE;
 
-		if (!(cnt & 3)) //Every ~200ms.
+		if (!(cnt & 15)) //Every ~240ms.
 			DEWinPolicyEnforce;
 		cnt++;
-		Sleep(50);
+		Sleep(15); //Fast enough to catch quick TAB re-presses for ALT-TAB.
 	}
 	de.task = NULL;
 }

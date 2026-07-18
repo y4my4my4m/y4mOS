@@ -30,15 +30,16 @@ LBts(&sys_run_level, RLf_REGISTRY);
 
 WallPaperInit;
 
-if (FileFind("::/DE/MakeDE.ZC"))
-	ExeFile("::/DE/MakeDE"); //y4mOS desktop environment (wallpaper + taskbar), auto-starts.
-
 if (DriveIsWritable)
 	DirMake("/Tmp"); //Good to have a Tmp
 
 Option(OPTf_WARN_PAREN, OFF);
 Option(OPTf_WARN_DUP_TYPES, OFF);
 LBts(&sys_run_level, RLf_HOME);
+
+//After the warning Options are OFF, like MakeHome below.
+if (FileFind("::/DE/MakeDE.ZC"))
+	ExeFile("::/DE/MakeDE"); //y4mOS desktop environment (wallpaper + taskbar), auto-starts.
 
 #help_index ""
 #include "~/MakeHome"
