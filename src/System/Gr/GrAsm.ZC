@@ -1,0 +1,25 @@
+#help_index "Graphics/Misc"
+asm {
+//************************************
+_IS_PIX_COVERED0::
+				PUSH		RBP
+				MOV 		RBP, RSP
+#assert FONT_WIDTH == FONT_HEIGHT == 8
+				MOV 		RCX, U64 SF_ARG3[RBP]
+				SAR 		RCX, 3
+				MOV 		RAX, U64 SF_ARG2[RBP]
+				SAR 		RAX, 3
+				MOV 		RDX, U64 SF_ARG1[RBP]
+				IMUL2		RCX, TEXT_COLS
+				MOV 		RBX, U64 [&gr.win_z_buf]
+				MOV 		DX,  U16 CTask.win_z_num[RDX]
+				ADD 		RCX, RAX
+				XOR 		RAX, RAX
+				CMP 		DX, U16 [RBX + RCX * 2]
+				JAE 		@@05		//Jump not covered
+				INC 		RAX
+@@05:			POP 		RBP
+				RET1		24
+};
+
+public _extern	_IS_PIX_COVERED0			Bool IsPixCovered0(CTask *task, I64 x, I64 y);//No clipping

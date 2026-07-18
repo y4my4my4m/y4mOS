@@ -1,0 +1,7 @@
+Cd(__DIR__);;
+
+#include "DE"
+
+Cd("..");;
+
+DEStart;

@@ -1,0 +1,14 @@
+# VM / build artifacts
+build/*.iso
+build/*.ISO
+build/*.qcow2
+build/*.vdi
+build/*.vmdk
+build/AUTO.ISO
+build/limine/
+zealbooter/bin/
+zealbooter/obj/
+
+# Temp files
+*.MAP
+src/Tmp/

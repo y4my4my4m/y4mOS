@@ -1,0 +1,1757 @@
+#help_index "Graphics"
+
+Option(OPTf_WARN_HEADER_MISMATCH, OFF);
+public Bool GrPlot0(CDC *dc=gr.dc, I64 x, I64 y)
+{//2D. No clipping or transformation or thick.
+	U32				*dst;
+	I32				*db;
+	I64				 d, dist, rop, pen, pen2;
+	CColorROPU32	 color = dc->color;
+	Bool			 was_timer_rand = Bts(&Fs->task_flags, TASKf_NONTIMER_RAND);
+
+	if (dc->flags & DCF_LOCATE_NEAREST)
+	{
+		dist = DistSqrI64(x, y, dc->cur_x, dc->cur_y);
+		if (dist <= dc->nearest_dist)
+			dc->nearest_dist = dist;
+	}
+	if (dc->flags & DCF_RECORD_EXTENTS)
+	{
+		if (x < dc->min_x)
+			dc->min_x = x;
+
+		if (x > dc->max_x)
+			dc->max_x = x;
+
+		if (y < dc->min_y)
+			dc->min_y = y;
+
+		if (y > dc->max_y)
+			dc->max_y = y;
+	}
+	if (dc->flags & DCF_DONT_DRAW)
+		return TRUE;
+	d = dc->width_internal * y + x;
+	if (db = dc->depth_buf)
+	{
+		db += d;
+		if (0 <= dc->db_z <= *db)
+			*db = dc->db_z;
+		else
+			return TRUE;
+	}
+	pen = GrColorResolve(color);
+	rop = GrRopBGet(color);
+	if (!(color & ROPF_TRUE_COLOR) && color.c1.rop & (ROPBF_DITHER | ROPBF_PROBABILITY_DITHER))
+	{
+		if (color.c1.rop & ROPBF_PROBABILITY_DITHER)
+		{
+			if (RandU16 < dc->dither_probability_u16)
+				pen = GrPixResolve(color.c1.color);
+			BEqual(&Fs->task_flags, TASKf_NONTIMER_RAND, was_timer_rand);
+		}
+		else
+		{
+			if ((x ^ y) & 1)
+				pen = GrPixResolve(color.c1.color);
+		}
+	}
+	dst = dc->body + d;
+	switch (rop)
+	{
+		case ROPB_EQU:
+		case ROPB_MONO:
+			*dst = pen;
+			break;
+
+		case ROPB_COLLISION:
+			pen2 = *dst;
+			if (pen2 != PIXF_TRANSPARENT && pen2 != GrColorResolve(dc->bkcolor))
+				dc->collision_count++;
+			break;
+
+		case ROPB_XOR:
+			*dst ^= pen & PIX_RGB_MASK;
+			break;
+	}
+
+	return TRUE;
+}
+Option(OPTf_WARN_HEADER_MISMATCH, ON);
+
+public I64 GrPeek0(CDC *dc=gr.dc, I64 x, I64 y)
+{//2D. No clipping or transformation. Returns native 32-bit pix val.
+	return dc->body[dc->width_internal * y + x];
+}
+
+#help_index "Graphics;Graphics/Device Contexts"
+
+public I64 GrBlot(CDC *dc=gr.dc, I64 x, I64 y, CDC *img)
+{//2D. Clipping but not transformation..
+	I64				 i, j, k, k1, w1, h1, w2, h2, dist, rop, win_z_num, xx, pen, bk, c;
+	U32				*dst, *src;
+	U16				*zb = NULL;
+	I32				*db;
+	CColorROPU32	 color, old_color;
+	CTask			*win_task;
+	Bool			 cell_ok;
+
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		win_task = dc->win_task;
+		x += win_task->scroll_x;
+		y += win_task->scroll_y;
+	}
+	if (x < 0)
+		w1 = -x;
+	else
+		w1 = 0;
+	if (y < 0)
+		h1 = -y;
+	else
+		h1 = 0;
+	w2 = img->width;
+	h2 = img->height;
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		x += win_task->pix_left;
+		y += win_task->pix_top;
+	}
+	if (dc->flags & DCF_LOCATE_NEAREST)
+	{
+		dist = DistSqrI64(x + img->width >> 1, y + img->height >> 1, dc->cur_x, dc->cur_y);
+		if (dist <= dc->nearest_dist)
+			dc->nearest_dist = dist;
+	}
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		if (x + w1 < 0)
+			w1 = -x;
+		if (x + w2 > win_task->pix_right + 1)
+			w2 = win_task->pix_right + 1 - x;
+
+		if (y + h1 < 0)
+			h1 = -y;
+		if (y + h2 > win_task->pix_bottom + 1)
+			h2 = win_task->pix_bottom + 1 - y;
+	}
+	if (x + w2 > dc->width)
+		w2 = dc->width - x;
+	if (y + h2 > dc->height)
+		h2 = dc->height - y;
+	if (w1 < w2 <= img->width && h1 < h2 <= img->height)
+	{
+		if (dc->flags & DCF_RECORD_EXTENTS)
+		{
+			if (x + w1 < dc->min_x)
+				dc->min_x = x + w1;
+
+			if (x + w2 - 1 > dc->max_x)
+				dc->max_x = x + w2 - 1;
+
+			if (y + h1 < dc->min_y)
+				dc->min_y = y + h1;
+
+			if (y + h2 - 1 > dc->max_y)
+				dc->max_y = y + h2 - 1;
+		}
+		if (dc->flags & DCF_DONT_DRAW)
+			return 1;
+
+		old_color = dc->color;
+		db = dc->depth_buf;
+		dc->depth_buf = NULL;
+		dc->color &= ~ROPF_DITHER;
+		color = dc->color;
+		rop = GrRopBGet(color);
+		if (rop == ROPB_XOR && !(img->flags & DCF_NO_TRANSPARENTS))
+			rop = ROPB_EQU; //Historic behavior: XOR blot with transparents acts as EQU.
+		if (dc->flags & DCF_SCREEN_BITMAP && !(dc->flags & DCF_ON_TOP) && rop != ROPB_COLLISION)
+		{
+			win_z_num = win_task->win_z_num;
+			zb = gr.win_z_buf;
+		}
+		switch (rop)
+		{
+			case ROPB_COLLISION: //TODO: Might want to check win_z_buf
+				bk = GrColorResolve(dc->bkcolor);
+				k = h1 * img->width_internal;
+				k1 = (h1 + y) * dc->width_internal + x;
+				for (j = h2 - h1; j; j--)
+				{
+					for (i = w1; i < w2; i++)
+					{
+						c = dc->body[k1 + i];
+						if (c != PIXF_TRANSPARENT && c != bk && img->body[k + i] != PIXF_TRANSPARENT)
+							dc->collision_count++;
+					}
+					k += img->width_internal;
+					k1 += dc->width_internal;
+				}
+				break;
+
+			case ROPB_MONO:
+				pen = GrColorResolve(color);
+				k = h1 * img->width_internal;
+				k1 = (h1 + y) * dc->width_internal;
+				if (img->flags & DCF_NO_TRANSPARENTS)
+				{//Opaque mono stamp: pen where src set, else black.
+					for (j = h1; j < h2; j++)
+					{
+						src = img->body + k;
+						dst = dc->body + k1;
+						cell_ok = TRUE;
+						for (i = w1; i < w2; i++)
+						{
+							xx = x + i;
+							if (zb && (i == w1 || !(xx & 7)))
+								cell_ok = win_z_num >= zb[(y + j) >> 3 * TEXT_COLS + (xx >> 3)];
+							if (cell_ok)
+							{
+								if (src[i])
+									dst[xx] = pen;
+								else
+									dst[xx] = 0;
+							}
+						}
+						k += img->width_internal;
+						k1 += dc->width_internal;
+					}
+				}
+				else
+				{//Pen where src set, else leave.
+					for (j = h1; j < h2; j++)
+					{
+						src = img->body + k;
+						dst = dc->body + k1;
+						cell_ok = TRUE;
+						for (i = w1; i < w2; i++)
+						{
+							xx = x + i;
+							if (zb && (i == w1 || !(xx & 7)))
+								cell_ok = win_z_num >= zb[(y + j) >> 3 * TEXT_COLS + (xx >> 3)];
+							if (cell_ok && src[i])
+								dst[xx] = pen;
+						}
+						k += img->width_internal;
+						k1 += dc->width_internal;
+					}
+				}
+				break;
+
+			case ROPB_EQU:
+				k = h1 * img->width_internal;
+				k1 = (h1 + y) * dc->width_internal;
+				if (img->flags & DCF_NO_TRANSPARENTS)
+				{
+					for (j = h1; j < h2; j++)
+					{
+						src = img->body + k;
+						dst = dc->body + k1;
+						cell_ok = TRUE;
+						for (i = w1; i < w2; i++)
+						{
+							xx = x + i;
+							if (zb && (i == w1 || !(xx & 7)))
+								cell_ok = win_z_num >= zb[(y + j) >> 3 * TEXT_COLS + (xx >> 3)];
+							if (cell_ok)
+								dst[xx] = src[i];
+						}
+						k += img->width_internal;
+						k1 += dc->width_internal;
+					}
+				}
+				else
+				{
+					for (j = h1; j < h2; j++)
+					{
+						src = img->body + k;
+						dst = dc->body + k1;
+						cell_ok = TRUE;
+						for (i = w1; i < w2; i++)
+						{
+							xx = x + i;
+							if (zb && (i == w1 || !(xx & 7)))
+								cell_ok = win_z_num >= zb[(y + j) >> 3 * TEXT_COLS + (xx >> 3)];
+							if (cell_ok)
+							{
+								c = src[i];
+								if (c != PIXF_TRANSPARENT)
+									dst[xx] = c;
+							}
+						}
+						k += img->width_internal;
+						k1 += dc->width_internal;
+					}
+				}
+				break;
+
+			case ROPB_XOR: //Only reached with DCF_NO_TRANSPARENTS.
+				k = h1 * img->width_internal;
+				k1 = (h1 + y) * dc->width_internal;
+				for (j = h1; j < h2; j++)
+				{
+					src = img->body + k;
+					dst = dc->body + k1;
+					cell_ok = TRUE;
+					for (i = w1; i < w2; i++)
+					{
+						xx = x + i;
+						if (zb && (i == w1 || !(xx & 7)))
+							cell_ok = win_z_num >= zb[(y + j) >> 3 * TEXT_COLS + (xx >> 3)];
+						if (cell_ok)
+							dst[xx] ^= src[i];
+					}
+					k += img->width_internal;
+					k1 += dc->width_internal;
+				}
+				break;
+		}
+		dc->depth_buf	= db;
+		dc->color		= old_color;
+		return 1;
+	}
+	else
+		return 0;
+}
+
+#help_index "Graphics/Device Contexts"
+
+U8 *GrBitMap4ToBitMap8(U8 *dst, U8 *src, I64 src_size, I64 bkcolor)
+{
+	I64 c, k, i = src_size * 2, i1 = i >> 3;
+
+	for (k = 0; k < i; k++)
+	{
+		c = 0;
+		if (Bt(src,			 k)) c |= 1;
+		if (Bt(src + i1,	 k)) c |= 2;
+		if (Bt(src + i1 * 2, k)) c |= 4;
+		if (Bt(src + i1 * 3, k)) c |= 8;
+		if (c == bkcolor)		 c  = TRANSPARENT;
+		*dst++ = c;
+	}
+
+	return dst;
+}
+
+U8 *GrBitMap1ToBitMap8(U8 *dst, U8 *src, I64 src_size, I64 bkcolor)
+{
+	I64 c, k, i = src_size * 8;
+
+	for (k = 0; k < i; k++)
+	{
+		c = 0;
+		if (Bt(src, k))	  c = COLOR_MONO;
+		if (c == bkcolor) c = TRANSPARENT;
+		*dst++ = c;
+	}
+
+	return dst;
+}
+
+public U32 *GrBitMap8ToBitMap32(U32 *dst, U8 *src, I64 count)
+{//Convert legacy 8-bit indexed pixs to native 32-bit pixs.
+	while (count--)
+		*dst++ = GrPixResolve(*src++);
+
+	return dst;
+}
+
+public U8 *GrBitMap32ToBitMap8(U8 *dst, U32 *src, I64 count)
+{//Quantize native 32-bit pixs to legacy 8-bit indexed pixs.
+	while (count--)
+		*dst++ = GrPix2Color(*src++);
+
+	return dst;
+}
+
+public CDC *DCExt(CDC *dc=gr.dc, I64 x1, I64 y1, I64 x2, I64 y2, CTask *task=NULL)
+{//Extract new device context rect from device context.
+	CDC	  *res;
+	CTask *win_task;
+
+	if (x1 > x2)
+		SwapI64(&x1, &x2);
+	if (y1 > y2)
+		SwapI64(&y1, &y2);
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		win_task = dc->win_task;
+		x1 += win_task->pix_left + win_task->scroll_x;
+		y1 += win_task->pix_top  + win_task->scroll_y;
+		x2 += win_task->pix_left + win_task->scroll_x;
+		y2 += win_task->pix_top  + win_task->scroll_y;
+	}
+	res = DCNew(x2 - x1 + 1, y2 -y1 + 1, task);
+	DCFill(res);
+	GrBlot(res, -x1, -y1, dc);
+
+	return res;
+}
+
+public CDC *DCDiff(CDC *base, CDC *update)
+{//Trim to win of what has chged.
+	I64  i, x1 = 0, y1 = 0, x2 = update->width - 1, y2 = update->height - 1; //inclusive
+	U32 *ptr_base, *ptr_update;
+	CDC *res;
+
+	ptr_base   = base->body;
+	ptr_update = update->body;
+	while (y1 <= y2)
+	{
+		i = update->width;
+		while (i--)
+			if (*ptr_base++ != *ptr_update++)
+				goto df_y2;
+		y1++;
+	}
+	return NULL;
+df_y2:
+	ptr_base   = base->body	  + base->width_internal	* base->height;
+	ptr_update = update->body + update->width_internal	* update->height;
+	while (y1 < y2)
+	{
+		i = update->width;
+		while (i--)
+			if (*--ptr_base != *--ptr_update)
+				goto df_x1;
+		y2--;
+	}
+df_x1:
+	while (x1 < x2)
+	{
+		for (i = y1; i <= y2; i++)
+			if (GrPeek0(base, x1, i) != GrPeek0(update, x1, i))
+				 goto df_x2;
+		x1++;
+	}
+df_x2:
+	while (x1 < x2)
+	{
+		for (i = y1; i <= y2; i++)
+			if (GrPeek0(base, x2, i) != GrPeek0(update, x2, i))
+				 goto df_done;
+		x2--;
+	}
+df_done:
+	res = DCExt(update, x1, y1, x2, y2);
+	res->x0 = x1;
+	res->y0 = y1;
+
+	return res;
+}
+
+#help_index "Graphics/Char;Char/Graphics"
+
+public I64 GrPutChar(CDC *dc=gr.dc, I64 x, I64 y, U8 ch)
+{//2D. Clipping but not transformation.
+	U8				*font_ptr;
+	U32				*dst;
+	U16				*zb = NULL;
+	I64				 i, j, k1, w1, h1, w2, h2, dist, bits, rop, win_z_num, xx, pen, bk, c;
+	CColorROPU32	 color;
+	CTask			*win_task;
+	Bool			 cell_ok;
+
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		win_task = dc->win_task;
+		x += win_task->scroll_x;
+		y += win_task->scroll_y;
+	}
+
+	if (x < 0)
+		w1 = -x;
+	else
+		w1 = 0;
+	if (y < 0)
+		h1 = -y;
+	else
+		h1 = 0;
+	w2 = FONT_WIDTH;
+	h2 = FONT_HEIGHT;
+
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		x += win_task->pix_left;
+		y += win_task->pix_top;
+	}
+	if (dc->flags & DCF_LOCATE_NEAREST)
+	{
+		dist = DistSqrI64(x + w2 >> 1, y + h2 >> 1, dc->cur_x, dc->cur_y);
+		if (dist <= dc->nearest_dist)
+			dc->nearest_dist = dist;
+	}
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		if (x + w1 < 0)
+			w1 = -x;
+		if (x + w2 > win_task->pix_right + 1)
+			w2 = win_task->pix_right + 1 - x;
+
+		if (y + h1 < 0)
+			h1 = -y;
+		if (y + h2 > win_task->pix_bottom + 1)
+			h2 = win_task->pix_bottom + 1 - y;
+	}
+	if (x + w2 > dc->width)
+		w2 = dc->width - x;
+	if (y + h2 > dc->height)
+		h2 = dc->height - y;
+	if (w1 < w2 <= FONT_WIDTH && h1 < h2 <= FONT_HEIGHT)
+	{
+		if (dc->flags & DCF_RECORD_EXTENTS)
+		{
+			if (x + w1 < dc->min_x)
+				dc->min_x = x + w1;
+
+			if (x + w2 - 1 > dc->max_x)
+				dc->max_x = x + w2 - 1;
+
+			if (y + h1	< dc->min_y)
+				dc->min_y = y + h1;
+
+			if (y + h2 - 1 > dc->max_y)
+				dc->max_y = y + h2 - 1;
+		}
+		if (dc->flags & DCF_DONT_DRAW)
+			return 1;
+		color = dc->color;
+		rop = GrRopBGet(color);
+		font_ptr = &text.font(U8 *)[FONT_HEIGHT * ch + h1];
+		if (rop == ROPB_COLLISION)
+		{
+#assert FONT_WIDTH == 8
+			bk = GrColorResolve(dc->bkcolor);
+			for (i = w1; i < w2; i++)
+			{
+				k1 = (h1 + y) * dc->width_internal + x;
+				for (j = h2 - h1; j; j--)
+				{
+					c = dc->body[k1 + i];
+					if (c != PIXF_TRANSPARENT && c != bk && Bt(font_ptr + (h2 - h1 - j), i))
+						dc->collision_count++;
+					k1 += dc->width_internal;
+				}
+			}
+		}
+		else
+		{
+			pen = GrColorResolve(color);
+			if (dc->flags & DCF_SCREEN_BITMAP && !(dc->flags & DCF_ON_TOP))
+			{
+				win_z_num = win_task->win_z_num;
+				zb = gr.win_z_buf;
+			}
+			k1 = (h1 + y) * dc->width_internal;
+			for (j = h1; j < h2; j++)
+			{
+				bits = font_ptr[j - h1];
+				dst = dc->body + k1;
+				cell_ok = TRUE;
+				for (i = w1; i < w2; i++)
+				{
+					xx = x + i;
+					if (zb && (i == w1 || !(xx & 7)))
+						cell_ok = win_z_num >= zb[(y + j) >> 3 * TEXT_COLS + (xx >> 3)];
+					if (cell_ok && bits & 1 << i)
+					{
+						if (rop == ROPB_XOR)
+							dst[xx] ^= pen & PIX_RGB_MASK;
+						else
+							dst[xx] = pen;
+					}
+				}
+				k1 += dc->width_internal;
+			}
+		}
+		return 1;
+	}
+	else
+		return 0;
+}
+
+I64 GrPutS(CDC *dc=gr.dc, I64 x, I64 y, U8 *_s)
+{//Use $LK,"GrPrint",A="MN:GrPrint"$()
+	I64 x0, sx = 0, sy = 0, res;
+
+	if (!_s)
+		return 0;
+	x0 = x;
+	res = 0;
+	while (*_s)
+	{
+		if (*_s == '\n')
+		{
+			x = x0;
+			y += FONT_HEIGHT;
+			_s++;
+		}
+		else if (*_s == '\t')
+		{
+			x = x0 + CeilU64(x - x0 + FONT_WIDTH, 8 * FONT_WIDTH);
+			_s++;
+		}
+		else if (*_s(U32 *) == '$$SY,')
+		{
+			if (_s[4] == '-')
+			{
+				_s++;
+				sy = '0' - _s[4];
+			}
+			else
+				sy = _s[4] - '0';
+			_s += 6;
+		}
+		else if (*_s(U32 *) == '$$SX,')
+		{
+			if (_s[4] == '-')
+			{
+				_s++;
+				sx = '0' - _s[4];
+			}
+			else
+				sx = _s[4] - '0';
+			_s += 6;
+		}
+		else
+		{
+			res += GrPutChar(dc, x + sx, y + sy, *_s);
+			x += FONT_WIDTH;
+			_s++;
+		}
+	}
+
+	return res;
+}
+
+I64 GrVPutS(CDC *dc=gr.dc, I64 x, I64 y, U8 *_s)
+{//Vertical Text.  Use $LK,"GrVPrint",A="MN:GrVPrint"$()
+	I64 y0, sx = 0, sy = 0, res;
+	U8  buf[2];
+
+	if (!_s)
+		return 0;
+	y0 = y;
+	res = 0;
+	buf[1] = 0;
+	while (*_s)
+	{
+		if (*_s == '\n')
+		{
+			y = y0;
+			x += FONT_WIDTH;
+			_s++;
+		}
+		else if (*_s == '\t')
+		{
+			y = y0 + CeilU64(y - y0 + FONT_HEIGHT, 8 * FONT_HEIGHT);
+			_s++;
+		}
+		else if (*_s(U32 *) == '$$SY,')
+		{
+			if (_s[4] == '-')
+			{
+				_s++;
+				sx = '0' - _s[4];
+			}
+			else
+				sx = _s[4] - '0';
+			_s += 6;
+		}
+		else if (*_s(U32 *) == '$$SX,')
+		{
+			if (_s[4] == '-')
+			{
+				_s++;
+				sy = '0' - _s[4];
+			}
+			else
+				sy = _s[4] - '0';
+			_s += 6;
+		}
+		else
+		{
+			*buf = *_s++;
+			res += GrPutS(dc, x, y, buf);
+			y += FONT_HEIGHT;
+		}
+	}
+
+	return res;
+}
+
+public I64 GrPrint(CDC *dc=gr.dc, I64 x, I64 y, U8 *format, ...)
+{//2D. Clipping but not transformation.
+	I64 res;
+	U8 *buf = StrPrintJoin(NULL, format, argc, argv);
+
+	res = GrPutS(dc, x, y, buf);
+	Free(buf);
+
+	return res;
+}
+
+public I64 GrVPrint(CDC *dc=gr.dc, I64 x, I64 y, U8 *format, ...)
+{//2D. Vertical text. Clipping but not transformation.
+	I64 res;
+	U8 *buf = StrPrintJoin(NULL, format, argc, argv);
+
+	res = GrVPutS(dc, x, y, buf);
+	Free(buf);
+
+	return res;
+}
+
+#help_index "Graphics"
+public I64 GrRect(CDC *dc=gr.dc, I64 x, I64 y, I64 w, I64 h)
+{//2D. Width Height. Clipping but not transformation.
+//Returns count of pixs changed.
+	I64				 i, res = 0, j, k1, w1, h1, w2, h2, dist, rop, win_z_num, xx, yy,
+					 pen, pen0, pen1, pen_row, bk, c;
+	U32				*dst;
+	U16				*zb = NULL;
+	CColorROPU32	 color;
+	Bool			 dither, probability_dither, cell_ok,
+					 was_timer_rand = Bts(&Fs->task_flags, TASKf_NONTIMER_RAND);
+	CTask			*win_task;
+
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		win_task = dc->win_task;
+		x += win_task->scroll_x;
+		y += win_task->scroll_y;
+	}
+
+	if (x < 0)
+		w1 = -x;
+	else
+		w1 = 0;
+	if (y < 0)
+		h1 = -y;
+	else
+		h1 = 0;
+	w2 = w;
+	h2 = h;
+
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		x += win_task->pix_left;
+		y += win_task->pix_top;
+	}
+	if (dc->flags & DCF_LOCATE_NEAREST)
+	{//TODO:Untested
+		if (x <= dc->cur_x <= x + w && y <= dc->cur_y <= y + h)
+			dist = 0;
+		else
+			dist = DistSqrI64(x + w >> 1, y + h >> 1, dc->cur_x, dc->cur_y);
+		if (dist <= dc->nearest_dist)
+			dc->nearest_dist = dist;
+	}
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		if (x + w1 < 0)
+			w1 = -x;
+		if (x + w2 > win_task->pix_right + 1)
+			w2 = win_task->pix_right + 1 - x;
+
+		if (y + h1 < 0)
+			h1 = -y;
+		if (y + h2 > win_task->pix_bottom + 1)
+			h2 = win_task->pix_bottom + 1 - y;
+	}
+	if (x + w2 > dc->width)
+		w2 = dc->width - x;
+
+	if (y + h2 > dc->height)
+		h2 = dc->height - y;
+
+	if (w1 < w2 <= w && h1 < h2 <= h)
+	{
+		if (dc->flags & DCF_RECORD_EXTENTS)
+		{
+			if (x + w1	< dc->min_x)
+				dc->min_x = x + w1;
+
+			if (x + w2 - 1 > dc->max_x)
+				dc->max_x = x + w2 - 1;
+
+			if (y + h1	< dc->min_y)
+				dc->min_y = y + h1;
+
+			if (y + h2 - 1 > dc->max_y)
+				dc->max_y = y + h2 - 1;
+		}
+		if (dc->flags & DCF_DONT_DRAW)
+		{
+			BEqual(&Fs->task_flags, TASKf_NONTIMER_RAND, was_timer_rand);
+			return TRUE;
+		}
+		color = dc->color;
+		rop = GrRopBGet(color);
+		pen0 = GrColorResolve(color);
+		pen1 = pen0;
+		dither = FALSE;
+		probability_dither = FALSE;
+		if (!(color & ROPF_TRUE_COLOR) && color.c1.rop & (ROPBF_DITHER | ROPBF_PROBABILITY_DITHER))
+		{
+			dither = TRUE;
+			pen1 = GrPixResolve(color.c1.color);
+			if (color.c1.rop & ROPBF_PROBABILITY_DITHER)
+				probability_dither = TRUE;
+		}
+		if (rop == ROPB_COLLISION)
+		{//TODO: Might want to check win_z_buf
+			bk = GrColorResolve(dc->bkcolor);
+			k1 = (h1 + y) * dc->width_internal + x;
+			res = -dc->collision_count;
+			for (j = h2 - h1; j; j--)
+			{
+				for (i = w1; i < w2; i++)
+				{
+					c = dc->body[k1 + i];
+					if (c != PIXF_TRANSPARENT && c != bk)
+						dc->collision_count++;
+				}
+				k1 += dc->width_internal;
+			}
+			res += dc->collision_count;
+		}
+		else
+		{
+			if (dc->flags & DCF_SCREEN_BITMAP && !(dc->flags & DCF_ON_TOP))
+			{
+				win_z_num = win_task->win_z_num;
+				zb = gr.win_z_buf;
+			}
+			k1 = (h1 + y) * dc->width_internal;
+			for (j = h1; j < h2; j++)
+			{
+				yy = y + j;
+				dst = dc->body + k1;
+				if (probability_dither)
+				{
+					if (RandU16 < dc->dither_probability_u16)
+						pen_row = pen1;
+					else
+						pen_row = pen0;
+				}
+				else
+					pen_row = pen0;
+				cell_ok = TRUE;
+				for (i = w1; i < w2; i++)
+				{
+					xx = x + i;
+					if (zb && (i == w1 || !(xx & 7)))
+						cell_ok = win_z_num >= zb[yy >> 3 * TEXT_COLS + (xx >> 3)];
+					if (cell_ok)
+					{
+						if (dither && !probability_dither)
+						{
+							if ((xx ^ yy) & 1)
+								pen = pen1;
+							else
+								pen = pen0;
+						}
+						else
+							pen = pen_row;
+						if (rop == ROPB_XOR)
+							dst[xx] ^= pen & PIX_RGB_MASK;
+						else
+							dst[xx] = pen;
+						res++;
+					}
+				}
+				k1 += dc->width_internal;
+			}
+		}
+	}
+	BEqual(&Fs->task_flags, TASKf_NONTIMER_RAND, was_timer_rand);
+
+	return res;
+}
+
+I64 GrRayLenMinus(CDC *dc, I64 x, I64 y)
+{//Returns count of pixs changed
+	I64		 res = 0, x3, y3, d, c;
+	U32		*dst, *dst2;
+	Bool	 not_color = ToBool(dc->flags & DCF_FILL_NOT_COLOR);
+	CTask	*win_task;
+
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		win_task = dc->win_task;
+		x += win_task->scroll_x;
+		y += win_task->scroll_y;
+	}
+	x3 = x;
+	y3 = y;
+	if (x3 < 0 || y3 < 0)
+		goto gr_done;
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		x3 += win_task->pix_left;
+		y3 += win_task->pix_top;
+		if (	!(0 <= x3 <= win_task->pix_right)  ||
+				!(0 <= y3 <= win_task->pix_bottom) ||
+				!(dc->flags & DCF_ON_TOP) && IsPixCovered0(win_task, x3, y3))
+			goto gr_done;
+	}
+	if (x3 >= dc->width || y3 >= dc->height)
+		goto gr_done;
+
+	d = y3 * dc->width_internal;
+	dst2 = dc->body + d;
+	while (TRUE)
+	{
+		x3 = x;
+		if (x3 & (FONT_WIDTH - 1) == FONT_WIDTH - 1)
+		{
+			if (dc->flags & DCF_SCREEN_BITMAP)
+			{
+				if (x3 < 0)
+					break;
+				x3 += win_task->pix_left;
+				if (	!(0 <= x3 <= win_task->pix_right) || x3 >= dc->width ||
+						!(dc->flags & DCF_ON_TOP) && IsPixCovered0(win_task, x3, y3))
+					break;
+			}
+			else
+				if (!(0 <= x3 < dc->width))
+					break;
+		}
+		else if (dc->flags & DCF_SCREEN_BITMAP)
+			x3 += win_task->pix_left;
+		dst = dst2 + x3;
+		c = *dst;
+		if (not_color)
+		{
+			if (c != dc->color2)
+			{
+				res++;
+				x--;
+			}
+			else
+				break;
+		}
+		else
+		{
+			if (c == dc->color2)
+			{
+				res++;
+				x--;
+			}
+			else
+				break;
+		}
+	}
+
+	return res;
+gr_done:
+	return 0;
+}
+
+I64 GrRayLen(CDC *dc, I64 *x1, I64 y, I64 z=0, I32 *db=NULL)
+{
+//Returns count of pixs changed
+	I64				 res = 0, d, x = *x1, x2, x3, y3, dist, rop, c, pen, pen0, pen1, bk;
+	Bool			 plot, dither, probability_dither,
+					 not_color = ToBool(dc->flags & DCF_FILL_NOT_COLOR),
+					 was_timer_rand = Bts(&Fs->task_flags, TASKf_NONTIMER_RAND);
+	U32				*dst, *dst2;
+	CColorROPU32	 color = dc->color;
+	I32				*db2;
+	CTask			*win_task;
+
+
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		win_task = dc->win_task;
+		x += win_task->scroll_x;
+		y += win_task->scroll_y;
+		z += win_task->scroll_z;
+	}
+	x2 = x;
+	x3 = x;
+	y3 = y;
+	if (x3 < 0 || y3 < 0)
+		goto gr_done;
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		x3 += win_task->pix_left;
+		y3 += win_task->pix_top;
+		if (	!(0 <= x3 <= win_task->pix_right)  ||
+				!(0 <= y3 <= win_task->pix_bottom) ||
+				!(dc->flags & DCF_ON_TOP) && IsPixCovered0(win_task, x3, y3))
+			goto gr_done;
+	}
+	if (x3 >= dc->width || y3 >= dc->height)
+		goto gr_done;
+
+	d = dc->width_internal * y3;
+	if (db)
+		db += d;
+
+	rop = GrRopBGet(color);
+	pen0 = GrColorResolve(color);
+	pen1 = pen0;
+	bk = GrColorResolve(dc->bkcolor);
+	dither = FALSE;
+	probability_dither = FALSE;
+	if (!(color & ROPF_TRUE_COLOR) && color.c1.rop & (ROPBF_DITHER | ROPBF_PROBABILITY_DITHER))
+	{
+		dither = TRUE;
+		pen1 = GrPixResolve(color.c1.color);
+		if (color.c1.rop & ROPBF_PROBABILITY_DITHER)
+			probability_dither = TRUE;
+	}
+	dst2 = dc->body + d;
+	while (TRUE)
+	{
+		x3 = x;
+		if (!(x3 & (FONT_WIDTH - 1)))
+		{
+			if (dc->flags & DCF_SCREEN_BITMAP)
+			{
+				if (x3 < 0)
+					break;
+				x3 += win_task->pix_left;
+				if (	!(0 <= x3 <= win_task->pix_right) || x3 >= dc->width ||
+						!(dc->flags & DCF_ON_TOP) && IsPixCovered0(win_task, x3, y3))
+					break;
+			}
+			else
+			{
+				if (!(0 <= x3 < dc->width))
+					break;
+			}
+		}
+		else if (dc->flags & DCF_SCREEN_BITMAP)
+			x3 += win_task->pix_left;
+
+		dst = dst2 + x3;
+
+		c = *dst;
+		if (db)
+		{
+			db2 = db + x3;
+			if (0 <= z <= *db2)
+			{
+				*db2 = z;
+				plot = TRUE;
+			}
+			else
+				plot = FALSE;
+		}
+		else
+			plot = TRUE;
+
+		if ((not_color && c != dc->color2 || !not_color && c == dc->color2) && plot)
+		{
+			if (dc->flags & DCF_LOCATE_NEAREST)
+			{
+				dist = DistSqrI64(x3, y3, dc->cur_x, dc->cur_y);
+				if (dist <= dc->nearest_dist)
+					dc->nearest_dist = dist;
+			}
+			if (dc->flags & DCF_RECORD_EXTENTS)
+			{
+				if (x3 < dc->min_x)
+					dc->min_x = x3;
+
+				if (x3 > dc->max_x)
+					dc->max_x = x3;
+
+				if (y3 < dc->min_y)
+					dc->min_y = y3;
+
+				if (y3 > dc->max_y)
+					dc->max_y = y3;
+			}
+			dst = dst2 + x3;
+
+			pen = pen0;
+			if (dither)
+			{
+				if (probability_dither)
+				{
+					if (RandU16 < dc->dither_probability_u16)
+						pen = pen1;
+				}
+				else
+					if ((x3 ^ y3) & 1)
+						pen = pen1;
+			}
+			switch (rop)
+			{
+				case ROPB_EQU:
+				case ROPB_MONO:
+					*dst = pen;
+					break;
+
+				case ROPB_COLLISION:
+					c = *dst;
+					if (c != PIXF_TRANSPARENT && c != bk)
+						dc->collision_count++;
+					break;
+
+				case ROPB_XOR:
+					*dst ^= pen & PIX_RGB_MASK;
+					break;
+			}
+			res++;
+			x++;
+		}
+		else
+			break;
+	}
+	if (dc->flags & DCF_SCREEN_BITMAP)
+		*x1 = x - 1 - win_task->scroll_x;
+	else
+		*x1 = x - 1;
+	x = x2 - 1;
+	while (TRUE)
+	{
+		x3 = x;
+		if (x3 & (FONT_WIDTH - 1) == FONT_WIDTH - 1)
+		{
+			if (dc->flags & DCF_SCREEN_BITMAP)
+			{
+				if (x3 < 0)
+					break;
+				x3 += win_task->pix_left;
+				if (	!(0 <= x3 <= win_task->pix_right) || x3 >= dc->width ||
+						!(dc->flags & DCF_ON_TOP) && IsPixCovered0(win_task, x3, y3))
+					break;
+			}
+			else
+				if (!(0 <= x3 < dc->width))
+					break;
+		}
+		else if (dc->flags & DCF_SCREEN_BITMAP)
+			x3 += win_task->pix_left;
+
+		dst = dst2 + x3;
+		c = *dst;
+		if (db)
+		{
+			db2 = db + x3;
+			if (0 <= z <= *db2)
+			{
+				*db2 = z;
+				plot = TRUE;
+			}
+			else
+				plot = FALSE;
+		}
+		else
+			plot = TRUE;
+
+		if ((not_color && c != dc->color2 || !not_color && c == dc->color2) && plot)
+		{
+			if (dc->flags & DCF_LOCATE_NEAREST)
+			{
+				dist = DistSqrI64(x3, y3, dc->cur_x, dc->cur_y);
+				if (dist <= dc->nearest_dist)
+					dc->nearest_dist = dist;
+			}
+			if (dc->flags & DCF_RECORD_EXTENTS)
+			{
+				if (x3 < dc->min_x)
+					dc->min_x = x3;
+				if (x3 > dc->max_x)
+					dc->max_x = x3;
+				if (y3 < dc->min_y)
+					dc->min_y = y3;
+				if (y3 > dc->max_y)
+					dc->max_y = y3;
+			}
+			dst = dst2 + x3;
+
+			pen = pen0;
+			if (dither)
+			{
+				if (probability_dither)
+				{
+					if (RandU16 < dc->dither_probability_u16)
+						pen = pen1;
+				}
+				else
+					if ((x3 ^ y3) & 1)
+						pen = pen1;
+			}
+			switch (rop)
+			{
+				case ROPB_EQU:
+				case ROPB_MONO:
+					*dst = pen;
+					break;
+
+				case ROPB_COLLISION:
+					c = *dst;
+					if (c != PIXF_TRANSPARENT && c != bk)
+						dc->collision_count++;
+					break;
+
+				case ROPB_XOR:
+					*dst ^= pen & PIX_RGB_MASK;
+					break;
+			}
+			res++;
+			x--;
+		}
+		else
+			break;
+	}
+	BEqual(&Fs->task_flags, TASKf_NONTIMER_RAND, was_timer_rand);
+
+	return res;
+gr_done:
+	BEqual(&Fs->task_flags, TASKf_NONTIMER_RAND, was_timer_rand);
+
+	return 0;
+}
+
+public I64 GrHLine(CDC *dc=gr.dc, I64 x1, I64 x2, I64 y, I64 z1=0, I64 z2=0)
+{//3D. No transformation or thick.
+//Returns count of pixs changed
+	//Uses $LK,"fixed-point",A="FI:::/Demo/Lectures/FixedPoint.ZC"$.
+	I64				 dist, dx, dz, z, res = 0, i, j, d, rop, c, pen0, pen1, pen_cur, bk;
+	U32				*dst;
+	CColorROPU32	 color = dc->color;
+	I32				*db;
+	Bool			 plot = TRUE, char_clear, dither, probability_dither,
+					 was_timer_rand = Bts(&Fs->task_flags, TASKf_NONTIMER_RAND);
+	CTask			*win_task;
+
+
+	if (!dc->depth_buf)
+	{
+		BEqual(&Fs->task_flags, TASKf_NONTIMER_RAND, was_timer_rand);
+		if (x2 < x1)
+			SwapI64(&x1, &x2);
+		return GrRect(dc, x1, y, x2 - x1 + 1, 1);
+	}
+
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		win_task = dc->win_task;
+		x1 += win_task->scroll_x;
+		x2 += win_task->scroll_x;
+		y  += win_task->scroll_y;
+		z1 += win_task->scroll_z;
+		z2 += win_task->scroll_z;
+	}
+	if (dc->flags & DCF_RECORD_EXTENTS)
+	{
+		if (x1 < dc->min_x)
+			dc->min_x = x1;
+
+		if (x1 > dc->max_x)
+			dc->max_x = x1;
+
+		if (x2 < dc->min_x)
+			dc->min_x = x2;
+
+		if (x2 > dc->max_x)
+			dc->max_x = x2;
+
+		if (y < dc->min_y)
+			dc->min_y = y;
+
+		if (y > dc->max_y)
+			dc->max_y = y;
+	}
+	if (y < 0)
+		goto gr_done;
+	if (x2 < x1)
+	{
+		SwapI64(&x1, &x2);
+		SwapI64(&z1, &z2);
+	}
+	if (x2 < 0)
+		goto gr_done;
+	if (x1 < 0)
+	{
+		i = -x1;
+		x1 = 0;
+	}
+	else
+		i = 0;
+	j = 0;
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		x1 += win_task->pix_left;
+		x2 += win_task->pix_left;
+		if (x1 > win_task->pix_right)
+			goto gr_done;
+		if (x2 > win_task->pix_right)
+		{
+			j = x2 - win_task->pix_right;
+			x2 = win_task->pix_right;
+		}
+		y += win_task->pix_top;
+		if (!(0 <= y <= win_task->pix_bottom) || x2 < 0)
+			goto gr_done;
+	}
+	if (x1 >= dc->width || y >= dc->height)
+		goto gr_done;
+	dx = x2 + j - (x1 - i);
+	d = dc->width_internal * y + x1;
+	if (db = dc->depth_buf)
+	{
+		db += d;
+		if (dx)
+			dz = (z2 - z1) << 32 / dx;
+		else
+			dz = 0;
+		z = z1 << 32;
+	}
+	if (i)
+		z += i * dz;
+	if (x2 >= dc->width)
+		x2 = dc->width - 1;
+
+	if (dc->flags & DCF_LOCATE_NEAREST)
+	{
+		if (x1 <= dc->cur_x <= x2)
+			dist = 0;
+		else if (dc->cur_x < x1)
+			dist = SqrI64(x1 - dc->cur_x);
+		else
+			dist = SqrI64(dc->cur_x - x2);
+		dist += SqrI64(y - dc->cur_y);
+		if (dist <= dc->nearest_dist)
+			dc->nearest_dist = dist;
+	}
+	if (dc->flags & DCF_DONT_DRAW)
+		goto gr_done;
+
+	if (	!(dc->flags & DCF_SCREEN_BITMAP) ||
+			win_task->next_task == sys_winmgr_task ||
+			dc->flags & DCF_ON_TOP || !IsPixCovered0(win_task, x1, y))
+		char_clear = TRUE;
+	else
+		char_clear = FALSE;
+	rop = GrRopBGet(color);
+	pen0 = GrColorResolve(color);
+	pen1 = pen0;
+	bk = GrColorResolve(dc->bkcolor);
+	dither = FALSE;
+	probability_dither = FALSE;
+	if (!(color & ROPF_TRUE_COLOR) && color.c1.rop & (ROPBF_DITHER | ROPBF_PROBABILITY_DITHER))
+	{
+		dither = TRUE;
+		pen1 = GrPixResolve(color.c1.color);
+		if (color.c1.rop & ROPBF_PROBABILITY_DITHER)
+		{
+			probability_dither = TRUE;
+			if (RandU16 < dc->dither_probability_u16)
+				pen_cur = pen1;
+			else
+				pen_cur = pen0;
+		}
+		else
+		{
+			if ((x1 ^ y) & 1)
+			{
+				pen_cur = pen0; //Will swap below.
+				pen0 = pen1;
+				pen1 = pen_cur;
+			}
+			pen_cur = pen0;
+		}
+	}
+	else
+		pen_cur = pen0;
+	while (x1 <= x2)
+	{
+		if (char_clear)
+		{
+			if (db)
+			{
+				if (0 <= z.i32[1] <= *db)
+				{
+					*db = z.i32[1];
+					plot = TRUE;
+				}
+				else
+					plot = FALSE;
+			}
+			if (plot)
+			{
+				dst = dc->body + d;
+				switch (rop)
+				{
+					case ROPB_EQU:
+					case ROPB_MONO:
+						*dst = pen_cur;
+						break;
+
+					case ROPB_COLLISION:
+						c = *dst;
+						if (c != PIXF_TRANSPARENT && c != bk)
+							dc->collision_count++;
+						break;
+
+					case ROPB_XOR:
+						*dst ^= pen_cur & PIX_RGB_MASK;
+						break;
+				}
+				res++;
+			}
+		}
+		if (dither)
+		{
+			if (probability_dither)
+			{
+				if (RandU16 < dc->dither_probability_u16)
+					pen_cur = pen1;
+				else
+					pen_cur = pen0;
+			}
+			else
+			{
+				if (pen_cur == pen0)
+					pen_cur = pen1;
+				else
+					pen_cur = pen0;
+			}
+		}
+		d++;
+		x1++;
+		if (db)
+			db++;
+		z += dz;
+		if (!(x1 & (FONT_WIDTH - 1)) && x1 <= x2)
+		{
+			if (	!(dc->flags & DCF_SCREEN_BITMAP)||
+					win_task->next_task == sys_winmgr_task ||
+					dc->flags & DCF_ON_TOP || !IsPixCovered0(win_task, x1, y))
+				char_clear = TRUE;
+			else
+				char_clear = FALSE;
+		}
+	}
+gr_done:
+	BEqual(&Fs->task_flags, TASKf_NONTIMER_RAND, was_timer_rand);
+
+	return res;
+}
+
+public I64 GrVLine(CDC *dc=gr.dc, I64 x, I64 y1, I64 y2, I64 z1=0, I64 z2=0)
+{//3D. No transformation or thick.
+//Returns count of pixs changed
+	//Uses $LK,"fixed-point",A="FI:::/Demo/Lectures/FixedPoint.ZC"$.
+	I64				 dist, dy, dz, z, res = 0, i, j, d, rop, c, pen0, pen1, pen_cur, bk;
+	U32				*dst;
+	CColorROPU32	 color = dc->color;
+	I32				*db;
+	Bool			 plot = TRUE, char_clear, dither, probability_dither,
+					 was_timer_rand = Bts(&Fs->task_flags, TASKf_NONTIMER_RAND);
+	CTask			*win_task;
+
+
+	if (!dc->depth_buf)
+	{
+		BEqual(&Fs->task_flags, TASKf_NONTIMER_RAND, was_timer_rand);
+		if (y2 < y1)
+			SwapI64(&y1, &y2);
+		return GrRect(dc, x, y1, 1, y2 - y1 + 1);
+	}
+
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		win_task = dc->win_task;
+		x  += win_task->scroll_x;
+		y1 += win_task->scroll_y;
+		y2 += win_task->scroll_y;
+		z1 += win_task->scroll_z;
+		z2 += win_task->scroll_z;
+	}
+	if (dc->flags & DCF_RECORD_EXTENTS)
+	{
+		if (x < dc->min_x)
+			dc->min_x = x;
+
+		if (x > dc->max_x)
+			dc->max_x = x;
+
+		if (y1 < dc->min_y)
+			dc->min_y = y1;
+
+		if (y1 > dc->max_y)
+			dc->max_y = y1;
+
+		if (y2 < dc->min_y)
+			dc->min_y = y2;
+
+		if (y2 > dc->max_y)
+			dc->max_y = y2;
+	}
+	if (x < 0)
+		goto gr_done;
+	if (y2 < y1)
+	{
+		SwapI64(&y1, &y2);
+		SwapI64(&z1, &z2);
+	}
+	if (y2 < 0)
+		goto gr_done;
+	if (y1 < 0)
+	{
+		i = -y1;
+		y1 = 0;
+	}
+	else
+		i = 0;
+	j = 0;
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		y1 += win_task->pix_top;
+		y2 += win_task->pix_top;
+		if (y1 > win_task->pix_bottom)
+			goto gr_done;
+		if (y2 > win_task->pix_bottom)
+		{
+			j = y2 - win_task->pix_bottom;
+			y2 = win_task->pix_bottom;
+		}
+		x += win_task->pix_left;
+		if (!(0 <= x <= win_task->pix_right) || y2 < 0)
+			goto gr_done;
+	}
+	if (y1 >= dc->height || x >= dc->width)
+		goto gr_done;
+	dy = y2 + j - (y1 - i);
+	d = dc->width_internal * y1 + x;
+	if (db = dc->depth_buf)
+	{
+		db += d;
+		if (dy)
+			dz = (z2 - z1) << 32 / dy;
+		else
+			dz = 0;
+		z = z1 << 32;
+	}
+	if (i)
+		z += i * dz;
+	if (y2 >= dc->height)
+		y2 = dc->height - 1;
+
+	if (dc->flags & DCF_LOCATE_NEAREST)
+	{
+		if (y1 <= dc->cur_y <= y2)
+			dist = 0;
+		else if (dc->cur_y < y1)
+			dist = SqrI64(y1 - dc->cur_y);
+		else
+			dist = SqrI64(dc->cur_y - y2);
+		dist += SqrI64(x - dc->cur_x);
+		if (dist <= dc->nearest_dist)
+			dc->nearest_dist = dist;
+	}
+	if (dc->flags & DCF_DONT_DRAW)
+		goto gr_done;
+
+	if (	!(dc->flags & DCF_SCREEN_BITMAP) ||
+			win_task->next_task == sys_winmgr_task ||
+			dc->flags & DCF_ON_TOP || !IsPixCovered0(win_task, x, y1))
+		char_clear = TRUE;
+	else
+		char_clear = FALSE;
+	rop = GrRopBGet(color);
+	pen0 = GrColorResolve(color);
+	pen1 = pen0;
+	bk = GrColorResolve(dc->bkcolor);
+	dither = FALSE;
+	probability_dither = FALSE;
+	if (!(color & ROPF_TRUE_COLOR) && color.c1.rop & (ROPBF_DITHER | ROPBF_PROBABILITY_DITHER))
+	{
+		dither = TRUE;
+		pen1 = GrPixResolve(color.c1.color);
+		if (color.c1.rop & ROPBF_PROBABILITY_DITHER)
+		{
+			probability_dither = TRUE;
+			if (RandU16 < dc->dither_probability_u16)
+				pen_cur = pen1;
+			else
+				pen_cur = pen0;
+		}
+		else
+		{
+			if ((x ^ y1) & 1)
+			{
+				pen_cur = pen0; //Will swap below.
+				pen0 = pen1;
+				pen1 = pen_cur;
+			}
+			pen_cur = pen0;
+		}
+	}
+	else
+		pen_cur = pen0;
+	while (y1 <= y2)
+	{
+		if (char_clear)
+		{
+			if (db)
+			{
+				if (0 <= z.i32[1] <= *db)
+				{
+					*db = z.i32[1];
+					plot = TRUE;
+				}
+				else
+					plot = FALSE;
+			}
+			if (plot)
+			{
+				dst = dc->body + d;
+				switch (rop)
+				{
+					case ROPB_EQU:
+					case ROPB_MONO:
+						*dst = pen_cur;
+						break;
+
+					case ROPB_COLLISION:
+						c = *dst;
+						if (c != PIXF_TRANSPARENT && c != bk)
+							dc->collision_count++;
+						break;
+
+					case ROPB_XOR:
+						*dst ^= pen_cur & PIX_RGB_MASK;
+						break;
+				}
+				res++;
+			}
+		}
+		if (dither)
+		{
+			if (probability_dither)
+			{
+				if (RandU16 < dc->dither_probability_u16)
+					pen_cur = pen1;
+				else
+					pen_cur = pen0;
+			}
+			else
+			{
+				if (pen_cur == pen0)
+					pen_cur = pen1;
+				else
+					pen_cur = pen0;
+			}
+		}
+		d += dc->width_internal;
+		y1++;
+		if (db)
+			db += dc->width_internal;
+		z += dz;
+		if (!(y1 & (FONT_HEIGHT - 1)) && y1 <= y2)
+		{
+			if (	!(dc->flags & DCF_SCREEN_BITMAP) ||
+					win_task->next_task == sys_winmgr_task ||
+					dc->flags & DCF_ON_TOP || !IsPixCovered0(win_task, x, y1))
+				char_clear = TRUE;
+			else
+				char_clear = FALSE;
+		}
+	}
+gr_done:
+	BEqual(&Fs->task_flags, TASKf_NONTIMER_RAND, was_timer_rand);
+
+	return res;
+}
+
+#help_index "Graphics/Color"
+U32 GrBlendPix(U32 dst, I64 sr, I64 sg, I64 sb, I64 a, I64 ia)
+{//Alpha-blend src (sr,sg,sb, alpha a) over dst pix. ia = 255 - a. Returns 0xRRGGBB.
+	I64 r = (sr * a + (dst >> 16 & 0xFF) * ia) / 255;
+	I64 g = (sg * a + (dst >> 8  & 0xFF) * ia) / 255;
+	I64 b = (sb * a + (dst       & 0xFF) * ia) / 255;
+
+	return r << 16 | g << 8 | b;
+}
+
+public I64 GrRectAlpha(CDC *dc=gr.dc, I64 x, I64 y, I64 w, I64 h, I64 rgb, I64 a)
+{//2D alpha-blended rect. rgb=0xRRGGBB, a=0..255 (0 clear, 255 opaque). Clipping, no transform.
+//Real transparency: whatever is already in the dc shows through. Returns pixs changed.
+	I64		 i, j, k1, w1, h1, w2, h2, res = 0, win_z_num, xx, yy, ia,
+			 sr = rgb >> 16 & 0xFF, sg = rgb >> 8 & 0xFF, sb = rgb & 0xFF;
+	U32		*dst;
+	U16		*zb = NULL;
+	CTask	*win_task;
+
+	if (a <= 0)
+		return 0;
+	if (a > 255)
+		a = 255;
+	ia = 255 - a;
+
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		win_task = dc->win_task;
+		x += win_task->scroll_x;
+		y += win_task->scroll_y;
+	}
+	if (x < 0)
+		w1 = -x;
+	else
+		w1 = 0;
+	if (y < 0)
+		h1 = -y;
+	else
+		h1 = 0;
+	w2 = w;
+	h2 = h;
+	if (dc->flags & DCF_SCREEN_BITMAP)
+	{
+		x += win_task->pix_left;
+		y += win_task->pix_top;
+		if (x + w1 < 0)
+			w1 = -x;
+		if (x + w2 > win_task->pix_right + 1)
+			w2 = win_task->pix_right + 1 - x;
+		if (y + h1 < 0)
+			h1 = -y;
+		if (y + h2 > win_task->pix_bottom + 1)
+			h2 = win_task->pix_bottom + 1 - y;
+	}
+	if (x + w2 > dc->width)
+		w2 = dc->width - x;
+	if (y + h2 > dc->height)
+		h2 = dc->height - y;
+
+	if (w1 < w2 <= w && h1 < h2 <= h)
+	{
+		if (dc->flags & DCF_DONT_DRAW)
+			return 0;
+		if (dc->flags & DCF_SCREEN_BITMAP && !(dc->flags & DCF_ON_TOP))
+		{
+			win_z_num = win_task->win_z_num;
+			zb = gr.win_z_buf;
+		}
+		k1 = (h1 + y) * dc->width_internal;
+		for (j = h1; j < h2; j++)
+		{
+			yy = y + j;
+			dst = dc->body + k1;
+			for (i = w1; i < w2; i++)
+			{
+				xx = x + i;
+				if (!zb || win_z_num >= zb[yy >> 3 * TEXT_COLS + (xx >> 3)])
+				{
+					dst[xx] = GrBlendPix(dst[xx], sr, sg, sb, a, ia);
+					res++;
+				}
+			}
+			k1 += dc->width_internal;
+		}
+	}
+
+	return res;
+}

@@ -1,0 +1,43 @@
+// Native PNG decode demo. Loads a truecolor PNG with PNGRead() and blots it
+// to the window every frame. Transparent pixels (alpha < 128) show the window
+// background through. Press any key to exit.
+
+CDC *png_demo_img;
+
+U0 PNGDemoDraw(CTask *task, CDC *dc)
+{
+	if (png_demo_img)
+		GrBlot(dc, (task->pix_width  - png_demo_img->width)  / 2,
+				   (task->pix_height - png_demo_img->height) / 2, png_demo_img);
+}
+
+U0 PNGDemo(U8 *filename="::/Demo/Graphics/PNGTest.PNG")
+{
+	png_demo_img = PNGRead(filename);
+	if (!png_demo_img)
+	{
+		"PNGRead failed on \"%s\".\n", filename;
+		return;
+	}
+
+	SettingsPush;
+	AutoComplete;
+	WinBorder;
+	WinMax;
+	DocClear;
+	DCFill;
+
+	Fs->win_inhibit = WIG_TASK_DEFAULT - WIF_SELF_FOCUS - WIF_SELF_BORDER;
+	Fs->draw_it = &PNGDemoDraw;
+
+	while (!CharScan)
+		Refresh;
+
+	Fs->draw_it = NULL;
+	DCDel(png_demo_img);
+	png_demo_img = NULL;
+	DCFill;
+	SettingsPop;
+}
+
+PNGDemo;
