@@ -579,11 +579,64 @@ I64 DNSQueryRun(CUDPSocket *udp_socket, U8 *name, U16 port, CAddressInfo **resul
 
 // Shrine has port arg as U8 *service with a no_warn and says it should be parsed as port, allowing that here
 // Also has CAddressInfo *hints with a no_warn, omitting that for now
+Bool DNSParseDottedQuad(U8 *s, U8 *out4)
+{//"a.b.c.d" -> 4 bytes. FALSE if not a pure numeric dotted quad.
+	I64	 i, v, digits;
+	U8	*p = s;
+
+	for (i = 0; i < 4; i++)
+	{
+		v = 0;
+		digits = 0;
+		while ('0' <= *p <= '9')
+		{
+			v = v * 10 + *p - '0';
+			p++;
+			digits++;
+		}
+		if (!digits || v > 255)
+			return FALSE;
+		out4[i] = v;
+		if (i < 3)
+		{
+			if (*p != '.')
+				return FALSE;
+			p++;
+		}
+	}
+
+	return *p == 0;
+}
+
 I64 DNSAddressInfoGet(U8 *node_name, U16 port, CAddressInfo **result)
 {
 	I64			 error;
 	CUDPSocket	*udp_socket;
-	CDNSHash	*cached_entry = DNSCacheFind(node_name);
+	CDNSHash	*cached_entry;
+	CAddressInfo *res;
+	CSocketAddressIPV4 *addr;
+	U8			 quad[4];
+
+	if (DNSParseDottedQuad(node_name, quad))
+	{//Numeric IP: build the CAddressInfo directly, no query. Matches the
+	//r_data layout DNSQueryRun uses (4 raw network-order bytes).
+		res = CAlloc(sizeof(CAddressInfo));
+		res->flags			= 0;
+		res->family			= AF_INET;
+		res->socket_type	= 0;
+		res->protocol		= 0;
+		res->address_length	= sizeof(CSocketAddressIPV4);
+		res->address		= CAlloc(sizeof(CSocketAddressIPV4));
+		res->canonical_name	= 0;
+		res->next			= NULL;
+		addr = res->address;
+		addr->family = AF_INET;
+		MemCopy(&addr->address.address, quad, 4);
+		*result = res;
+		return 0;
+	}
+
+	cached_entry = DNSCacheFind(node_name);
 
 	if (cached_entry)
 	{
