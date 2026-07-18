@@ -503,6 +503,11 @@ U0 KbdInit()
 	OutU8(PIC_1_DATA, InU8(PIC_1_DATA) & ~2);
 }
 
+//YDE: multimedia keys, latched raw by KbdHandler; the DE consumes them via a
+//runtime symbol lookup, so old kernels simply lack the feature.
+public I64 kbd_media_vol;	//Accumulated VolUp(+) / VolDown(-) presses.
+public I64 kbd_media_mute;	//Accumulated Mute presses.
+
 U0 KbdHandler()
 {
 	static U8 last_raw_byte = 0;
@@ -514,6 +519,12 @@ U0 KbdHandler()
 	{
 		FifoU8Remove(kbd.fifo2, &raw_byte);
 		KbdBuildSC(raw_byte, FALSE, &last_raw_byte, &kbd.scan_code);
+		switch (raw_byte)
+		{//Multimedia keys, latched at the raw level (make codes only).
+			case 0x30:	kbd_media_vol++;	break;	//Volume up.
+			case 0x2E:	kbd_media_vol--;	break;	//Volume down.
+			case 0x20:	kbd_media_mute++;	break;	//Mute toggle.
+		}
 	}
 	if (Btr(&kbd.scan_code, SCf_NEW_KEY))
 	{

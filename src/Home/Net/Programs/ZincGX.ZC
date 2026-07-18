@@ -81,8 +81,8 @@ class CGxGlobals
 	CColorROPU32 text_pen;	//Resolved default text pen for this page.
 	I64		 list_typ[8], list_ctr[8], list_sp;	//0 = ul, 1 = ol.
 	U8		 url[256];
-	I64		 url_len;
-	Bool	 url_focus, quit, fetch, relayout;
+	I64		 url_len, url_caret;
+	Bool	 url_focus, url_selall, quit, fetch, relayout;
 	U8		*hover_href;
 	U8		 run[GX_RUN_MAX];
 	I64		 run_len, run_x, run_y, run_scale;
@@ -1008,13 +1008,21 @@ U0 GxDrawChrome(CDC *dc)
 	GrRect(dc, bx + 122, GX_CHROME_H - 5, w - bx - 122 - 40, 1);
 	GrRect(dc, bx + 122, 4, 1, GX_CHROME_H - 8);
 	GrRect(dc, w - 44, 4, 1, GX_CHROME_H - 8);
-	dc->color = de_theme.text;
-	if (gx.url_focus && Blink)
-		StrPrint(buf, "%s_", gx.url);
-	else
-		StrPrint(buf, "%s", gx.url);
+	StrPrint(buf, "%s", gx.url);
 	buf[ClampI64((w - bx - 130 - 44) / FONT_WIDTH, 0, 262)] = 0; //Clip to the box.
+	if (gx.url_focus && gx.url_selall)
+	{//Select-all highlight behind the text.
+		dc->color = de_theme.bttn_focus;
+		GrRect(dc, bx + 127, 6, StrLen(buf) * FONT_WIDTH + 2, GX_CHROME_H - 12);
+	}
+	dc->color = de_theme.text;
 	GrPrint(dc, bx + 128, ty, "%s", buf);
+	if (gx.url_focus && !gx.url_selall && Blink)
+	{//Caret at the edit position.
+		dc->color = de_theme.accent;
+		GrRect(dc, bx + 128 + MinI64(gx.url_caret, StrLen(buf)) * FONT_WIDTH,
+			   GX_CHROME_H - 7, FONT_WIDTH, 2);
+	}
 
 	//Go.
 	dc->color = de_theme.chip;
@@ -1275,6 +1283,9 @@ img_loop:
 	}
 }
 
+U8	gx_clip[256];
+I64	gx_clip_len = 0; //JIT globals are NOT zeroed: explicit.
+
 U0 GxUrlSet(U8 *url)
 {
 	I64 len = StrLen(url);
@@ -1284,6 +1295,37 @@ U0 GxUrlSet(U8 *url)
 	MemCopy(gx.url, url, len);
 	gx.url[len] = 0;
 	gx.url_len = len;
+	gx.url_caret = len;
+	gx.url_selall = FALSE;
+}
+
+U0 GxUrlIns(I64 ch)
+{
+	I64 i;
+
+	if (gx.url_selall)
+	{
+		gx.url_len = 0;
+		gx.url_caret = 0;
+		gx.url_selall = FALSE;
+	}
+	if (gx.url_len >= 254)
+		return;
+	for (i = gx.url_len; i > gx.url_caret; i--)
+		gx.url[i] = gx.url[i - 1];
+	gx.url[gx.url_caret++] = ch;
+	gx.url[++gx.url_len] = 0;
+}
+
+U0 GxUrlDel(I64 at)
+{//Remove the char at index 'at'.
+	I64 i;
+
+	if (at < 0 || at >= gx.url_len)
+		return;
+	for (i = at; i < gx.url_len - 1; i++)
+		gx.url[i] = gx.url[i + 1];
+	gx.url[--gx.url_len] = 0;
 }
 
 U0 GxClickContent(I64 x, I64 y)
@@ -1385,7 +1427,12 @@ U0 GxClick(I64 x, I64 y)
 		else if (w - 36 <= x < w - 4)
 			GxNavTo(ZincResolveInput(gx.url));
 		else if (126 <= x < w - 44)
+		{
 			gx.url_focus = TRUE;
+			gx.url_selall = FALSE;
+			gx.url_caret = ClampI64((x - 132 + FONT_WIDTH / 2) / FONT_WIDTH,
+									0, gx.url_len);
+		}
 		return;
 	}
 	if (x >= w - GX_SBAR_W && gx.doc_h > view_h)
@@ -1402,7 +1449,7 @@ U0 GxClick(I64 x, I64 y)
 public U0 ZincGX(U8 *start_url=NULL)
 {
 	U8	*current, *target;
-	I64	 msg, a1, a2, view_h, nav_chain = 0;
+	I64	 msg, a1, a2, view_h, vi, nav_chain = 0;
 	U8	 title[80];
 
 	MemSet(&gx, 0, sizeof(CGxGlobals));
@@ -1612,22 +1659,80 @@ public U0 ZincGX(U8 *start_url=NULL)
 						}
 						else if (a1 == CH_BACKSPACE)
 						{
-							if (gx.url_len)
-								gx.url[--gx.url_len] = 0;
+							if (gx.url_selall)
+							{
+								gx.url_len = 0;
+								gx.url_caret = 0;
+								gx.url[0] = 0;
+								gx.url_selall = FALSE;
+							}
+							else if (gx.url_caret > 0)
+								GxUrlDel(--gx.url_caret);
 						}
 						else if (a1 == CH_ESC)
 							gx.url_focus = FALSE;
-						else if (' ' <= a1 < 0x7F && gx.url_len < 254)
+						else if (a1 == 1)  //Ctrl+A: select all.
+							gx.url_selall = TRUE;
+						else if (a1 == 3)  //Ctrl+C: copy the URL.
 						{
-							gx.url[gx.url_len++] = a1;
-							gx.url[gx.url_len] = 0;
+							MemCopy(gx_clip, gx.url, gx.url_len + 1);
+							gx_clip_len = gx.url_len;
 						}
+						else if (a1 == 22) //Ctrl+V: paste.
+						{
+							if (gx.url_selall)
+							{
+								gx.url_len = 0;
+								gx.url_caret = 0;
+								gx.url[0] = 0;
+								gx.url_selall = FALSE;
+							}
+							for (vi = 0; vi < gx_clip_len; vi++)
+								if (' ' <= gx_clip[vi] < 0x7F)
+									GxUrlIns(gx_clip[vi]);
+						}
+						else if (' ' <= a1 < 0x7F)
+							GxUrlIns(a1);
+						else if (!a1)
+							switch (a2.u8[0])
+							{
+								case SC_CURSOR_LEFT:
+									gx.url_selall = FALSE;
+									gx.url_caret = MaxI64(0, gx.url_caret - 1);
+									break;
+								case SC_CURSOR_RIGHT:
+									gx.url_selall = FALSE;
+									gx.url_caret = MinI64(gx.url_len, gx.url_caret + 1);
+									break;
+								case SC_HOME:
+									gx.url_caret = 0;
+									break;
+								case SC_END:
+									gx.url_caret = gx.url_len;
+									break;
+								case SC_DELETE:
+									if (gx.url_selall)
+									{
+										gx.url_len = 0;
+										gx.url_caret = 0;
+										gx.url[0] = 0;
+										gx.url_selall = FALSE;
+									}
+									else
+										GxUrlDel(gx.url_caret);
+									break;
+							}
 					}
 					else switch (a1)
 					{
 						case CH_ESC:
 						case CH_SHIFT_ESC:
 							gx.quit = TRUE;
+							break;
+						case 12: //Ctrl+L: focus the URL bar, all selected.
+							gx.url_focus = TRUE;
+							gx.url_selall = TRUE;
+							gx.url_caret = gx.url_len;
 							break;
 						case 'b':
 							GxNavTo(StrNew("b"));
