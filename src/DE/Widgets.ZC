@@ -247,8 +247,10 @@ Bool DEWinPoll(CDEWinCtx *ctx)
 			case MESSAGE_MS_L_DOWN:
 				wg = ctx->head;
 				while (wg)
-				{
+				{//Only interactive types take hits - panels/labels under the
+				//click must not swallow it.
 					if (wg->visible &&
+						(wg->type == DEWT_BUTTON || wg->type == DEWT_CHECK || wg->type == DEWT_SLIDER) &&
 						wg->x <= a1 < wg->x + wg->w && wg->y <= a2 < wg->y + wg->h)
 					{
 						switch (wg->type)
@@ -298,11 +300,13 @@ CDEWinCtx *DEWinInit(U8 *title, I64 cols, I64 rows)
 	ctx->task = Fs;
 	ctx->old_inhibit = Fs->win_inhibit;
 	StrCopy(Fs->task_title, title);
-	WinHorz(Max(1, (TEXT_COLS - cols) / 2), Max(1, (TEXT_COLS - cols) / 2) + cols - 1);
-	WinVert(Max(1, (TEXT_ROWS - rows) / 2), Max(1, (TEXT_ROWS - rows) / 2) + rows - 1);
-	WinToTop;
-	//Keep border/focus stock; stop clicks from repositioning the doc cursor.
-	Fs->win_inhibit = ctx->old_inhibit | WIF_SELF_MS_L | WIF_SELF_MS_R;
+	WinHorz(MaxI64(1, (TEXT_COLS - cols) / 2), MaxI64(1, (TEXT_COLS - cols) / 2) + cols - 1);
+	WinVert(MaxI64(1, (TEXT_ROWS - rows) / 2), MaxI64(1, (TEXT_ROWS - rows) / 2) + rows - 1);
+	//Do NOT inhibit WIF_SELF_MS_L: click-to-focus rides WinCursorPosSet->WinToTop,
+	//and the doc is empty so cursor repositioning is harmless. MS_L_D inhibit
+	//makes L_DOWN/L_UP deliver instantly (skips the double-click timeout).
+	Fs->win_inhibit = ctx->old_inhibit | WIF_FOCUS_TASK_MS_L_D;
+	WinFocus;
 	DocCursor(OFF);
 	DocClear;
 	Fs->user_data = ctx;

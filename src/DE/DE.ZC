@@ -148,12 +148,50 @@ U0 DEMenuTask()
 	de.menu_task = NULL;
 }
 
+U0 DEBarTasksUpdate()
+{//Maintain a STABLE-ordered task array. The raw task list is z-order and
+//WinToTop reshuffles it on every focus, so drawing from it made buttons jump.
+	CTask	*t;
+	I64		 i, j;
+	Bool	 found;
+
+	//Prune dead/hidden entries, keeping arrival order.
+	j = 0;
+	for (i = 0; i < de.bar_count; i++)
+	{
+		t = de.bar_tasks[i];
+		if (TaskValidate(t) && Bt(&t->display_flags, DISPLAYf_SHOW) && t != de.task)
+			de.bar_tasks[j++] = t;
+	}
+	de.bar_count = j;
+
+	//Append newcomers at the end.
+	t = sys_winmgr_task;
+	while ((t = t->next_task) != sys_winmgr_task && de.bar_count < DE_BAR_TASKS_MAX)
+	{
+		if (!TaskValidate(t))
+			break;
+		if (Bt(&t->display_flags, DISPLAYf_SHOW) && t != de.task)
+		{
+			found = FALSE;
+			for (i = 0; i < de.bar_count; i++)
+				if (de.bar_tasks[i] == t)
+				{
+					found = TRUE;
+					break;
+				}
+			if (!found)
+				de.bar_tasks[de.bar_count++] = t;
+		}
+	}
+}
+
 U0 DEBarDraw(CDC *dc, CCtrl *c)
 {//Taskbar paint, called every frame from the WinMgr ctrl pass. dc is the
 //z-clipped screen alias; the bar strip is reserved, so it always shows.
-	CTask		*t = sys_winmgr_task;
+	CTask		*t;
 	CDateStruct	 ds;
-	I64			 y0 = GR_HEIGHT - DE_BAR_HEIGHT, x = 4, n = 0,
+	I64			 i, y0 = GR_HEIGHT - DE_BAR_HEIGHT, x = 4, n = 0,
 				 ty = y0 + (DE_BAR_HEIGHT - FONT_HEIGHT) / 2;
 	U8			 buf[STR_LEN];
 
@@ -174,16 +212,20 @@ U0 DEBarDraw(CDC *dc, CCtrl *c)
 	de.chip_x1 = x + DE_CHIP_WIDTH - 1;
 	x += DE_CHIP_WIDTH + 8;
 
-	//One button per visible Core0 window task.
-	while ((t = t->next_task) != sys_winmgr_task && n < DE_BAR_TASKS_MAX)
+	//One button per visible window task, in stable arrival order.
+	DEBarTasksUpdate;
+	for (i = 0; i < de.bar_count; i++)
 	{
-		if (!TaskValidate(t))
-			break;
-		if (Bt(&t->display_flags, DISPLAYf_SHOW) && t != de.task && x + DE_BTTN_WIDTH < GR_WIDTH - 80)
+		t = de.bar_tasks[i];
+		if (x + DE_BTTN_WIDTH >= GR_WIDTH - 80)
+		{//Off-bar: unclickable. (No 'continue' in HolyC.)
+			de.bar_x0[i] = -1;
+			de.bar_x1[i] = -1;
+		}
+		else
 		{
-			de.bar_tasks[n] = t;
-			de.bar_x0[n]	= x;
-			de.bar_x1[n]	= x + DE_BTTN_WIDTH - 6;
+			de.bar_x0[i] = x;
+			de.bar_x1[i] = x + DE_BTTN_WIDTH - 6;
 			if (t == sys_focus_task)
 				dc->color = de_theme.bttn_focus;
 			else
@@ -197,7 +239,6 @@ U0 DEBarDraw(CDC *dc, CCtrl *c)
 			n++;
 		}
 	}
-	de.bar_count = n;
 
 	Date2Struct(&ds, Now);
 	StrPrint(buf, "%02d:%02d:%02d", ds.hour, ds.min, ds.sec);
