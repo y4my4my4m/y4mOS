@@ -22,11 +22,13 @@ U0 GrFlatTitleRow(CTask *task, Bool focused)
 {//Modern flat truecolor title row, painted over the DolDoc border top line.
 //Layout mirrors $LK,"DocBorderNew",A="MN:DocBorderNew"$ so the MENU (far left) and [X] (far right)
 //click zones keep working. Toggle via $LK,"GuiMenuBarModern",A="MN:GuiMenuBarModern"$().
-	I64	 l = task->win_left - 1, r = task->win_right + 1, row = task->win_top - 1;
+	I64	 l = task->win_left, r = task->win_right, row = task->win_top - 1;
 	I64	 w = r - l + 1, i, n, tx;
 	CColorROPU32 bar, txt, chip_bg, chip_fg;
 	U8	*menu = "MENU", *close = "[X]", *title = task->task_title;
 
+	//The corner cells at win_left-1 / win_right+1 keep their border glyphs so
+	//the frame still connects to the side borders.
 	if (row < 0 || w < 14)
 		return;
 	bar = gr.tc_border_bg;

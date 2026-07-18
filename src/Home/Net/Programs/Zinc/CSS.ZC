@@ -34,6 +34,8 @@ class CZStyle
 	I32 fg, bg, border;			// -1 unset, else 0x00RRGGBB
 	I16 fsize;					// font-size in px; -1 unset
 	I16 mt, mb, ml, pt, pb, pl;	// block margins/padding in px; -1 unset
+	I16 width;					// block width: 0 unset, >0 px, -1..-99 percent
+	I8	ml_auto;				// margin-left/right auto (center when width set)
 	I8	bold;					// -1 unset / 0 / 1
 	I8	underline;
 	I8	display;				// -1 unset, else ZCSS_DISP_*
@@ -72,6 +74,8 @@ U0 ZStyleReset(CZStyle *s)
 	s->pt = -1;
 	s->pb = -1;
 	s->pl = -1;
+	s->width = 0;
+	s->ml_auto = -1;
 	s->bold = -1;
 	s->underline = -1;
 	s->display = -1;
@@ -93,6 +97,8 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	if (src->pt		   >= 0) dst->pt		= src->pt;
 	if (src->pb		   >= 0) dst->pb		= src->pb;
 	if (src->pl		   >= 0) dst->pl		= src->pl;
+	if (src->width)			 dst->width		= src->width;
+	if (src->ml_auto   >= 0) dst->ml_auto	= src->ml_auto;
 	if (src->bold	   >= 0) dst->bold		= src->bold;
 	if (src->underline >= 0) dst->underline = src->underline;
 	if (src->display   >= 0) dst->display	= src->display;
@@ -112,6 +118,8 @@ U0 ZStyleStripBox(CZStyle *s)
 	s->pl = -1;
 	s->border = -1;
 	s->display = -1;
+	s->width = 0;
+	s->ml_auto = -1;
 }
 
 U0 ZCssReset()
@@ -343,6 +351,24 @@ I64 ZCssBoxVals(U8 *val, I64 *out4)
 
 #define ZCSS_SPACE_MAX	80	// clamp margins/padding so junk can't blow layout
 
+Bool ZCssHasAuto(U8 *val)
+{ // any whitespace-separated token equal to "auto"?
+	U8 *p = val;
+
+	while (*p)
+	{
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (!StrNICompare(p, "auto", 4) &&
+			(p[4] == 0 || p[4] == ' ' || p[4] == '\t' || p[4] == ';'))
+			return TRUE;
+		while (*p && *p != ' ' && *p != '\t')
+			p++;
+	}
+
+	return FALSE;
+}
+
 U0 ZCssMarginSet(U8 *val, I16 *t, I16 *b, I16 *l)
 { // CSS shorthand order: top right bottom left
 	I64 v[4], count = ZCssBoxVals(val, v), vt = -1, vb = -1, vl = -1;
@@ -513,7 +539,11 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 			out->align = 0;
 	}
 	else if (!StrICompare(name, "margin"))
+	{
 		ZCssMarginSet(val, &out->mt, &out->mb, &out->ml);
+		if (ZCssHasAuto(val))
+			out->ml_auto = 1; // "margin: X auto" centers a sized block
+	}
 	else if (!StrICompare(name, "margin-top"))
 	{
 		n = ZCssPx(val);
@@ -526,11 +556,43 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 		if (n >= 0)
 			out->mb = MinI64(n, ZCSS_SPACE_MAX);
 	}
-	else if (!StrICompare(name, "margin-left"))
+	else if (!StrICompare(name, "margin-left") ||
+			 !StrICompare(name, "margin-right"))
 	{
-		n = ZCssPx(val);
-		if (n >= 0)
-			out->ml = MinI64(n, ZCSS_SPACE_MAX);
+		if (ZCssHasAuto(val))
+			out->ml_auto = 1;
+		if (name[7] == 'l')
+		{
+			n = ZCssPx(val);
+			if (n >= 0)
+				out->ml = MinI64(n, ZCSS_SPACE_MAX);
+		}
+	}
+	else if (!StrICompare(name, "width") || !StrICompare(name, "max-width"))
+	{
+		p = val;
+		while (*p && *p != '%')
+			p++;
+		if (*p == '%')
+		{
+			n = Str2I64(val);
+			if (1 <= n <= 99)
+				out->width = -n;
+		}
+		else
+		{
+			n = ZCssPx(val);
+			if (n > 15)
+			{ // max-width narrows an existing width, plain width replaces it
+				if (name[0] == 'm' || name[0] == 'M')
+				{
+					if (out->width <= 0 || n < out->width)
+						out->width = MinI64(n, 4000);
+				}
+				else
+					out->width = MinI64(n, 4000);
+			}
+		}
 	}
 	else if (!StrICompare(name, "padding"))
 		ZCssMarginSet(val, &out->pt, &out->pb, &out->pl);

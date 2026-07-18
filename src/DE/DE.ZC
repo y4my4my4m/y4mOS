@@ -355,9 +355,19 @@ U0 DETaskMain()
 
 		if (!(cnt & 15)) //Every ~240ms.
 			DEWinPolicyEnforce;
-		if (de.glass && sys_focus_task && sys_focus_task != gr.translucent_task &&
-			sys_focus_task != sys_winmgr_task && sys_focus_task != sys_task)
-			WinTranslucent(sys_focus_task, 205); //Glass follows the focus.
+		if (de.glass)
+		{//Glass follows the focus, but only doc/terminal windows: the cell
+		//blend erases draw_it graphics (widget apps would look blank).
+			if (sys_focus_task && sys_focus_task != sys_winmgr_task &&
+				sys_focus_task != sys_task && !sys_focus_task->draw_it &&
+				!(sys_focus_task->win_inhibit & WIF_SELF_DOC))
+			{
+				if (gr.translucent_task != sys_focus_task)
+					WinTranslucent(sys_focus_task, 205);
+			}
+			else if (gr.translucent_task)
+				WinOpaque;
+		}
 		cnt++;
 		Sleep(15); //Fast enough to catch quick TAB re-presses for ALT-TAB.
 	}
@@ -402,7 +412,7 @@ public U0 DEStart(U8 *wallpaper_filename="::/DE/Wallpaper.PNG")
 
 	if (!gr.tc_chrome) //Truecolor chrome on by default; Settings can revert.
 		GuiChromeTrueColor(de_theme.accent, ColorRGB(0x0A, 0x10, 0x1A), de_theme.accent_dim);
-	GuiMenuBarModern(TRUE); //Flat truecolor title rows; Settings can revert.
+	//Modern flat title rows stay OFF by default; opt in via Settings.
 	LBtr(&sys_task->display_flags, DISPLAYf_SHOW); //SysLog hidden; F12 toggles.
 
 	de.on = TRUE;

@@ -1,0 +1,541 @@
+//Native baseline JPEG (JFIF/EXIF) decoder for YDE. Pure ZealC - no ELF.
+//Supports: baseline + extended sequential DCT (SOF0/SOF1), 8-bit, grayscale
+//or YCbCr, chroma subsampling 4:4:4 / 4:2:2 / 4:4:0 / 4:2:0, restart markers.
+//NOT supported (returns NULL): progressive (SOF2), arithmetic coding, 12-bit,
+//CMYK. Callers fall back to a placeholder.
+//
+//API mirrors GrPNG.ZC:
+//  JPGReadBuf(buf, size, mem_task) -> truecolor CDC or NULL
+//  JPGRead(filename, mem_task)     -> truecolor CDC or NULL
+
+#define JPG_MAX_DIM		2048
+
+Bool jpg_tabs_init = FALSE;	//ZealOS JIT does NOT zero globals: explicit init.
+F64	 jpg_idct_tab[8][8];	//[x][u] = C(u)/2 * cos((2x+1) u pi / 16)
+
+U8 jpg_zigzag[64] = {
+	 0,  1,  8, 16,  9,  2,  3, 10,
+	17, 24, 32, 25, 18, 11,  4,  5,
+	12, 19, 26, 33, 40, 48, 41, 34,
+	27, 20, 13,  6,  7, 14, 21, 28,
+	35, 42, 49, 56, 57, 50, 43, 36,
+	29, 22, 15, 23, 30, 37, 44, 51,
+	58, 59, 52, 45, 38, 31, 39, 46,
+	53, 60, 61, 54, 47, 55, 62, 63};
+
+U0 JpgTabsInit()
+{
+	I64 x, u;
+	F64 cu;
+
+	if (jpg_tabs_init)
+		return;
+	for (x = 0; x < 8; x++)
+		for (u = 0; u < 8; u++)
+		{
+			if (u == 0)
+				cu = 0.353553390593274; //1/sqrt(8)
+			else
+				cu = 0.5;
+			jpg_idct_tab[x][u] = cu * Cos((2 * x + 1) * u * pi / 16.0);
+		}
+	jpg_tabs_init = TRUE;
+}
+
+class CJpgHuff
+{
+	I64	mincode[17], maxcode[17], valptr[17];	//Per code length 1..16.
+	U8	symbols[256];
+	Bool defined;
+};
+
+class CJpgComp
+{
+	I64	id, hs, vs, tq;		//Sampling factors, quant table.
+	I64	td, ta;				//DC/AC huffman table ids (from SOS).
+	I64	dc_pred;
+	I64	pw, ph;				//Plane dims.
+	U8 *plane;
+};
+
+class CJpg
+{
+	U8		*p, *end;		//Entropy bit reader.
+	I64		 bitbuf, bitcnt;
+	Bool	 hit_marker;
+	I64		 width, height, ncomp;
+	I64		 restart_interval;
+	CJpgComp comp[3];
+	I64		 quant[4][64];
+	CJpgHuff hdc[4], hac[4];
+	I64		 hmax, vmax, mcux, mcuy;
+};
+
+I64 JpgBit(CJpg *j)
+{//Next entropy-coded bit; 0 at markers (spec: pad reads past data with 0).
+	I64 b;
+
+	if (!j->bitcnt)
+	{
+		if (j->p >= j->end || j->hit_marker)
+			return 0;
+		if (*j->p == 0xFF)
+		{
+			if (j->p + 1 < j->end && j->p[1] == 0x00)
+			{//Byte stuffing: 0xFF00 = data 0xFF.
+				b = 0xFF;
+				j->p += 2;
+			}
+			else
+			{//Leave j->p ON the marker so restart resync can find it.
+				j->hit_marker = TRUE;
+				return 0;
+			}
+		}
+		else
+			b = *j->p++;
+		j->bitbuf = b;
+		j->bitcnt = 8;
+	}
+	j->bitcnt--;
+
+	return j->bitbuf >> j->bitcnt & 1;
+}
+
+I64 JpgBits(CJpg *j, I64 n)
+{
+	I64 i, v = 0;
+
+	for (i = 0; i < n; i++)
+		v = v << 1 | JpgBit(j);
+
+	return v;
+}
+
+I64 JpgExtend(I64 v, I64 n)
+{//JPEG EXTEND: map an n-bit magnitude to its signed value.
+	if (n && v < 1 << (n - 1))
+		return v - (1 << n) + 1;
+
+	return v;
+}
+
+I64 JpgHuffDecode(CJpg *j, CJpgHuff *h)
+{//Canonical huffman decode per the JPEG spec flow. -1 on error.
+	I64 code = JpgBit(j), len = 1;
+
+	while (len <= 16)
+	{
+		if (h->maxcode[len] >= 0 && code <= h->maxcode[len])
+			return h->symbols[h->valptr[len] + code - h->mincode[len]];
+		code = code << 1 | JpgBit(j);
+		len++;
+	}
+
+	return -1;
+}
+
+Bool JpgDecodeBlock(CJpg *j, CJpgComp *c, F64 *pix)
+{//One 8x8 block: huffman -> dequant -> dezigzag -> IDCT into pix[64].
+	I64	 i, k, s, r, diff, zz;
+	I64	 coef[64];
+	F64	 tmp[64], sum;
+	I64	*q = &j->quant[c->tq][0];
+
+	MemSet(coef, 0, sizeof(coef));
+
+	s = JpgHuffDecode(j, &j->hdc[c->td]);
+	if (s < 0 || s > 11)
+		return FALSE;
+	diff = JpgExtend(JpgBits(j, s), s);
+	c->dc_pred += diff;
+	coef[0] = c->dc_pred * q[0];
+
+	k = 1;
+	while (k < 64)
+	{
+		s = JpgHuffDecode(j, &j->hac[c->ta]);
+		if (s < 0)
+			return FALSE;
+		r = s >> 4;
+		s = s & 0xF;
+		if (!s)
+		{
+			if (r == 15)
+				k += 16;	//ZRL: sixteen zeros.
+			else
+				break;		//EOB.
+		}
+		else
+		{
+			k += r;
+			if (k > 63)
+				return FALSE;
+			zz = jpg_zigzag[k];
+			coef[zz] = JpgExtend(JpgBits(j, s), s) * q[zz];
+			k++;
+		}
+	}
+
+	//Separable IDCT: rows then columns.
+	for (i = 0; i < 8; i++)		//i = row y.
+		for (k = 0; k < 8; k++)	//k = column x.
+		{
+			sum = 0;
+			for (r = 0; r < 8; r++)
+				sum += coef[i * 8 + r] * jpg_idct_tab[k][r];
+			tmp[i * 8 + k] = sum;
+		}
+	for (i = 0; i < 8; i++)		//i = column x.
+		for (k = 0; k < 8; k++)	//k = row y.
+		{
+			sum = 0;
+			for (r = 0; r < 8; r++)
+				sum += tmp[r * 8 + i] * jpg_idct_tab[k][r];
+			pix[k * 8 + i] = sum;
+		}
+
+	return TRUE;
+}
+
+U0 JpgPlaceBlock(CJpgComp *c, F64 *pix, I64 bx, I64 by)
+{//Clamp + level-shift an IDCT'ed block into the component plane.
+	I64 x, y, px, py, v;
+
+	for (y = 0; y < 8; y++)
+	{
+		py = by + y;
+		if (py < c->ph)
+			for (x = 0; x < 8; x++)
+			{
+				px = bx + x;
+				if (px < c->pw)
+				{
+					v = ToI64(pix[y * 8 + x]) + 128;
+					if (v < 0)
+						v = 0;
+					else if (v > 255)
+						v = 255;
+					c->plane[py * c->pw + px] = v;
+				}
+			}
+	}
+}
+
+Bool JpgHuffBuild(CJpgHuff *h, U8 *counts, U8 *syms, I64 nsyms)
+{//Canonical code tables from the DHT segment.
+	I64 len, code = 0, k = 0;
+
+	MemCopy(h->symbols, syms, nsyms);
+	for (len = 1; len <= 16; len++)
+	{
+		h->valptr[len]	= k;
+		h->mincode[len]	= code;
+		if (counts[len])
+		{
+			code += counts[len];
+			k	 += counts[len];
+		}
+		h->maxcode[len] = code - 1;
+		if (!counts[len])
+			h->maxcode[len] = -1;
+		code <<= 1;
+	}
+	h->defined = TRUE;
+
+	return TRUE;
+}
+
+CDC *JpgFinish(CJpg *j, CTask *mem_task)
+{//Upsample chroma + YCbCr->RGB into a truecolor CDC.
+	CDC	*dc = DCNew(j->width, j->height, mem_task);
+	I64	 x, y, yy, cb, cr, r, g, b;
+	I64	 cx, cy, w = j->width, h = j->height;
+	CJpgComp *c0 = &j->comp[0], *c1, *c2;
+	U32	*row;
+
+	if (j->ncomp == 3)
+	{
+		c1 = &j->comp[1];
+		c2 = &j->comp[2];
+	}
+	for (y = 0; y < h; y++)
+	{
+		row = dc->body + y * dc->width_internal;
+		for (x = 0; x < w; x++)
+		{
+			yy = c0->plane[(y * c0->vs / j->vmax) * c0->pw + x * c0->hs / j->hmax];
+			if (j->ncomp == 3)
+			{
+				cx = x * c1->hs / j->hmax;
+				cy = y * c1->vs / j->vmax;
+				cb = c1->plane[cy * c1->pw + cx] - 128;
+				cx = x * c2->hs / j->hmax;
+				cy = y * c2->vs / j->vmax;
+				cr = c2->plane[cy * c2->pw + cx] - 128;
+				//NB: in ZealC '>>' binds tighter than '*': use / 256 instead.
+				r = yy + 359 * cr / 256;
+				g = yy - (88 * cb + 183 * cr) / 256;
+				b = yy + 454 * cb / 256;
+				if (r < 0) r = 0;
+				if (r > 255) r = 255;
+				if (g < 0) g = 0;
+				if (g > 255) g = 255;
+				if (b < 0) b = 0;
+				if (b > 255) b = 255;
+			}
+			else
+			{
+				r = yy;
+				g = yy;
+				b = yy;
+			}
+			row[x] = r << 16 | g << 8 | b;
+		}
+	}
+	dc->flags |= DCF_NO_TRANSPARENTS;
+
+	return dc;
+}
+
+public CDC *JPGReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
+{//Decode a baseline JPEG from memory. NULL if unsupported/corrupt.
+	CJpg	*j;
+	CDC		*dc = NULL;
+	I64		 i, k, n, m, seg, len, prec, cnt, nsyms, id, mx, my, ci, bx, by, v;
+	I64		 tc, th, ri_count, next;
+	U8		*p = buf, *end = buf + size, *sp;
+	U8		 counts[17], syms[256];
+	F64		 pix[64];
+	Bool	 ok, sof_seen = FALSE, sos_hit = FALSE;
+
+	if (size < 16 || p[0] != 0xFF || p[1] != 0xD8)
+		return NULL;
+	JpgTabsInit;
+	j = CAlloc(sizeof(CJpg));
+	p += 2;
+
+	while (p + 4 <= end && !sos_hit)
+	{
+		if (*p != 0xFF)
+		{
+			p++;
+			goto jpg_next_seg;
+		}
+		while (p < end && *p == 0xFF)
+			p++;
+		if (p >= end)
+			break;
+		seg = *p++;
+		if (seg == 0xD8 || (0xD0 <= seg <= 0xD7) || seg == 0x01)
+			goto jpg_next_seg;	//No payload.
+		if (p + 2 > end)
+			break;
+		len = p[0] << 8 | p[1];
+		if (len < 2 || p + len > end)
+			break;
+		sp = p + 2;			//Segment payload.
+		p += len;			//Next segment.
+
+		switch (seg)
+		{
+			case 0xC0:		//SOF0 baseline.
+			case 0xC1:		//SOF1 extended sequential.
+				prec = sp[0];
+				j->height = sp[1] << 8 | sp[2];
+				j->width  = sp[3] << 8 | sp[4];
+				j->ncomp  = sp[5];
+				if (prec != 8 || j->ncomp < 1 || j->ncomp > 3 ||
+					j->width < 1 || j->height < 1 ||
+					j->width > JPG_MAX_DIM || j->height > JPG_MAX_DIM)
+					goto jpg_fail;
+				for (i = 0; i < j->ncomp; i++)
+				{
+					j->comp[i].id = sp[6 + i * 3];
+					j->comp[i].hs = sp[7 + i * 3] >> 4 & 0xF;
+					j->comp[i].vs = sp[7 + i * 3] & 0xF;
+					j->comp[i].tq = sp[8 + i * 3] & 3;
+					if (j->comp[i].hs < 1 || j->comp[i].hs > 2 ||
+						j->comp[i].vs < 1 || j->comp[i].vs > 2)
+						goto jpg_fail;
+				}
+				sof_seen = TRUE;
+				break;
+			case 0xC2:		//Progressive: unsupported.
+			case 0xC3:
+			case 0xC5:
+			case 0xC6:
+			case 0xC7:
+			case 0xC9:
+			case 0xCA:
+			case 0xCB:
+			case 0xCD:
+			case 0xCE:
+			case 0xCF:
+				goto jpg_fail;
+			case 0xDB:		//DQT.
+				n = len - 2;
+				while (n > 0)
+				{
+					prec = *sp >> 4 & 0xF;
+					id	 = *sp & 3;
+					sp++;
+					n--;
+					if (prec)
+					{//16-bit entries.
+						for (i = 0; i < 64; i++)
+							j->quant[id][jpg_zigzag[i]] = sp[i * 2] << 8 | sp[i * 2 + 1];
+						sp += 128;
+						n -= 128;
+					}
+					else
+					{
+						for (i = 0; i < 64; i++)
+							j->quant[id][jpg_zigzag[i]] = sp[i];
+						sp += 64;
+						n -= 64;
+					}
+				}
+				break;
+			case 0xC4:		//DHT.
+				n = len - 2;
+				while (n > 16)
+				{
+					tc = *sp >> 4 & 0xF;
+					th = *sp & 3;
+					sp++;
+					nsyms = 0;
+					counts[0] = 0;
+					for (i = 1; i <= 16; i++)
+					{
+						counts[i] = sp[i - 1];
+						nsyms += counts[i];
+					}
+					sp += 16;
+					if (nsyms > 256)
+						goto jpg_fail;
+					MemCopy(syms, sp, nsyms);
+					sp += nsyms;
+					n -= 17 + nsyms;
+					if (tc)
+						JpgHuffBuild(&j->hac[th], counts, syms, nsyms);
+					else
+						JpgHuffBuild(&j->hdc[th], counts, syms, nsyms);
+				}
+				break;
+			case 0xDD:		//DRI.
+				j->restart_interval = sp[0] << 8 | sp[1];
+				break;
+			case 0xDA:		//SOS: entropy data follows.
+				if (!sof_seen)
+					goto jpg_fail;
+				cnt = sp[0];
+				if (cnt != j->ncomp)
+					goto jpg_fail;
+				for (i = 0; i < cnt; i++)
+				{
+					id = sp[1 + i * 2];
+					for (k = 0; k < j->ncomp; k++)
+						if (j->comp[k].id == id)
+						{
+							j->comp[k].td = sp[2 + i * 2] >> 4 & 3;
+							j->comp[k].ta = sp[2 + i * 2] & 3;
+						}
+				}
+				j->p = p;	//Entropy-coded data starts after the SOS header.
+				sos_hit = TRUE;
+				break;
+			default:		//APPn, COM, others: skip.
+				break;
+		}
+jpg_next_seg:;
+	}
+
+	if (!sos_hit)
+		goto jpg_fail;
+
+	//Plane setup.
+	j->hmax = 1;
+	j->vmax = 1;
+	for (i = 0; i < j->ncomp; i++)
+	{
+		j->hmax = MaxI64(j->hmax, j->comp[i].hs);
+		j->vmax = MaxI64(j->vmax, j->comp[i].vs);
+	}
+	j->mcux = (j->width  + 8 * j->hmax - 1) / (8 * j->hmax);
+	j->mcuy = (j->height + 8 * j->vmax - 1) / (8 * j->vmax);
+	for (i = 0; i < j->ncomp; i++)
+	{
+		j->comp[i].pw = j->mcux * 8 * j->comp[i].hs;
+		j->comp[i].ph = j->mcuy * 8 * j->comp[i].vs;
+		j->comp[i].plane = CAlloc(j->comp[i].pw * j->comp[i].ph);
+	}
+
+	j->end = end;
+	j->bitcnt = 0;
+	j->hit_marker = FALSE;
+	ok = TRUE;
+	ri_count = 0;
+
+	for (my = 0; my < j->mcuy && ok; my++)
+		for (mx = 0; mx < j->mcux && ok; mx++)
+		{
+			for (ci = 0; ci < j->ncomp && ok; ci++)
+				for (v = 0; v < j->comp[ci].vs && ok; v++)
+					for (i = 0; i < j->comp[ci].hs && ok; i++)
+					{
+						if (!JpgDecodeBlock(j, &j->comp[ci], pix))
+							ok = FALSE;
+						else
+						{
+							bx = (mx * j->comp[ci].hs + i) * 8;
+							by = (my * j->comp[ci].vs + v) * 8;
+							JpgPlaceBlock(&j->comp[ci], pix, bx, by);
+						}
+					}
+			ri_count++;
+			if (j->restart_interval && ri_count == j->restart_interval &&
+				!(my == j->mcuy - 1 && mx == j->mcux - 1))
+			{//Byte-align and consume the RSTn marker; reset DC predictors.
+				ri_count = 0;
+				j->bitcnt = 0;
+				j->hit_marker = FALSE;
+				while (j->p + 1 < j->end)
+				{
+					if (j->p[0] == 0xFF && (0xD0 <= j->p[1] <= 0xD7))
+					{
+						j->p += 2;
+						break;
+					}
+					j->p++;
+				}
+				for (i = 0; i < j->ncomp; i++)
+					j->comp[i].dc_pred = 0;
+			}
+		}
+
+	//Even a truncated image is worth showing if we got the planes allocated.
+	dc = JpgFinish(j, mem_task);
+
+jpg_fail:
+	for (i = 0; i < 3; i++)
+		Free(j->comp[i].plane);
+	Free(j);
+
+	return dc;
+}
+
+public CDC *JPGRead(U8 *filename, CTask *mem_task=NULL)
+{//Decode a JPEG file to a truecolor CDC. NULL if unreadable/unsupported.
+	I64	 size;
+	U8	*buf = FileRead(filename, &size);
+	CDC *dc = NULL;
+
+	if (buf)
+	{
+		dc = JPGReadBuf(buf, size, mem_task);
+		Free(buf);
+	}
+
+	return dc;
+}

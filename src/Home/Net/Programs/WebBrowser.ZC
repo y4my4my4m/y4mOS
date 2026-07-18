@@ -311,25 +311,48 @@ U0 ZincCollectCss(CZNode *node, I64 *external_left)
 	}
 }
 
+I64 zinc_ext_js_left = 3; //External <script src> budget, reset per page.
+
 U0 ZincRunScripts(CZNode *node)
-{ // run inline <script> blocks in document order
+{ // run inline <script> blocks (and small external ones) in document order
 	CZNode *child;
-	U8	   *type;
+	U8	   *type, *src, *abs;
+	CHttpResponse *r;
 
 	if (node->type == ZH_ELEM && ZTagIs(node, "script"))
 	{
-		if (ZNodeAttr(node, "src"))
-			NetLog("ZINC: external script skipped.");
-		else
+		type = ZNodeAttr(node, "type");
+		if (!type || StrIMatch("javascript", type) || StrIMatch("module", type))
 		{
-			type = ZNodeAttr(node, "type");
-			if (!type || StrIMatch("javascript", type) || StrIMatch("module", type))
-			{
-				if (node->text)
+			src = ZNodeAttr(node, "src");
+			if (src)
+			{//Fetch small external scripts so their function defs exist for
+			//onclick handlers. Big frameworks won't parse anyway - cap size.
+				if (zinc_ext_js_left > 0 && zinc_base_ok)
 				{
-					if (!JsRun(zinc_js, node->text))
-						ZincJsNote;
+					abs = HttpUrlResolve(&zinc_base, src);
+					if (abs)
+					{
+						zinc_ext_js_left--;
+						r = HttpGet(abs);
+						if (r && r->status == 200 && r->body && r->body_length < 98304)
+						{
+							if (!JsRun(zinc_js, r->body))
+								ZincJsNote;
+						}
+						else
+							NetLog("ZINC: external script skipped (fetch/size).");
+						HttpResponseFree(r);
+						Free(abs);
+					}
 				}
+				else
+					NetLog("ZINC: external script skipped (budget).");
+			}
+			else if (node->text)
+			{
+				if (!JsRun(zinc_js, node->text))
+					ZincJsNote;
 			}
 		}
 	}
@@ -355,6 +378,7 @@ U0 ZincSetPage(U8 *url, U8 *html)
 { // build DOM + CSS + forms + JS for fetched html
 	I64 external_css = 4;
 
+	zinc_ext_js_left = 3;
 	ZincPageFree;
 	zinc_base_ok = (HttpUrlParse(url, &zinc_base) >= 0);
 	zinc_dom = ZHtmlParse(html);

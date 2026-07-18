@@ -469,6 +469,8 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 	U8		*attr, *type;
 	U8		 mark[8];
 	I64		 i, box_op, mt_eff, mb_eff, pt_eff, pb_eff, ml_eff, pl_eff;
+	I64		 save_wrap, save_indent, bw, avail, cells, k, y0, ymax, cw, base;
+	I64		 center_add;
 	Bool	 is_block, is_body, boxed, is_list;
 
 	if (!node || gx.op_count >= GX_OPS_MAX - 8)
@@ -653,6 +655,61 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 		}
 	}
 
+	if (!StrCompare(node->tag, "tr"))
+	{//Table row: lay the td/th children out as side-by-side columns.
+		cells = 0;
+		child = node->first_child;
+		while (child)
+		{
+			if (child->type == ZH_ELEM &&
+				(!StrCompare(child->tag, "td") || !StrCompare(child->tag, "th")))
+				cells++;
+			child = child->next;
+		}
+		GxRunFlush;
+		if (gx.x > GX_MARGIN + gx.indent)
+			GxNewline(0);
+		base = GX_MARGIN + gx.indent;
+		avail = gx.wrap_w - base;
+		if (cells >= 2 && avail / cells >= 60)
+		{
+			MemCopy(&kid, &style, sizeof(CZStyle));
+			ZStyleStripBox(&kid);
+			save_indent = gx.indent;
+			save_wrap	= gx.wrap_w;
+			cw	 = avail / cells;
+			y0	 = gx.y;
+			ymax = y0;
+			k	 = 0;
+			child = node->first_child;
+			while (child)
+			{
+				if (child->type == ZH_ELEM &&
+					(!StrCompare(child->tag, "td") || !StrCompare(child->tag, "th")))
+				{
+					gx.y	  = y0;
+					gx.indent = save_indent + k * cw;
+					gx.wrap_w = base + (k + 1) * cw - 6;
+					gx.x	  = GX_MARGIN + gx.indent;
+					gx.line_start_op = gx.op_count;
+					GxNode(child, &kid);
+					GxRunFlush;
+					GxLineAlign;
+					ymax = MaxI64(ymax, gx.y);
+					k++;
+				}
+				child = child->next;
+			}
+			gx.indent = save_indent;
+			gx.wrap_w = save_wrap;
+			gx.y	  = ymax;
+			gx.x	  = GX_MARGIN + gx.indent;
+			gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+			return;
+		}
+		//Single cell (or too narrow): fall through and flow normally.
+	}
+
 	is_body = !StrCompare(node->tag, "body") || !StrCompare(node->tag, "html") ||
 			  !StrCompare(node->tag, "#root");
 	is_list = !StrCompare(node->tag, "ul") || !StrCompare(node->tag, "ol");
@@ -704,6 +761,24 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 		}
 		gx.y += mt_eff;
 		gx.indent += ml_eff;
+		save_wrap = 0;
+		center_add = 0;
+		if (style.width && !is_body)
+		{//width / max-width: narrow the wrap; margin:auto centers the box.
+			avail = gx.wrap_w - (GX_MARGIN + gx.indent);
+			if (style.width > 0)
+				bw = MinI64(style.width, avail);
+			else
+				bw = avail * -style.width / 100;
+			if (bw >= 60 && bw < avail)
+			{
+				if (style.ml_auto == 1)
+					center_add = (avail - bw) / 2;
+				gx.indent += center_add;
+				save_wrap = gx.wrap_w;
+				gx.wrap_w = GX_MARGIN + gx.indent + bw;
+			}
+		}
 		if (boxed)
 		{
 			op = GxOpAdd(GXO_BOX, GX_MARGIN + gx.indent - 3, gx.y - 2,
@@ -780,6 +855,11 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 			gx.line_start_op = gx.op_count;
 		}
 		gx.y += mb_eff;
+		if (save_wrap)
+		{//Undo the width narrowing and any margin:auto centering shift.
+			gx.wrap_w = save_wrap;
+			gx.indent -= center_add;
+		}
 		gx.indent -= ml_eff + pl_eff;
 		gx.x = GX_MARGIN + gx.indent;
 	}
@@ -1162,10 +1242,13 @@ U0 GxImgTask()
 		if (!StrNICompare(ce->url, "http", 4))
 		{
 			r = HttpGet(ce->url);
-			if (r && r->status == 200 && r->body_length > 8 &&
-				r->body[1] == 'P' && r->body[2] == 'N' && r->body[3] == 'G')
-			{//PNG magic (0x89 'P' 'N' 'G'). Decode into a cache-owned DC.
-				dc = PNGReadBuf(r->body, r->body_length, 255, sys_task);
+			if (r && r->status == 200 && r->body_length > 8)
+			{//Sniff by content: PNG (0x89 P N G) or JPEG (FFD8).
+				dc = NULL;
+				if (r->body[1] == 'P' && r->body[2] == 'N' && r->body[3] == 'G')
+					dc = PNGReadBuf(r->body, r->body_length, 255, sys_task);
+				else if (r->body[0] == 0xFF && r->body[1] == 0xD8)
+					dc = JPGReadBuf(r->body, r->body_length, sys_task);
 				if (dc)
 				{
 					iw = dc->width;
