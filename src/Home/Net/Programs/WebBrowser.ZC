@@ -7,9 +7,9 @@
 	  Render.ZC  styled DOM -> DolDoc with clickable links/forms
 
 	Features: http + https (TLS 1.3, encrypted but NOT authenticated -- see
-	Protocols/TLS.ZC), <style> blocks, inline style=, up to two external
+	Protocols/TLS.ZC), <style> blocks, inline style=, up to four external
 	stylesheets, inline <script>, GET forms, back/forward history, titles.
-	Not done: images, external scripts, POST, cookies, frames.
+	Not done: images (ZincGX has PNG), external scripts, POST, cookies, frames.
 
 	Run:  Zinc;               (opens the built-in welcome page)
 	      Zinc("http://frogfind.com/");
@@ -18,7 +18,8 @@
 	Keyboard: type an address and press ENTER (scheme optional), or the
 	short commands b f r g h q, l<n> links, i<n> widgets.
 
-	Built-in pages: zinc:welcome, zinc:test (JS engine self-checks).
+	Built-in pages: zinc:welcome, zinc:test (JS engine self-checks),
+	zinc:css (CSS renderer self-checks; best viewed in ZincGX).
 
 	No literal dollar signs allowed in this file (DolDoc source rule). */
 
@@ -63,8 +64,9 @@ U8 *zinc_welcome =
 	"</form>"
 	"<hr>"
 	"<p class=dim>Diagnostics: <a href=\"zinc:test\">zinc:test</a> checks "
-	"the JS engine. Before first https use, run <b>CryptoSelfTest;</b> in "
-	"a terminal to verify the crypto.</p>"
+	"the JS engine, <a href=\"zinc:css\">zinc:css</a> the CSS renderer. "
+	"Before first https use, run <b>CryptoSelfTest;</b> in a terminal to "
+	"verify the crypto.</p>"
 	"</body></html>";
 
 U8 *zinc_testpage =
@@ -94,6 +96,57 @@ U8 *zinc_testpage =
 	"'clicked at '+Date.now()\">Click event test</button> "
 	"<span id=o>(not clicked)</span></p>"
 	"<p><a href=\"zinc:welcome\">back to welcome</a></p>"
+	"</body></html>";
+
+U8 *zinc_csspage =
+	"<html><head><title>Zinc CSS self-test</title><style>"
+	"body { background: #f0f0f2; color: #222222; }"
+	"h1 { color: #2244aa; }"
+	"h2 { color: crimson; font-size: 22px; }"
+	".card { background: #fdfcff; border: 1px solid #aaaacc; "
+	"  margin: 12px; padding: 10px; }"
+	".card p { margin: 4px; }"
+	".hot { color: rgb(220, 60, 0); font-weight: bold; }"
+	"#uniq { background: gold; color: black; }"
+	".ctr { text-align: center; }"
+	".rgt { text-align: right; }"
+	".gone { display: none; }"
+	".nested { background: #dde8ff; border: 1px solid steelblue; "
+	"  padding: 8px; margin: 8px; }"
+	"ul.plain { list-style: none; }"
+	"@media screen { .mediaok { color: seagreen; font-weight: bold; } }"
+	"@media print { body { background: white; } .mediaok { color: red; } }"
+	"blockquote { border-left: 3px solid gray; }"
+	"</style></head><body>"
+	"<h1>CSS render checks</h1>"
+	"<p>Page: light background, dark default text. h1 blue, h2 crimson 22px.</p>"
+	"<h2>Colors + selectors</h2>"
+	"<p>1. <span class=hot>class .hot: bold red-orange</span>, "
+	"<span id=uniq>id #uniq: black on gold</span>, "
+	"<span style=\"color:#0a0\">inline #0a0 green</span>, "
+	"<span style=\"background:#333;color:#fff\">inline bg</span>.</p>"
+	"<p>2. Descendant rule: text inside the card below is tight (margin 4px).</p>"
+	"<p class=mediaok>3. @media screen entered: this line is seagreen bold "
+	"(red or plain = BAD).</p>"
+	"<p class=gone>4. display:none - THIS LINE MUST NOT APPEAR.</p>"
+	"<div class=card><p>5. .card box: white fill + 1px border + padding, "
+	"12px margin.</p>"
+	"<div class=nested><p>6. Nested box: light blue fill, steelblue border.</p>"
+	"</div></div>"
+	"<p class=ctr>7. This paragraph is centered.</p>"
+	"<p class=rgt>8. This one is right-aligned.</p>"
+	"<blockquote>9. Blockquote: indented, gray left border.</blockquote>"
+	"<h2>Text + legacy</h2>"
+	"<p>10. <font color=purple size=5>font tag: purple size 5</font>, "
+	"<mark>mark highlight</mark>, <b>bold</b>, <small>small gray</small>.</p>"
+	"<center>11. Legacy center tag centers this.</center>"
+	"<p style=\"font-size:26px\">12. Inline 26px text (2x glyphs).</p>"
+	"<ul><li>13. ul bullet one</li><li>bullet two"
+	"<ul><li>nested bullet</li></ul></li></ul>"
+	"<ol><li>14. ol numbered one</li><li>numbered two</li></ol>"
+	"<ul class=plain><li>15. list-style none: no bullet here</li></ul>"
+	"<p><a href=\"zinc:welcome\">16. link: UA blue + underline, hover accent"
+	"</a></p>"
 	"</body></html>";
 
 U0 ZincPrintSafe(CDoc *doc, U8 *s)
@@ -300,7 +353,7 @@ U0 ZincPageFree()
 
 U0 ZincSetPage(U8 *url, U8 *html)
 { // build DOM + CSS + forms + JS for fetched html
-	I64 external_css = 2;
+	I64 external_css = 4;
 
 	ZincPageFree;
 	zinc_base_ok = (HttpUrlParse(url, &zinc_base) >= 0);
@@ -346,6 +399,8 @@ U0 ZincLoad(U8 *url)
 	{ // built-in pages: no real base URL to resolve links against
 		if (!StrICompare(url, "zinc:test"))
 			ZincSetPage(url, zinc_testpage);
+		else if (!StrICompare(url, "zinc:css"))
+			ZincSetPage(url, zinc_csspage);
 		else
 			ZincSetPage(url, zinc_welcome);
 		zinc_base_ok = FALSE;

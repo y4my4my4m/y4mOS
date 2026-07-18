@@ -118,16 +118,17 @@ U0 ZnSep(I64 nl)
 }
 
 I64 ZnEffFg(CZStyle *style)
-{ // -1 = document default
+{ // -1 = document default; styles carry RGB, DolDoc wants a palette index
 	I64 fg = style->fg;
 
+	if (fg >= 0)
+		fg = ZCssNearestVga(fg >> 16 & 0xFF, fg >> 8 & 0xFF, fg & 0xFF);
 	if (style->bold > 0)
 	{
 		if (fg < 0)
 			return RED;
 		if (fg < 8)
 			return fg + 8;
-		return fg;
 	}
 
 	return fg;
@@ -137,6 +138,9 @@ U0 ZnStyle(CZStyle *style)
 { // switch DolDoc state to match the computed style
 	I64	 fg = ZnEffFg(style), bg = style->bg;
 	Bool ul = style->underline > 0;
+
+	if (bg >= 0)
+		bg = ZCssNearestVga(bg >> 16 & 0xFF, bg >> 8 & 0xFF, bg & 0xFF);
 
 	if (fg != zn.cur_fg)
 	{
@@ -556,13 +560,14 @@ Bool ZnTagSkipped(U8 *tag)
 		   !StrCompare(tag, "canvas") || !StrCompare(tag, "object");
 }
 
+I16 zn_ua_hsize[6] = {32, 24, 18, 16, 13, 11};
+
 U0 ZnUaStyle(U8 *tag, CZStyle *out)
 { // browser default styling per tag; author CSS overrides it
 	if (tag[0] == 'h' && '1' <= tag[1] <= '6' && !tag[2])
 	{
-		out->bold = 1;
-		if (tag[1] == '1' || tag[1] == '2')
-			out->uppercase = 1;
+		out->bold  = 1;
+		out->fsize = zn_ua_hsize[tag[1] - '1'];
 	}
 	else if (!StrCompare(tag, "b") || !StrCompare(tag, "strong"))
 		out->bold = 1;
@@ -572,23 +577,25 @@ U0 ZnUaStyle(U8 *tag, CZStyle *out)
 		out->underline = 1;
 	else if (!StrCompare(tag, "code") || !StrCompare(tag, "tt") ||
 			 !StrCompare(tag, "kbd")  || !StrCompare(tag, "samp"))
-		out->fg = PURPLE;
+		out->fg = 0xAA00AA;
 	else if (!StrCompare(tag, "pre"))
 	{
-		out->fg	 = PURPLE;
+		out->fg	 = 0xAA00AA;
 		out->pre = 1;
 	}
 	else if (!StrCompare(tag, "mark"))
 	{
-		out->bg = YELLOW;
-		out->fg = BLACK;
+		out->bg = 0xFFFF55;
+		out->fg = 0x000000;
 	}
 	else if (!StrCompare(tag, "th"))
 		out->bold = 1;
+	else if (!StrCompare(tag, "center"))
+		out->align = 1;
 	else if (!StrCompare(tag, "small") || !StrCompare(tag, "del") ||
 			 !StrCompare(tag, "s") || !StrCompare(tag, "strike") ||
 			 !StrCompare(tag, "sub") || !StrCompare(tag, "sup"))
-		out->fg = DKGRAY;
+		out->fg = 0x999999;
 }
 
 U0 ZnNode(CZNode *node, CZStyle *inherited)

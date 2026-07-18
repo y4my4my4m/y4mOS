@@ -36,6 +36,7 @@
 #define GXW_AREA		6
 
 #define GXO_IMG			4
+#define GXO_BOX			5	//Block background fill and/or 1px border.
 #define GX_IMG_CACHE	48
 #define GX_IMG_MAXW		480
 #define GX_IMG_MAXH		360
@@ -72,7 +73,13 @@ class CGxGlobals
 	I64		 x, y, line_h;	//Layout cursor.
 	I64		 link_depth;	//>0: inside <a>.
 	U8		*cur_href;
-	I64		 list_depth;
+	I64		 indent;		//Left offset from lists + margins/padding (px).
+	I64		 line_start_op;	//First op on the current line (for text-align).
+	I64		 line_align;	//0 left, 1 center, 2 right for the current line.
+	I64		 page_bg, page_fg;	//body/html colors; -1 unset.
+	Bool	 page_has_bg;
+	CColorROPU32 text_pen;	//Resolved default text pen for this page.
+	I64		 list_typ[8], list_ctr[8], list_sp;	//0 = ul, 1 = ol.
 	U8		 url[256];
 	I64		 url_len;
 	Bool	 url_focus, quit, fetch, relayout;
@@ -133,17 +140,33 @@ U0 GxImgCacheFree()
 	gx.img_count = 0;
 }
 
-CColorROPU32 GxPen(I64 vga, CColorROPU32 def)
-{//VGA index -> truecolor pen. Pages assume a light background; our chrome is
-//dark, so dark palette colors get promoted to their bright variants and
-//black falls back to the theme text color.
-	if (vga < 0 || vga > 15)
+CColorROPU32 GxPen(I64 rgb, CColorROPU32 def)
+{//0xRRGGBB -> truecolor TEXT pen. If the page set no background it sits on
+//our dark theme, so near-black text gets promoted for readability. Once the
+//page brings its own background, colors are used literally.
+	I64 r, g, b;
+
+	if (rgb < 0)
 		return def;
-	if (vga == 0)
-		return de_theme.text;
-	if (vga < 7)
-		vga += 8;
-	return ColorBGR(gr_palette[vga]);
+	r = rgb >> 16 & 0xFF;
+	g = rgb >> 8 & 0xFF;
+	b = rgb & 0xFF;
+	if (!gx.page_has_bg && r + g + b < 180)
+	{
+		if (r + g + b < 40)
+			return de_theme.text;
+		r = MinI64(255, r + 110);
+		g = MinI64(255, g + 110);
+		b = MinI64(255, b + 110);
+	}
+	return ColorRGB(r, g, b);
+}
+
+CColorROPU32 GxPenBg(I64 rgb, CColorROPU32 def)
+{//0xRRGGBB -> truecolor FILL pen, always literal.
+	if (rgb < 0)
+		return def;
+	return ColorRGB(rgb >> 16 & 0xFF, rgb >> 8 & 0xFF, rgb & 0xFF);
 }
 
 U0 GxOpsReset()
@@ -178,11 +201,23 @@ CGxOp *GxOpAdd(I64 type, I64 x, I64 y, I64 w, I64 h)
 }
 
 //--- Layout ------------------------------------------------------------------
-U0 GxNewline(I64 extra)
-{
-	gx.x = GX_MARGIN + gx.list_depth * 16;
-	gx.y += gx.line_h + extra;
-	gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+U0 GxLineAlign()
+{//Close the current line: shift its ops for text-align center/right.
+	I64 i, right = 0, shift;
+
+	if (gx.line_align > 0 && gx.op_count > gx.line_start_op)
+	{
+		for (i = gx.line_start_op; i < gx.op_count; i++)
+			right = MaxI64(right, gx.ops[i].x + gx.ops[i].w);
+		shift = gx.wrap_w - right;
+		if (gx.line_align == 1)
+			shift /= 2;
+		if (shift > 0 && right)
+			for (i = gx.line_start_op; i < gx.op_count; i++)
+				gx.ops[i].x += shift;
+	}
+	gx.line_start_op = gx.op_count;
+	gx.line_align = 0;
 }
 
 U0 GxRunFlush()
@@ -198,7 +233,7 @@ U0 GxRunFlush()
 	{
 		tmp = DCNew(gx.run_len * FONT_WIDTH + 1, FONT_HEIGHT + 1);
 		DCFill(tmp);
-		tmp->color = GxPen(gx.run_style.fg, de_theme.text);
+		tmp->color = GxPen(gx.run_style.fg, gx.text_pen);
 		GrPrint(tmp, 0, 0, "%s", gx.run);
 		if (gx.run_style.bold == 1)
 			GrPrint(tmp, 1, 0, "%s", gx.run);
@@ -218,13 +253,13 @@ U0 GxRunFlush()
 		if (op)
 		{
 			op->text = StrNew(gx.run);
-			op->fg	 = GxPen(gx.run_style.fg, de_theme.text);
+			op->fg	 = GxPen(gx.run_style.fg, gx.text_pen);
 			op->bold = gx.run_style.bold == 1;
 			op->ul	 = gx.run_style.underline == 1 || gx.run_link;
 			if (gx.run_style.bg >= 0)
 			{
 				op->has_bg = TRUE;
-				op->bg = GxPen(gx.run_style.bg, de_theme.win_bg);
+				op->bg = GxPenBg(gx.run_style.bg, de_theme.win_bg);
 			}
 		}
 	}
@@ -233,22 +268,36 @@ U0 GxRunFlush()
 	gx.run_len = 0;
 }
 
+U0 GxNewline(I64 extra)
+{
+	GxRunFlush;
+	GxLineAlign;
+	gx.x = GX_MARGIN + gx.indent;
+	gx.y += gx.line_h + extra;
+	gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+}
+
 U0 GxWord(U8 *word, I64 len, CZStyle *style, I64 scale)
 {//Place one word, wrapping as needed, merging into the current run.
 	I64 cw = FONT_WIDTH * scale, need = len * cw;
 
 	if (len <= 0)
 		return;
+	//First content on a fresh line decides that line's text-align.
+	if (gx.x <= GX_MARGIN + gx.indent && style->align > 0)
+		gx.line_align = style->align;
 	//Style/link/scale change or wrap breaks the run.
 	if (gx.run_len &&
 		(scale != gx.run_scale || gx.run_link != (gx.link_depth > 0) ||
 		 MemCompare(&gx.run_style, style, sizeof(CZStyle))))
 		GxRunFlush;
 
-	if (gx.x + need > gx.wrap_w && gx.x > GX_MARGIN + gx.list_depth * 16)
+	if (gx.x + need > gx.wrap_w && gx.x > GX_MARGIN + gx.indent)
 	{
 		GxRunFlush;
 		GxNewline(0);
+		if (style->align > 0)
+			gx.line_align = style->align;
 	}
 	if (!gx.run_len)
 	{
@@ -390,20 +439,44 @@ U0 GxWidget(CZNode *node, I64 kind)
 		gx.line_h = h + GX_LINE_LEAD;
 }
 
-U0 GxNode(CZNode *node, CZStyle *inherited, I64 scale)
+I64 GxScaleOf(CZStyle *style)
+{//font-size px -> integer glyph scale.
+	if (style->fsize >= 28)
+		return 3;
+	if (style->fsize >= 19)
+		return 2;
+	return 1;
+}
+
+I64 GxDefSpace(U8 *tag)
+{//Default vertical margin for blocks with no author margins.
+	if (!StrCompare(tag, "p") || !StrCompare(tag, "blockquote") ||
+		!StrCompare(tag, "pre") || !StrCompare(tag, "table") ||
+		(tag[0] == 'h' && '1' <= tag[1] <= '6' && !tag[2]))
+		return 6;
+	if (!StrCompare(tag, "ul") || !StrCompare(tag, "ol"))
+		return 3;
+	return 0;
+}
+
+I64 gx_font_sizes[7] = {10, 13, 16, 19, 24, 32, 40}; //<font size=1..7>
+
+U0 GxNode(CZNode *node, CZStyle *inherited)
 {
-	CZStyle	 style, author;
+	CZStyle	 style, author, kid;
 	CZNode	*child;
 	CGxOp	*op;
 	U8		*attr, *type;
-	I64		 kid_scale;
+	U8		 mark[8];
+	I64		 i, box_op, mt_eff, mb_eff, pt_eff, pb_eff, ml_eff, pl_eff;
+	Bool	 is_block, is_body, boxed, is_list;
 
 	if (!node || gx.op_count >= GX_OPS_MAX - 8)
 		return;
 
 	if (node->type == ZH_TEXT)
 	{
-		GxText(node->text, inherited, scale, inherited->pre == 1);
+		GxText(node->text, inherited, GxScaleOf(inherited), inherited->pre == 1);
 		return;
 	}
 	if (ZnTagSkipped(node->tag))
@@ -416,6 +489,35 @@ U0 GxNode(CZNode *node, CZStyle *inherited, I64 scale)
 		return;
 	ZStyleMerge(&style, &author);
 	style.display = -1;
+
+	//Legacy presentational attributes.
+	attr = ZNodeAttr(node, "align");
+	if (attr)
+	{
+		if (!StrNICompare(attr, "center", 6))
+			style.align = 1;
+		else if (!StrNICompare(attr, "right", 5))
+			style.align = 2;
+		else if (!StrNICompare(attr, "left", 4))
+			style.align = 0;
+	}
+	if (!StrCompare(node->tag, "font"))
+	{
+		attr = ZNodeAttr(node, "color");
+		if (attr)
+		{
+			i = ZCssColor(attr);
+			if (i >= 0)
+				style.fg = i;
+		}
+		attr = ZNodeAttr(node, "size");
+		if (attr)
+		{
+			i = Str2I64(attr);
+			if (1 <= i <= 7)
+				style.fsize = gx_font_sizes[i - 1];
+		}
+	}
 
 	if (!StrCompare(node->tag, "br"))
 	{
@@ -440,6 +542,8 @@ U0 GxNode(CZNode *node, CZStyle *inherited, I64 scale)
 		I64		 iw, ih;
 
 		GxRunFlush;
+		if (gx.x <= GX_MARGIN + gx.indent && style.align > 0)
+			gx.line_align = style.align;
 		if (src && *src)
 		{
 			abs = ZincResolveLink(src); //MAlloc'ed absolute URL.
@@ -527,29 +631,20 @@ U0 GxNode(CZNode *node, CZStyle *inherited, I64 scale)
 		return;
 	}
 
-	kid_scale = scale;
-	if (!StrCompare(node->tag, "h1"))
-		kid_scale = 3;
-	else if (!StrCompare(node->tag, "h2"))
-		kid_scale = 2;
-	else if (!StrCompare(node->tag, "h3"))
-	{
-		kid_scale = 1;
-		style.bold = 1;
-	}
-
 	if (!StrCompare(node->tag, "a"))
 	{
 		attr = ZNodeAttr(node, "href");
 		if (attr && *attr)
 		{
+			if (style.fg < 0)
+				style.fg = 0x4EA3FF; //UA default link color.
 			GxRunFlush;
 			gx.link_depth++;
 			gx.cur_href = attr;
 			child = node->first_child;
 			while (child)
 			{
-				GxNode(child, &style, kid_scale);
+				GxNode(child, &style);
 				child = child->next;
 			}
 			GxRunFlush;
@@ -558,45 +653,211 @@ U0 GxNode(CZNode *node, CZStyle *inherited, I64 scale)
 		}
 	}
 
-	if (ZHtmlTagBlock(node->tag) || !StrCompare(node->tag, "td") ||
-		!StrCompare(node->tag, "th") || author.display == ZCSS_DISP_BLOCK)
+	is_body = !StrCompare(node->tag, "body") || !StrCompare(node->tag, "html") ||
+			  !StrCompare(node->tag, "#root");
+	is_list = !StrCompare(node->tag, "ul") || !StrCompare(node->tag, "ol");
+	is_block = ZHtmlTagBlock(node->tag) || !StrCompare(node->tag, "td") ||
+			   !StrCompare(node->tag, "th") || !StrCompare(node->tag, "center") ||
+			   !StrCompare(node->tag, "main") || !StrCompare(node->tag, "aside") ||
+			   !StrCompare(node->tag, "figure") || is_body;
+	if (author.display == ZCSS_DISP_BLOCK)
+		is_block = TRUE;
+	else if (author.display == ZCSS_DISP_INLINE)
+		is_block = FALSE;
+
+	box_op = -1;
+	mt_eff = 0;	mb_eff = 0;
+	pt_eff = 0;	pb_eff = 0;
+	ml_eff = 0;	pl_eff = 0;
+	boxed = is_block && !is_body && (author.bg >= 0 || author.border >= 0);
+
+	if (is_block)
 	{
 		GxRunFlush;
-		if (gx.x > GX_MARGIN + gx.list_depth * 16)
+		if (gx.x > GX_MARGIN + gx.indent)
 			GxNewline(0);
-		if (!StrCompare(node->tag, "p") || !StrCompare(node->tag, "h1") ||
-			!StrCompare(node->tag, "h2") || !StrCompare(node->tag, "h3") ||
-			!StrCompare(node->tag, "blockquote"))
-			gx.y += 5;
+		mt_eff = author.mt;
+		mb_eff = author.mb;
+		if (mt_eff < 0)
+			mt_eff = GxDefSpace(node->tag);
+		if (mb_eff < 0)
+			mb_eff = GxDefSpace(node->tag);
+		ml_eff = MaxI64(0, style.ml);
+		pl_eff = MaxI64(0, style.pl);
+		if (!StrCompare(node->tag, "blockquote") && style.ml < 0)
+			ml_eff = 24;
+		pt_eff = author.pt;
+		pb_eff = author.pb;
+		if (pt_eff < 0)
+		{
+			if (boxed)
+				pt_eff = 4;
+			else
+				pt_eff = 0;
+		}
+		if (pb_eff < 0)
+		{
+			if (boxed)
+				pb_eff = 4;
+			else
+				pb_eff = 0;
+		}
+		gx.y += mt_eff;
+		gx.indent += ml_eff;
+		if (boxed)
+		{
+			op = GxOpAdd(GXO_BOX, GX_MARGIN + gx.indent - 3, gx.y - 2,
+						 gx.wrap_w - (GX_MARGIN + gx.indent - 3), 8);
+			if (op)
+			{
+				box_op = gx.op_count - 1;
+				op->has_bg = author.bg >= 0;
+				op->fg = GxPenBg(author.bg, de_theme.win_bg);
+				op->ul = author.border >= 0;
+				op->bg = GxPenBg(author.border, de_theme.panel_edge);
+			}
+			gx.line_start_op = gx.op_count; //The box never shifts with its line.
+		}
+		gx.indent += pl_eff;
+		gx.y += pt_eff;
+		gx.x = GX_MARGIN + gx.indent;
 	}
-	if (!StrCompare(node->tag, "ul") || !StrCompare(node->tag, "ol"))
-		gx.list_depth++;
-	if (!StrCompare(node->tag, "li"))
+
+	if (is_list)
 	{
-		GxRunFlush;
-		GxNewline(0);
-		GxText("-", &style, 1, FALSE);
+		if (gx.list_sp < 8)
+		{
+			gx.list_typ[gx.list_sp] = !StrCompare(node->tag, "ol");
+			gx.list_ctr[gx.list_sp] = 0;
+			gx.list_sp++;
+		}
+		gx.indent += 18;
+		gx.x = GX_MARGIN + gx.indent;
 	}
+	if (!StrCompare(node->tag, "li") && style.list_none != 1)
+	{
+		if (gx.list_sp > 0 && gx.list_typ[gx.list_sp - 1])
+		{
+			gx.list_ctr[gx.list_sp - 1]++;
+			StrPrint(mark, "%d.", gx.list_ctr[gx.list_sp - 1] % 1000);
+		}
+		else
+		{
+			mark[0] = '*';
+			mark[1] = 0;
+		}
+		GxText(mark, &style, 1, FALSE);
+	}
+
+	//Children inherit text properties, never box properties.
+	MemCopy(&kid, &style, sizeof(CZStyle));
+	ZStyleStripBox(&kid);
+	if ((is_block && author.bg >= 0) || is_body)
+		kid.bg = -1; //The box (or the page fill) already painted it.
 
 	child = node->first_child;
 	while (child)
 	{
-		GxNode(child, &style, kid_scale);
+		GxNode(child, &kid);
 		child = child->next;
 	}
 
-	if (!StrCompare(node->tag, "ul") || !StrCompare(node->tag, "ol"))
+	if (is_list)
 	{
-		gx.list_depth--;
-		GxRunFlush;
-		GxNewline(0);
+		gx.indent -= 18;
+		if (gx.list_sp > 0)
+			gx.list_sp--;
 	}
-	if (ZHtmlTagBlock(node->tag) || author.display == ZCSS_DISP_BLOCK)
+	if (is_block)
 	{
 		GxRunFlush;
-		if (gx.x > GX_MARGIN + gx.list_depth * 16)
+		if (gx.x > GX_MARGIN + gx.indent)
 			GxNewline(0);
+		gx.y += pb_eff;
+		if (box_op >= 0)
+		{
+			gx.ops[box_op].h = MaxI64(8, gx.y + 2 - gx.ops[box_op].y);
+			gx.line_start_op = gx.op_count;
+		}
+		gx.y += mb_eff;
+		gx.indent -= ml_eff + pl_eff;
+		gx.x = GX_MARGIN + gx.indent;
 	}
+}
+
+CZNode *GxFindTag(CZNode *node, U8 *tag)
+{
+	CZNode *child, *hit;
+
+	if (!node)
+		return NULL;
+	if (node->type == ZH_ELEM && !StrCompare(node->tag, tag))
+		return node;
+	child = node->first_child;
+	while (child)
+	{
+		hit = GxFindTag(child, tag);
+		if (hit)
+			return hit;
+		child = child->next;
+	}
+
+	return NULL;
+}
+
+U0 GxPageStyle()
+{//Resolve the page background/text color from html+body CSS and legacy attrs.
+	CZNode	*el;
+	CZStyle	 a;
+	U8		*attr;
+	I64		 c;
+
+	gx.page_bg = -1;
+	gx.page_fg = -1;
+	el = GxFindTag(zinc_dom, "html");
+	if (el)
+	{
+		ZCssApply(el, &a);
+		if (a.bg >= 0)
+			gx.page_bg = a.bg;
+		if (a.fg >= 0)
+			gx.page_fg = a.fg;
+	}
+	el = GxFindTag(zinc_dom, "body");
+	if (el)
+	{
+		ZCssApply(el, &a);
+		if (a.bg >= 0)
+			gx.page_bg = a.bg;
+		if (a.fg >= 0)
+			gx.page_fg = a.fg;
+		attr = ZNodeAttr(el, "bgcolor");
+		if (attr && gx.page_bg < 0)
+		{
+			c = ZCssColor(attr);
+			if (c >= 0)
+				gx.page_bg = c;
+		}
+		attr = ZNodeAttr(el, "text");
+		if (attr && gx.page_fg < 0)
+		{
+			c = ZCssColor(attr);
+			if (c >= 0)
+				gx.page_fg = c;
+		}
+	}
+	gx.page_has_bg = gx.page_bg >= 0;
+	if (gx.page_has_bg)
+	{
+		if (gx.page_fg >= 0)
+			gx.text_pen = GxPenBg(gx.page_fg, de_theme.text);
+		else
+			gx.text_pen = ColorRGB(0, 0, 0); //CSS default: black text.
+	}
+	else if (gx.page_fg >= 0)
+		gx.text_pen = GxPen(gx.page_fg, de_theme.text);
+	else
+		gx.text_pen = de_theme.text;
 }
 
 U0 GxLayout()
@@ -605,19 +866,25 @@ U0 GxLayout()
 
 	gx.busy = TRUE;
 	GxOpsReset;
+	GxPageStyle;
 	gx.wrap_w = Fs->pix_width - GX_SBAR_W - GX_MARGIN;
 	gx.last_w = Fs->pix_width;
 	gx.x = GX_MARGIN;
 	gx.y = 8;
 	gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
 	gx.link_depth = 0;
-	gx.list_depth = 0;
+	gx.indent = 0;
+	gx.list_sp = 0;
 	gx.run_len = 0;
+	gx.line_start_op = 0;
+	gx.line_align = 0;
 	ZStyleReset(&root);
-	root.fg = 15; //Default: white-ish; page styles override.
+	root.fg = gx.page_fg; //-1: theme text over the theme background.
+	root.fsize = 16;
 	if (zinc_dom)
-		GxNode(zinc_dom, &root, 1);
+		GxNode(zinc_dom, &root);
 	GxRunFlush;
+	GxLineAlign;
 	gx.doc_h = gx.y + gx.line_h + 16;
 	if (gx.scroll > gx.doc_h)
 		gx.scroll = 0;
@@ -687,7 +954,10 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 	mx = mouse.pos.x - task->pix_left - task->scroll_x;
 	my = mouse.pos.y - task->pix_top - task->scroll_y;
 
-	dc->color = de_theme.win_bg;
+	if (gx.page_has_bg && !gx.busy)
+		dc->color = GxPenBg(gx.page_bg, de_theme.win_bg);
+	else
+		dc->color = de_theme.win_bg;
 	GrRect(dc, 0, 0, task->pix_width, task->pix_height);
 
 	if (gx.busy)
@@ -707,6 +977,21 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 			case GXO_RECT:
 				dc->color = op->fg;
 				GrRect(dc, op->x, oy, op->w, op->h);
+				break;
+			case GXO_BOX:
+				if (op->has_bg)
+				{
+					dc->color = op->fg;
+					GrRect(dc, op->x, oy, op->w, op->h);
+				}
+				if (op->ul)
+				{
+					dc->color = op->bg;
+					GrRect(dc, op->x, oy, op->w, 1);
+					GrRect(dc, op->x, oy + op->h - 1, op->w, 1);
+					GrRect(dc, op->x, oy, 1, op->h);
+					GrRect(dc, op->x + op->w - 1, oy, 1, op->h);
+				}
 				break;
 			case GXO_TEXT:
 				if (op->has_bg)
@@ -1058,6 +1343,8 @@ public U0 ZincGX(U8 *start_url=NULL)
 			{//Built-in page: parse directly in THIS (main) task's heap.
 				if (!StrICompare(current, "zinc:test"))
 					ZincSetPage(current, zinc_testpage);
+				else if (!StrICompare(current, "zinc:css"))
+					ZincSetPage(current, zinc_csspage);
 				else
 					ZincSetPage(current, zinc_welcome);
 				zinc_base_ok = FALSE;
