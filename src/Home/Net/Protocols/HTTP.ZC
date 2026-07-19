@@ -315,6 +315,52 @@ public U0 HttpCookiesShow()
 			http_cookies[i].name, http_cookies[i].value;
 }
 
+/* ---- chunked transfer-encoding (RFC 7230 4.1) ---- */
+
+I64 HttpDechunk(U8 *body, I64 len)
+{ // Decode "chunked" in place: <hex-size>[;ext]\r\n<data>\r\n ... 0\r\n\r\n.
+  // Returns the decoded length. Most HTTP/1.1 servers (nginx, ...) use this.
+	U8	*src = body, *dst = body, *end = body + len;
+	I64	 chunk;
+	U8	 c;
+
+	while (src < end)
+	{
+		chunk = 0;
+		while (src < end) // hex chunk size
+		{
+			c = *src;
+			if ('0' <= c <= '9')
+				chunk = chunk * 16 + (c - '0');
+			else if ('a' <= c <= 'f')
+				chunk = chunk * 16 + (c - 'a' + 10);
+			else if ('A' <= c <= 'F')
+				chunk = chunk * 16 + (c - 'A' + 10);
+			else
+				break;
+			src++;
+		}
+		while (src < end && *src != '\n') // skip to end of the size line (past any ;ext)
+			src++;
+		if (src < end)
+			src++; // past '\n'
+		if (chunk <= 0)
+			break; // last chunk (0) or malformed
+		if (src + chunk > end)
+			chunk = end - src; // truncated response
+		MemCopy(dst, src, chunk);
+		dst += chunk;
+		src += chunk;
+		if (src < end && *src == '\r') // CRLF after the chunk data
+			src++;
+		if (src < end && *src == '\n')
+			src++;
+	}
+	*dst = 0;
+
+	return dst - body;
+}
+
 /* ---- gzip (RFC 1952) ---- */
 
 U8 *HttpGunzip(U8 *src, I64 src_len, I64 *_out_len)
@@ -442,10 +488,18 @@ CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 	U8			  *request, *buf, *new_buf, *header_end, *status_ptr;
 	U8			  *cookie_hdr, *encoding, *unzipped;
 	I64			   buf_size, buf_used, received, header_block_len, unzipped_len;
-	I64			   deadline;
+	I64			   deadline, tries;
 	Bool		   aborted;
 
+	//The PCNet path can drop the very first connection after boot (a transient
+	//"APAD XMT TRUNCATE"), which used to leave the first page blank. Retry the
+	//connect a couple of times before giving up.
 	sock = TCPConnectionCreate(url->host, url->port);
+	for (tries = 0; sock <= 0 && tries < 3 && !net_abort; tries++)
+	{
+		Sleep(400);
+		sock = TCPConnectionCreate(url->host, url->port);
+	}
 	if (sock <= 0)
 	{
 		NetErr("HTTP %s: Connection to %s:%d failed.", method, url->host, url->port);
@@ -611,6 +665,16 @@ CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 	Free(buf);
 
 	HttpCookiesAccept(url, response->headers);
+
+	// De-chunk before anything else - chunked framing wraps the (maybe gzipped)
+	// payload, so it must be stripped first.
+	encoding = HttpHeaderGet(response->headers, "Transfer-Encoding");
+	if (encoding)
+	{
+		if (StrIMatch("chunked", encoding))
+			response->body_length = HttpDechunk(response->body, response->body_length);
+		Free(encoding);
+	}
 
 	encoding = HttpHeaderGet(response->headers, "Content-Encoding");
 	if (encoding)

@@ -1,7 +1,16 @@
-//YDE boot splash - truecolor gradient sky, pixel-upscaled logotype, random
-//motto. Any key (or a 12s timeout) closes it.
-//Invoked from StartOS.ZC in a PopUp task right after the WinMgr spawns, so
-//only System-level symbols may be used here (no DE toolkit yet).
+//YDE boot splash.
+//
+//A full-screen image composited on TOP of every finished frame by the Window
+//Manager, via the gr.fp_final_screen_update hook (the same hook FileMgr uses
+//to paint over everything). Because it is drawn last, nothing underneath -
+//the two terminals, AutoComplete, the wallpaper, or boot/compile output - can
+//overtake it. Boot proceeds completely normally underneath; there is no
+//waiting, no window z-order fighting, and no hiding of other windows.
+//
+//A background task clears the overlay on the first key/click or after a
+//timeout, restoring whatever final-screen hook was there before.
+//
+//Invoked from StartOS.ZC right after the WinMgr task spawns.
 
 DefineListLoad("YDE_MOTTOS",
 	"Charter? What charter.\0"
@@ -12,95 +21,124 @@ DefineListLoad("YDE_MOTTOS",
 	"Ring-0 all the way down.\0"
 	"Compiles itself at breakfast.\0");
 
-U8	*yde_splash_motto;
-CDC *yde_splash_logo;
+CDC	 *yde_splash_dc		= NULL;		//Pre-rendered full-screen splash image.
+Bool  yde_splash_up		= FALSE;
+U0	(*yde_splash_old_hook)(CDC *dc) = NULL;
 
-U0 YDESplashLogoMake()
-{//Render the name in the system font, then pixel-upscale 8x for the big
-//chunky logotype. Shadow pass first, color pass on top. Self-contained
-//nearest-neighbor scale: the DE toolkit is not compiled yet.
-	I64	 sc = 8, x, y;
-	CDC *tmp = DCNew(3 * FONT_WIDTH + 1, FONT_HEIGHT + 1);
+U0 YDESplashLogo(CDC *dc, I64 lx, I64 ly, I64 sc, U32 col)
+{//Pixel-upscale "YDE" in the system font, top-left at (lx, ly), scale sc.
+	U8	*name = "YDE";
+	I64	 i, px, py;
+	U64	 bits;
 
-	DCFill(tmp);
-	tmp->color = ColorRGB(0x22, 0x10, 0x3A);
-	GrPrint(tmp, 1, 1, "YDE");
-	tmp->color = ColorRGB(0xC8, 0x8F, 0xFF);
-	GrPrint(tmp, 0, 0, "YDE");
-
-	yde_splash_logo = DCNew(tmp->width * sc, tmp->height * sc);
-	for (y = 0; y < yde_splash_logo->height; y++)
-		for (x = 0; x < yde_splash_logo->width; x++)
-			yde_splash_logo->body[y * yde_splash_logo->width_internal + x] =
-				tmp->body[y / sc * tmp->width_internal + x / sc];
-	yde_splash_logo->flags &= ~DCF_NO_TRANSPARENTS; //Keep see-through gaps.
-	DCDel(tmp);
-}
-
-U0 YDESplashDraw(CTask *task, CDC *dc)
-{
-	I64 w = task->pix_width, h = task->pix_height, y, r, g, b, ly;
-
-	for (y = 0; y < h; y++)
-	{//Vertical gradient, navy -> violet.
-		r = 14 + 40 * y / h;
-		g = 10 + 12 * y / h;
-		b = 40 + 90 * y / h;
-		dc->color = ColorRGB(r, g, b);
-		GrRect(dc, 0, y, w, 1);
-	}
-
-	ly = (h - yde_splash_logo->height) / 2 - 24;
-	GrBlot(dc, (w - yde_splash_logo->width) / 2, ly, yde_splash_logo);
-
-	dc->color = ColorRGB(0xE8, 0xEC, 0xF4);
-	GrPrint(dc, (w - StrLen(sys_os_version_str) * FONT_WIDTH) / 2,
-			ly + yde_splash_logo->height + 20, "%s", sys_os_version_str);
-	dc->color = ColorRGB(0x8A, 0x94, 0xA8);
-	GrPrint(dc, (w - StrLen(yde_splash_motto) * FONT_WIDTH) / 2,
-			ly + yde_splash_logo->height + 36, "%s", yde_splash_motto);
-	dc->color = ColorRGB(0x60, 0x68, 0x7C);
-	GrPrint(dc, (w - 21 * FONT_WIDTH) / 2, h - 24, "Any key skips the wait");
-}
-
-extern Bool yde_splash_active; //Defined in StartOS.ZC; gates StartUpTasks.
-
-U0 YDESplash()
-{
-	I64	 msg, a1, a2;
-	F64	 t0 = tS;
-	Bool done = FALSE;
-
-	yde_splash_active = TRUE;
-	yde_splash_motto = MStrPrint("%Z", RandU8 % DefineCount("YDE_MOTTOS"), "YDE_MOTTOS");
-	YDESplashLogoMake;
-	if (!Fs->put_doc)
-		DocTermNew; //Pre-Home PopUp tasks come up bare.
-	LBts(&Fs->display_flags, DISPLAYf_SHOW);
-	WinBorder(OFF);
-	WinMax;
-	DocCursor(OFF);
-	DocClear;
-	Fs->draw_it = &YDESplashDraw;
-
-	WinToTop;
-	WinZBufUpdate;
-	while (!done && tS - t0 < 7.0)
+	dc->color = col;
+	for (i = 0; name[i]; i++)
 	{
-		while (msg = MessageScan(&a1, &a2))
-			if (msg == MESSAGE_KEY_DOWN)
-				done = TRUE;
-		WinMax;   //Stay big and on top; nothing else should be spawning yet
-		WinToTop; //because StartUpTasks waits on yde_splash_active.
-		Sleep(30);
+		bits = text.font[name[i]];
+		for (py = 0; py < FONT_HEIGHT; py++)
+			for (px = 0; px < FONT_WIDTH; px++)
+				if (bits >> (py * 8 + px) & 1)
+					GrRect(dc, lx + (i * FONT_WIDTH + px) * sc, ly + py * sc, sc, sc);
 	}
-
-	//Release the boot: StartUpTasks may now spawn the terminals + AutoComplete.
-	yde_splash_active = FALSE;
-
-	Fs->draw_it = NULL;
-	DCDel(yde_splash_logo);
-	Free(yde_splash_motto);
 }
 
-YDESplash;
+U0 YDESplashRender()
+{//Draw the gradient sky, logotype and text into a full-screen DC, once.
+	I64	 y, r, g, b, sc = 10, lw, lx, ly;
+	U8	*motto = MStrPrint("%Z", RandU8 % DefineCount("YDE_MOTTOS"), "YDE_MOTTOS");
+
+	yde_splash_dc = DCNew(GR_WIDTH, GR_HEIGHT, sys_task);
+	for (y = 0; y < GR_HEIGHT; y++)
+	{//Vertical gradient, navy -> violet.
+		r = 14 + 40 * y / GR_HEIGHT;
+		g = 10 + 12 * y / GR_HEIGHT;
+		b = 40 + 90 * y / GR_HEIGHT;
+		yde_splash_dc->color = ColorRGB(r, g, b);
+		GrRect(yde_splash_dc, 0, y, GR_WIDTH, 1);
+	}
+	yde_splash_dc->flags |= DCF_NO_TRANSPARENTS;
+
+	lw = 3 * FONT_WIDTH * sc;
+	lx = (GR_WIDTH - lw) / 2;
+	ly = (GR_HEIGHT - FONT_HEIGHT * sc) / 2 - 24;
+	YDESplashLogo(yde_splash_dc, lx + 2, ly + 2, sc, ColorRGB(0x22, 0x10, 0x3A)); //shadow
+	YDESplashLogo(yde_splash_dc, lx, ly, sc, ColorRGB(0xC8, 0x8F, 0xFF));         //logo
+
+	yde_splash_dc->color = ColorRGB(0xE8, 0xEC, 0xF4);
+	GrPrint(yde_splash_dc, (GR_WIDTH - StrLen(sys_os_version_str) * FONT_WIDTH) / 2,
+			ly + FONT_HEIGHT * sc + 20, "%s", sys_os_version_str);
+	yde_splash_dc->color = ColorRGB(0x8A, 0x94, 0xA8);
+	GrPrint(yde_splash_dc, (GR_WIDTH - StrLen(motto) * FONT_WIDTH) / 2,
+			ly + FONT_HEIGHT * sc + 36, "%s", motto);
+	yde_splash_dc->color = ColorRGB(0x60, 0x68, 0x7C);
+	GrPrint(yde_splash_dc, (GR_WIDTH - 21 * FONT_WIDTH) / 2, GR_HEIGHT - 40,
+			"Any key skips the wait");
+
+	Free(motto);
+}
+
+U0 YDESplashOverlay(CDC *dc)
+{//gr.fp_final_screen_update: blit the splash over the finished frame with a
+//raw row copy (no z-buffer clipping, so it covers literally everything), then
+//chain to whatever hook we replaced.
+	I64 y, w = GR_WIDTH;
+
+	if (yde_splash_up && yde_splash_dc)
+	{
+		if (w > dc->width)
+			w = dc->width;
+		for (y = 0; y < GR_HEIGHT && y < dc->height; y++)
+			MemCopy(dc->body + y * dc->width_internal,
+					yde_splash_dc->body + y * yde_splash_dc->width_internal,
+					w * sizeof(U32));
+	}
+	if (yde_splash_old_hook)
+		(*yde_splash_old_hook)(dc);
+}
+
+extern Bool yde_boot_done; //StartOS.ZC sets this once boot has finished.
+
+U0 YDESplashDismissTask()
+{//Keep the overlay up until boot has actually finished (yde_boot_done) so no
+//tail-end compile output leaks past it - or until the user hits a key/click,
+//with a hard safety cap. Then remove the overlay and restore the old hook.
+	F64	t0	 = tS;
+	I64	snap = kbd.last_down_scan_code;
+
+	while (yde_splash_up && tS - t0 < 30.0)
+	{
+		if (tS - t0 >= 2.5 && yde_boot_done)
+		{//Shown at least briefly AND boot finished: let the freshly-spawned
+		//terminals paint a frame, then clear.
+			Sleep(600);
+			break;
+		}
+		if (tS - t0 >= 1.0 && (kbd.last_down_scan_code != snap || mouse.lb || mouse.rb))
+			break; //user skip, after a moment so a boot keypress does not count
+		Sleep(40);
+	}
+
+	yde_splash_up = FALSE;
+	gr.fp_final_screen_update = yde_splash_old_hook;
+	yde_splash_old_hook = NULL;
+	Sleep(80); //let the in-flight frame finish reading the DC
+	if (yde_splash_dc)
+	{
+		DCDel(yde_splash_dc);
+		yde_splash_dc = NULL;
+	}
+}
+
+U0 YDESplashStart()
+{//Render once, install the overlay hook, spawn the dismisser, and return so
+//boot carries on underneath.
+	if (yde_splash_up)
+		return;
+	YDESplashRender;
+	yde_splash_old_hook		 = gr.fp_final_screen_update;
+	yde_splash_up			 = TRUE;
+	gr.fp_final_screen_update = &YDESplashOverlay;
+	Spawn(&YDESplashDismissTask, NULL, "YDE Splash");
+}
+
+YDESplashStart;

@@ -72,21 +72,19 @@ Fs->win_inhibit = WIG_TASK_DEFAULT - WIF_SELF_BORDER - WIF_SELF_GRAB_SCROLL - WI
 LBts(&Fs->display_flags, DISPLAYf_CHILDREN_NOT_ON_TOP);
 LBts(&Fs->display_flags, DISPLAYf_SHOW);
 
-//YDE splash as soon as the compositor exists: covers Registry, wallpaper,
-//DE and Home compile time. Any key (or a timeout) dismisses it.
-//yde_splash_active gates StartUpTasks (HomeSys) so the two default terminals
-//and AutoComplete are not spawned - and do not flicker - until it is gone.
-public Bool yde_splash_active = FALSE;
+//YDE splash: installed as a full-screen overlay (gr.fp_final_screen_update)
+//that the WinMgr draws on top of every frame, so Registry/wallpaper/DE/Home
+//compile time and the spawning terminals all run underneath, invisible. The
+//splash's dismiss task watches yde_boot_done (set at the very end of this
+//file), so it stays up until boot has actually finished - no fixed wait, no
+//window fighting - then clears to a ready desktop (or on a key/click).
+public Bool yde_boot_done = FALSE;
 if (sys_boot_src.u16[0] != BOOT_SRC_RAM)
 {
-	yde_splash_active = TRUE;
 	if (FileFind("::/DE/Splash.ZC"))
-		PopUp("ExeFile(\"::/DE/Splash\");");
+		ExeFile("::/DE/Splash"); //defines + runs YDESplashStart, then returns
 	else
-	{
-		yde_splash_active = FALSE;
 		PopUp("ExeFile2(\"::/System/ZSplash.ZC\");");
-	}
 }
 
 RegInit;
@@ -107,5 +105,7 @@ if (FileFind("::/DE/MakeDE.ZC"))
 
 #help_index ""
 #include "~/MakeHome"
+
+yde_boot_done = TRUE; //Desktop + terminals are up: the splash may now clear.
 
 //After this file, the System task enters $LK,"server mode",A="HI:Job"$.

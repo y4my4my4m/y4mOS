@@ -1761,10 +1761,13 @@ public U0 ZincGX(U8 *start_url=NULL)
 	zinc_back_count = 0;
 	zinc_fwd_count	= 0;
 
+	//Always render the built-in welcome page first (no network), then, if a
+	//start URL was given, navigate to it exactly like a user typing in the
+	//address bar (via pending_nav). Fetching a network URL on the very first
+	//frame, before the window has settled, would leave the page blank.
+	current = StrNew("zinc:welcome");
 	if (start_url)
-		current = StrNew(start_url);
-	else
-		current = StrNew("zinc:welcome");
+		gx.pending_nav = StrNew(start_url);
 
 	Fs->draw_it = &GxDrawIt;
 	gx.img_task = Spawn(&GxImgTask, NULL, "ZincGX Images", 3);

@@ -398,8 +398,8 @@ U0 DEVolMuteToggle()
 }
 
 I64 DEVolWidgetDraw(CDC *dc, I64 x, I64 y0)
-{//Compact speaker + level bar at the bottom-left of the bar. Returns the
-//width consumed. Records hit zones for DEBarClick.
+{//Compact speaker + level bar in the right tray, left of the clock. Returns
+//the width consumed. Records hit zones for DEBarClick.
 	I64  cy = y0 + DE_BAR_HEIGHT / 2, ix = x, dx, h, level, bx, fill;
 	Bool audible = !de.muted && ac97.volume > 0;
 
@@ -457,8 +457,9 @@ U0 DEBarDraw(CDC *dc, CCtrl *c)
 	CTask		*t;
 	CDateStruct	 ds;
 	I64			 i, y0 = GR_HEIGHT - DE_BAR_HEIGHT, x = 4, n = 0,
-				 ty = y0 + (DE_BAR_HEIGHT - FONT_HEIGHT) / 2;
-	U8			 buf[STR_LEN];
+				 ty = y0 + (DE_BAR_HEIGHT - FONT_HEIGHT) / 2,
+				 clock_x, vol_x, right_limit;
+	U8			 buf[STR_LEN], clk[16];
 
 	dc->color = de_theme.bar_bg;
 	GrRect(dc, 0, y0, GR_WIDTH, DE_BAR_HEIGHT);
@@ -477,15 +478,21 @@ U0 DEBarDraw(CDC *dc, CCtrl *c)
 	de.chip_x1 = x + DE_CHIP_WIDTH - 1;
 	x += DE_CHIP_WIDTH + 10;
 
-	//Volume widget, bottom-left just past the launcher chip.
-	x += DEVolWidgetDraw(dc, x, y0) + 12;
+	//Right-side tray: clock at the far right, volume widget to its left.
+	//Compute these first so the task buttons know where to stop. The clock
+	//string lives in its own buffer - the button loop reuses buf.
+	Date2Struct(&ds, Now);
+	StrPrint(clk, "%02d:%02d:%02d", ds.hour, ds.min, ds.sec);
+	clock_x		= GR_WIDTH - FONT_WIDTH * StrLen(clk) - 8;
+	vol_x		= clock_x - (DE_VOL_ICON_W + DE_VOL_BAR_W) - 16;
+	right_limit	= vol_x - 8;
 
 	//One button per visible window task, in stable arrival order.
 	DEBarTasksUpdate;
 	for (i = 0; i < de.bar_count; i++)
 	{
 		t = de.bar_tasks[i];
-		if (x + DE_BTTN_WIDTH >= GR_WIDTH - 80)
+		if (x + DE_BTTN_WIDTH >= right_limit)
 		{//Off-bar: unclickable. (No 'continue' in HolyC.)
 			de.bar_x0[i] = -1;
 			de.bar_x1[i] = -1;
@@ -508,10 +515,10 @@ U0 DEBarDraw(CDC *dc, CCtrl *c)
 		}
 	}
 
-	Date2Struct(&ds, Now);
-	StrPrint(buf, "%02d:%02d:%02d", ds.hour, ds.min, ds.sec);
+	//Volume widget (right tray), then the clock.
+	DEVolWidgetDraw(dc, vol_x, y0);
 	dc->color = de_theme.text;
-	GrPrint(dc, GR_WIDTH - FONT_WIDTH * StrLen(buf) - 8, ty, "%s", buf);
+	GrPrint(dc, clock_x, ty, "%s", clk);
 }
 
 U0 DEBarClick(CCtrl *c, I64 x, I64 y, Bool down)
