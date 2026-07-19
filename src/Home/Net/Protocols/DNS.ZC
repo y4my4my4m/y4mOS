@@ -70,17 +70,42 @@ class CDNSGlobals
 
 CHashTable *dns_cache = NULL;
 
+// The browser resolves several hosts at once: ZincGX runs the page, image and
+// script fetches as separate tasks (see ZincGX "Fetch"/"Images"/"JS"), and they
+// all reach DNSAddressInfoGet -> this shared cache. HashAdd/HashFind are not
+// re-entrant, so a task walking the bucket chain while another relinks it tears
+// the chain and faults in SYS_HASH_SINGLE_TABLE_FIND. Serialize every
+// structural touch of dns_cache with this spinlock (JIT does not zero globals,
+// so it is initialized explicitly).
+I64 dns_cache_lock = 0;
+
+U0 DNSCacheLock()
+{
+	while (LBts(&dns_cache_lock, 0))
+		Yield;
+}
+
+U0 DNSCacheUnlock()
+{
+	LBtr(&dns_cache_lock, 0);
+}
+
 U0 DNSCacheInit()
 {
 	dns_cache = HashTableNew(DNS_HASHTABLE_SIZE);
+	dns_cache_lock = 0;
 
 	MemSet(&dns_globals.dns_ip, 0, sizeof(CIPAddressStorage));
 	dns_globals.addr_family = 0;
 }
 
 CDNSHash *DNSCacheFind(U8 *hostname)
-{
-	CDNSHash *entry = HashFind(hostname, dns_cache, HTT_DNS);
+{ // caller must NOT already hold dns_cache_lock (the lock is not re-entrant)
+	CDNSHash *entry;
+
+	DNSCacheLock;
+	entry = HashFind(hostname, dns_cache, HTT_DNS);
+	DNSCacheUnlock;
 
 	if (entry == NULL)
 		NetWarn("DNS CACHE FIND: Could not find a hostname in the DNS Cache.");
@@ -90,9 +115,15 @@ CDNSHash *DNSCacheFind(U8 *hostname)
 
 CDNSHash *DNSCachePut(U8 *hostname, CAddressInfo *info)
 {
-	NetLog("DNS CACHE PUT: Attempting Find DNS Entry in Cache: hostname: %s", hostname);
-	CDNSHash *entry = DNSCacheFind(hostname);
+	CDNSHash *entry;
 
+	NetLog("DNS CACHE PUT: Attempting Find DNS Entry in Cache: hostname: %s", hostname);
+
+	// Find-or-insert must be one critical section: two tasks resolving the same
+	// host at once would otherwise both miss the find and both HashAdd, or one
+	// could Free(info.address) under the other's read.
+	DNSCacheLock;
+	entry = HashFind(hostname, dns_cache, HTT_DNS);
 	if (!entry)
 	{
 		entry = CAlloc(sizeof(CDNSHash));
@@ -109,6 +140,7 @@ CDNSHash *DNSCachePut(U8 *hostname, CAddressInfo *info)
 		Free(entry->info.address);
 		AddressInfoCopy(&entry->info, info);
 	}
+	DNSCacheUnlock;
 
 	return entry;
 }
@@ -636,15 +668,20 @@ I64 DNSAddressInfoGet(U8 *node_name, U16 port, CAddressInfo **result)
 		return 0;
 	}
 
-	cached_entry = DNSCacheFind(node_name);
-
+	// Copy the cached CAddressInfo out under the lock: a concurrent DNSCachePut
+	// overwrite could otherwise Free(cached_entry->info.address) mid-copy.
+	DNSCacheLock;
+	cached_entry = HashFind(node_name, dns_cache, HTT_DNS);
 	if (cached_entry)
 	{
 		*result = CAlloc(sizeof(CAddressInfo));
 		AddressInfoCopy(*result, &cached_entry->info);
 		//(*res)->flags |= AI_CACHED; // TODO: add AI_CACHED define (maybe a better name?) not used anywhere i don't think..
-		return 0;
 	}
+	DNSCacheUnlock;
+
+	if (cached_entry)
+		return 0;
 
 	udp_socket = UDPSocket(AF_INET);
 	error = 0;

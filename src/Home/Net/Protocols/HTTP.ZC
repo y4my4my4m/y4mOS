@@ -146,6 +146,23 @@ class CHttpCookie
 CHttpCookie http_cookies[HTTP_COOKIE_MAX];
 I64 http_cookie_count = 0; // statically initialized; the JIT does not zero plain globals
 
+// The page, image and script fetch tasks (ZincGX) run concurrently and all
+// touch this jar. Serialize every read/mutation so a task iterating the array
+// cannot race another rewriting http_cookie_count and a slot. (JIT does not
+// zero globals; initialized explicitly.)
+I64 http_cookie_lock = 0;
+
+U0 HttpCookieLock()
+{
+	while (LBts(&http_cookie_lock, 0))
+		Yield;
+}
+
+U0 HttpCookieUnlock()
+{
+	LBtr(&http_cookie_lock, 0);
+}
+
 Bool HttpCookieDomainMatch(U8 *cookie_domain, U8 *host)
 { // exact host, or host is a subdomain of cookie_domain
 	I64 cd = StrLen(cookie_domain), hl = StrLen(host);
@@ -170,8 +187,11 @@ U0 HttpCookieDel(I64 i)
 }
 
 U0 HttpCookieStore(U8 *domain, U8 *path, U8 *name, U8 *value, Bool del)
-{ // inputs already bounded by the caller
+{ // inputs already bounded by the caller. Holds http_cookie_lock; HttpCookieDel
+  // is called only from here, so it must NOT take the lock itself.
 	I64 i;
+
+	HttpCookieLock;
 
 	for (i = 0; i < http_cookie_count; i++)
 		if (!StrICompare(http_cookies[i].domain, domain) &&
@@ -181,10 +201,12 @@ U0 HttpCookieStore(U8 *domain, U8 *path, U8 *name, U8 *value, Bool del)
 	if (del)
 	{
 		HttpCookieDel(i); // no-op when not found
+		HttpCookieUnlock;
 		return;
 	}
 	if (i >= HTTP_COOKIE_MAX)
 	{
+		HttpCookieUnlock;
 		NetErr("HTTP COOKIES: Jar full, dropping %s.", name);
 		return;
 	}
@@ -194,6 +216,8 @@ U0 HttpCookieStore(U8 *domain, U8 *path, U8 *name, U8 *value, Bool del)
 	StrCopy(http_cookies[i].value, value);
 	if (i == http_cookie_count)
 		http_cookie_count++;
+
+	HttpCookieUnlock;
 }
 
 U0 HttpCookiesAccept(CHttpUrl *url, U8 *headers)
@@ -278,6 +302,7 @@ U8 *HttpCookieHeaderBuild(CHttpUrl *url)
 	I64 i, used = 0, add;
 
 	buf[0] = 0;
+	HttpCookieLock;
 	for (i = 0; i < http_cookie_count; i++)
 	{
 		if (!HttpCookieDomainMatch(http_cookies[i].domain, url->host))
@@ -294,6 +319,7 @@ U8 *HttpCookieHeaderBuild(CHttpUrl *url)
 		used = StrLen(buf);
 http_ck_next:;
 	}
+	HttpCookieUnlock;
 
 	if (!buf[0])
 		return StrNew("");
@@ -302,7 +328,9 @@ http_ck_next:;
 
 public U0 HttpCookiesClear()
 {
+	HttpCookieLock;
 	http_cookie_count = 0;
+	HttpCookieUnlock;
 }
 
 public U0 HttpCookiesShow()

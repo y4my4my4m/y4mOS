@@ -37,9 +37,23 @@ class CARPGlobals
 
 CHashTable *arp_cache = NULL;
 
+// This cache is relinked from the RX *interrupt* (NetHandler -> IPV4Handler /
+// ARPHandler -> ARPCachePut) AND read/written from tasks (IPV4 send ->
+// ARPCacheFind, plus the parallel browser fetch tasks). HashAdd/HashFind are
+// not re-entrant, so an overlap tears the bucket chain and faults in
+// SYS_HASH_SINGLE_TABLE_FIND. Because one side is an interrupt, the guard must
+// be the PUSHFD;CLI;spin;LBtr;POPFD pattern (as the kernel heap lock uses), not
+// a Yield spin: a task holding a Yield lock could be interrupted by NetHandler,
+// which would then spin forever. CLI while held blocks the local RX interrupt;
+// LBts/PAUSE covers other cores. The critical sections are a single HashFind /
+// HashAdd with no allocation or blocking inside, so they stay tiny.
+// (JIT does not zero globals; initialized explicitly.)
+I64 arp_cache_lock = 0;
+
 U0 ARPCacheInit()
 {
 	arp_cache = HashTableNew(ARP_HASHTABLE_SIZE);
+	arp_cache_lock = 0;
 	arp_globals.local_ipv4 = 0;
 }
 
@@ -82,9 +96,17 @@ I64 ARPSend(U16 operation,
 }
 
 CARPHash *ARPCacheFind(U32 ip_address)
-{
+{ // caller must NOT already hold arp_cache_lock (the lock is not re-entrant)
 	U8			*ip_string	= MStrPrint("%X", ip_address);
-	CARPHash	*entry		= HashFind(ip_string, arp_cache, HTT_ARP);
+	CARPHash	*entry;
+
+	PUSHFD
+	CLI
+	while (LBts(&arp_cache_lock, 0))
+		PAUSE
+	entry = HashFind(ip_string, arp_cache, HTT_ARP);
+	LBtr(&arp_cache_lock, 0);
+	POPFD
 
 	if (entry == NULL)
 	{
@@ -115,7 +137,13 @@ CARPHash *ARPCachePut(U32 ip_address, U8 *mac_address)
 		entry->type = HTT_ARP;
 		MemCopy(entry->mac_address, mac_address, 6);
 
+		PUSHFD
+		CLI
+		while (LBts(&arp_cache_lock, 0))
+			PAUSE
 		HashAdd(entry, arp_cache);
+		LBtr(&arp_cache_lock, 0);
+		POPFD
 	}
 	else
 	{
