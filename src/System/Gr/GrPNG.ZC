@@ -438,8 +438,22 @@ U0 inflate_huffman(upng_t *upng, U8 *out, U64 outsize, U8 *in, U64 *bp,
   huffman_tree codetree;
   huffman_tree codetreeD;
   if (btype == 1) {
-    huffman_tree_init(&codetree, FIXED_DEFLATE_CODE_TREE(U64 *), 288, 15);
-    huffman_tree_init(&codetreeD, FIXED_DISTANCE_TREE(U64 *), 32, 15);
+    // Build the fixed Huffman trees from DEFLATE's canonical code lengths
+    // (RFC 1951 3.2.6) using the proven length-based builder, rather than a
+    // hand-transcribed static tree2d. btype 1 is rare in PNG streams (they
+    // use dynamic), so the static table went unexercised and was wrong.
+    U64 fixed_len[288];
+    U64 fixed_lenD[32];
+    U64 fi;
+    for (fi = 0; fi < 144; fi++) fixed_len[fi] = 8;
+    for (fi = 144; fi < 256; fi++) fixed_len[fi] = 9;
+    for (fi = 256; fi < 280; fi++) fixed_len[fi] = 7;
+    for (fi = 280; fi < 288; fi++) fixed_len[fi] = 8;
+    for (fi = 0; fi < 32; fi++) fixed_lenD[fi] = 5;
+    huffman_tree_init(&codetree, codetree_buffer, 288, 15);
+    huffman_tree_init(&codetreeD, codetreeD_buffer, 32, 15);
+    huffman_tree_create_lengths(upng, &codetree, fixed_len);
+    huffman_tree_create_lengths(upng, &codetreeD, fixed_lenD);
   } else if (btype == 2) {
     huffman_tree codelengthcodetree;
     huffman_tree_init(&codetree, codetree_buffer, 288, 15);

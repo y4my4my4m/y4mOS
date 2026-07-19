@@ -38,6 +38,7 @@ CJsInterp *zinc_js	= NULL;
 CHttpUrl   zinc_base;			// parsed current URL, for resolving links
 Bool	   zinc_base_ok = FALSE;
 U8		   zinc_note[144];		// one-line status shown in the chrome
+U8		  *zinc_post_body = NULL; // set by a POST form submit, consumed by the next nav fetch
 
 U8	*zinc_back[ZINC_HISTORY], *zinc_fwd[ZINC_HISTORY];
 I64	 zinc_back_count = 0, zinc_fwd_count = 0;
@@ -311,7 +312,21 @@ U0 ZincCollectCss(CZNode *node, I64 *external_left)
 	}
 }
 
-I64 zinc_ext_js_left = 3; //External <script src> budget, reset per page.
+//External <script src> budget, reset per page. Each fetch blocks the page
+//load and the interpreter can't digest framework bundles anyway, so this is
+//a time cap, not a hard capability limit -- raise it freely.
+#define ZINC_EXT_JS_MAX		8
+#define ZINC_EXT_JS_BYTES	262144
+
+I64 zinc_ext_js_left = ZINC_EXT_JS_MAX;
+
+// ZincGX sets zinc_defer_ext_js so external scripts are QUEUED here and
+// fetched by a background task after the page renders (defer semantics --
+// safe because our scripts already run after parsing, so there is no
+// document.write ordering to preserve). The classic browser fetches inline.
+Bool zinc_defer_ext_js	  = FALSE;
+U8	*zinc_js_queue[ZINC_EXT_JS_MAX];
+I64	 zinc_js_queue_count  = 0;
 
 U0 ZincRunScripts(CZNode *node)
 { // run inline <script> blocks (and small external ones) in document order
@@ -325,7 +340,16 @@ U0 ZincRunScripts(CZNode *node)
 		if (!type || StrIMatch("javascript", type) || StrIMatch("module", type))
 		{
 			src = ZNodeAttr(node, "src");
-			if (src)
+			if (src && zinc_defer_ext_js)
+			{//ZincGX: queue for background fetch; ran (in order) once fetched.
+				if (zinc_js_queue_count < ZINC_EXT_JS_MAX && zinc_base_ok)
+				{
+					abs = HttpUrlResolve(&zinc_base, src);
+					if (abs)
+						zinc_js_queue[zinc_js_queue_count++] = abs;
+				}
+			}
+			else if (src)
 			{//Fetch small external scripts so their function defs exist for
 			//onclick handlers. Big frameworks won't parse anyway - cap size.
 				if (zinc_ext_js_left > 0 && zinc_base_ok)
@@ -335,7 +359,7 @@ U0 ZincRunScripts(CZNode *node)
 					{
 						zinc_ext_js_left--;
 						r = HttpGet(abs);
-						if (r && r->status == 200 && r->body && r->body_length < 98304)
+						if (r && r->status == 200 && r->body && r->body_length < ZINC_EXT_JS_BYTES)
 						{
 							if (!JsRun(zinc_js, r->body))
 								ZincJsNote;
@@ -378,7 +402,7 @@ U0 ZincSetPage(U8 *url, U8 *html)
 { // build DOM + CSS + forms + JS for fetched html
 	I64 external_css = 4;
 
-	zinc_ext_js_left = 3;
+	zinc_ext_js_left = ZINC_EXT_JS_MAX;
 	ZincPageFree;
 	zinc_base_ok = (HttpUrlParse(url, &zinc_base) >= 0);
 	zinc_dom = ZHtmlParse(html);
@@ -406,6 +430,23 @@ U0 ZincSetPlainPage(U8 *url, U8 *text)
 	zinc_js = JsInterpNew(zinc_dom, url);
 }
 
+CHttpResponse *ZincNavFetch(U8 *url)
+{ // page navigation fetch: consumes a pending POST body if a form set one
+	CHttpResponse *r;
+	U8			  *body = zinc_post_body;
+
+	zinc_post_body = NULL;
+	if (body)
+	{
+		r = HttpPost(url, body);
+		Free(body);
+	}
+	else
+		r = HttpGet(url);
+
+	return r;
+}
+
 U0 ZincLoad(U8 *url)
 { // fetch url and set up the page (or an error page)
 	CHttpResponse *response;
@@ -431,7 +472,7 @@ U0 ZincLoad(U8 *url)
 		return;
 	}
 
-	response = HttpGet(url);
+	response = ZincNavFetch(url);
 	if (!response)
 	{
 		StrCopy(zinc_note, "Fetch failed. See the Network Log for details.");
@@ -597,12 +638,11 @@ U8 *ZincFormSubmitUrl(CZNode *clicked)
 	ZincFormWalk(scope, query, 2040, clicked);
 
 	action = NULL;
+	method = NULL;
 	if (form)
 	{
 		action = ZNodeAttr(form, "action");
 		method = ZNodeAttr(form, "method");
-		if (method && !StrICompare(method, "post"))
-			StrCopy(zinc_note, "POST form sent as GET (unsupported).");
 	}
 	if (!action || !*action)
 	{
@@ -619,6 +659,13 @@ U8 *ZincFormSubmitUrl(CZNode *clicked)
 		abs = NULL;
 	if (!abs)
 		return NULL;
+
+	if (method && !StrICompare(method, "post"))
+	{ // POST: fields travel as the request body, not in the URL
+		Free(zinc_post_body);
+		zinc_post_body = StrNew(query);
+		return abs;
+	}
 
 	if (*query)
 	{

@@ -73,13 +73,11 @@ U0 IrcShow(U8 *dol_prefix, U8 *raw_text)
 	clean = IrcClean(raw_text);
 	full = MStrPrint("%s%s$$FG$$$$BG$$\n", dol_prefix, clean);
 
+	// NetLog pattern: park the cursor at bottom col 0, then append
 	unlock = DocLock(doc);
-	DocBottom(doc);
-	DocPrint(doc, "%s", full);
-	// park the cursor at column 0 or the window horizontally scrolls to the
-	// end of the longest line and clips every line's head (see Telnet's TermBottom)
 	doc->cur_entry = doc;
 	doc->cur_col = 0;
+	DocPrint(doc, "%s", full);
 	if (unlock)
 		DocUnlock(doc);
 
@@ -415,35 +413,28 @@ U0 IrcInputTask(I64)
 	irc_quit = TRUE;
 }
 
-U0 IrcDisplayTask(I64)
-{
-	DocTermNew;
-	DocCursor(OFF);
-	DocPrint(, "$$WW,1$$");
-	DocPrint(, "$$LTBLUE$$== YIRC ==$$FG$$\n");
-
-	while (TaskValidate(irc_input_task) && !irc_quit)
-		Refresh;
-}
-
 U0 IrcWindowsInit()
 {
-	irc_input_task	 = Spawn(&IrcInputTask, NULL, "IRC Input");
-	irc_display_task = Spawn(&IrcDisplayTask, NULL, "IRC");
-	irc_input_task->win_inhibit	  = WIG_USER_TASK_DEFAULT;
-	irc_display_task->win_inhibit = WIG_USER_TASK_DEFAULT;
+	// display window: a served cmd line task, exactly like NetLog's window --
+	// it renders cross-task DocPrints correctly (word wrap, no clipping)
+	irc_display_task = Spawn(&ServerCmdLine, NULL, "IRC");
+	TaskWait(irc_display_task);
+	irc_display_task->border_src  = BDS_CONST;
+	irc_display_task->border_attr = BLUE << 4 + LTCYAN;
+	irc_display_task->text_attr	  = BLACK << 4 + LTGRAY;
+	DocClear(irc_display_task->border_doc, TRUE);
+	DocPrint(irc_display_task->put_doc, "$$WW+H,1$$");
+	DocPrint(irc_display_task->put_doc, "$$LTBLUE$$== YIRC ==$$FG$$\n");
+	Bts(&irc_display_task->win_inhibit, WIf_SELF_FOCUS);
+
+	irc_input_task = Spawn(&IrcInputTask, NULL, "IRC Input");
+	irc_input_task->win_inhibit = WIG_USER_TASK_DEFAULT;
 	LBts(&irc_input_task->display_flags, DISPLAYf_SHOW);
-	LBts(&irc_display_task->display_flags, DISPLAYf_SHOW);
 
-	irc_display_task->win_top	 = 2;
-	irc_display_task->win_bottom = TEXT_ROWS - 9;
-	irc_display_task->win_left	 = TEXT_COLS / 6;
-	irc_display_task->win_right	 = TEXT_COLS / 6 * 5;
-
-	irc_input_task->win_top		= irc_display_task->win_bottom + 2;
-	irc_input_task->win_bottom	= irc_input_task->win_top + 2;
-	irc_input_task->win_left	= irc_display_task->win_left;
-	irc_input_task->win_right	= irc_display_task->win_right;
+	WinHorz(TEXT_COLS / 6, 5 * TEXT_COLS / 6, irc_display_task);
+	WinVert(2, TEXT_ROWS - 9, irc_display_task);
+	WinHorz(TEXT_COLS / 6, 5 * TEXT_COLS / 6, irc_input_task);
+	WinVert(TEXT_ROWS - 7, TEXT_ROWS - 5, irc_input_task);
 
 	WinFocus(irc_input_task);
 }

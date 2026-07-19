@@ -100,6 +100,12 @@ class CGxGlobals
 	CTask	*img_task;
 	Bool	 img_dirty;		//An image finished; relayout wanted.
 	Bool	 img_busy;		//Img task is mid fetch/decode; don't free cache.
+	//Async external <script src>: bodies fetched in the background (sys-task
+	//heap), run IN ORDER by the main loop, page stays interactive meanwhile.
+	CTask	*js_task;
+	U8		*js_body[ZINC_EXT_JS_MAX];
+	Bool	 js_done[ZINC_EXT_JS_MAX];
+	I64		 js_ran;		//Next queue index to execute.
 } gx;
 
 CGxImg *GxImgFind(U8 *url)
@@ -469,7 +475,7 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 	U8		*attr, *type;
 	U8		 mark[8];
 	I64		 i, box_op, mt_eff, mb_eff, pt_eff, pb_eff, ml_eff, pl_eff;
-	I64		 save_wrap, save_indent, bw, avail, cells, k, y0, ymax, cw, base;
+	I64		 save_wrap, save_indent, bw, avail, cells, k, y0, ymax, cw, base, span;
 	I64		 center_add;
 	Bool	 is_block, is_body, boxed, is_list;
 
@@ -657,13 +663,20 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 
 	if (!StrCompare(node->tag, "tr"))
 	{//Table row: lay the td/th children out as side-by-side columns.
+	//cells counts column UNITS: a colspan=N cell takes N units of width.
 		cells = 0;
 		child = node->first_child;
 		while (child)
 		{
 			if (child->type == ZH_ELEM &&
 				(!StrCompare(child->tag, "td") || !StrCompare(child->tag, "th")))
-				cells++;
+			{
+				span = 1;
+				attr = ZNodeAttr(child, "colspan");
+				if (attr)
+					span = ClampI64(Str2I64(attr), 1, 8);
+				cells += span;
+			}
 			child = child->next;
 		}
 		GxRunFlush;
@@ -687,16 +700,20 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 				if (child->type == ZH_ELEM &&
 					(!StrCompare(child->tag, "td") || !StrCompare(child->tag, "th")))
 				{
+					span = 1;
+					attr = ZNodeAttr(child, "colspan");
+					if (attr)
+						span = ClampI64(Str2I64(attr), 1, 8);
 					gx.y	  = y0;
 					gx.indent = save_indent + k * cw;
-					gx.wrap_w = base + (k + 1) * cw - 6;
+					gx.wrap_w = base + (k + span) * cw - 6;
 					gx.x	  = GX_MARGIN + gx.indent;
 					gx.line_start_op = gx.op_count;
 					GxNode(child, &kid);
 					GxRunFlush;
 					GxLineAlign;
 					ymax = MaxI64(ymax, gx.y);
-					k++;
+					k += span;
 				}
 				child = child->next;
 			}
@@ -1185,6 +1202,47 @@ U8	*gx_fetch_body;
 I64	 gx_fetch_status;
 Bool gx_fetch_html, gx_fetch_ok;
 
+U0 GxJsReset()
+{//Stop the background script fetcher and drop queued/fetched scripts.
+	I64 i;
+
+	if (gx.js_task && TaskValidate(gx.js_task))
+		Kill(gx.js_task);
+	gx.js_task = NULL;
+	for (i = 0; i < zinc_js_queue_count; i++)
+	{
+		Free(zinc_js_queue[i]);
+		Free(gx.js_body[i]); //sys-task heap; NULL-safe
+		gx.js_body[i] = NULL;
+		gx.js_done[i] = FALSE;
+	}
+	zinc_js_queue_count = 0;
+	gx.js_ran = 0;
+}
+
+U0 GxJsFetchTask()
+{//Background: fetch queued external scripts one by one, in document order.
+//Bodies land in the sys-task heap so they survive this task's death; the
+//MAIN task runs them (the JS interp + DOM live in its heap).
+	I64			   i;
+	CHttpResponse *r;
+
+	for (i = 0; i < zinc_js_queue_count; i++)
+	{
+		r = HttpGet(zinc_js_queue[i]);
+		if (r && r->status == 200 && r->body && r->body_length < ZINC_EXT_JS_BYTES)
+		{
+			gx.js_body[i] = MAlloc(r->body_length + 1, sys_task);
+			MemCopy(gx.js_body[i], r->body, r->body_length + 1);
+		}
+		else
+			NetLog("ZINC GX: external script %d skipped (fetch/size).", i);
+		HttpResponseFree(r);
+		gx.js_done[i] = TRUE;
+	}
+	gx.js_task = NULL;
+}
+
 U0 GxFetchTask()
 {//Blocking network fetch ONLY. No DOM parsing here (heap would die with us).
 	CHttpResponse	*r;
@@ -1194,7 +1252,7 @@ U0 GxFetchTask()
 	gx_fetch_status = 0;
 	gx_fetch_html = TRUE;
 	gx_fetch_ok = FALSE;
-	r = HttpGet(gx.load_url);
+	r = ZincNavFetch(gx.load_url); // POSTs the pending form body if one is queued
 	if (r && r->body)
 	{
 		gx_fetch_status = r->status;
@@ -1408,6 +1466,128 @@ gx_click_next:;
 	}
 }
 
+U0 GxClipSet(U8 *s)
+{ // browser-internal clipboard (shared with the URL bar Ctrl+C/V)
+	I64 n;
+
+	if (!s)
+		return;
+	n = StrLen(s);
+	if (n > 255)
+		n = 255;
+	MemCopy(gx_clip, s, n);
+	gx_clip[n] = 0;
+	gx_clip_len = n;
+}
+
+U0 GxDownload(U8 *abs_url)
+{ // fetch abs_url and save it under ::/Tmp/Downloads, named from the URL
+	CHttpResponse *r;
+	U8	 name[104], path[160];
+	U8	*tmp, *p;
+	I64  i, n = 0;
+
+	if (!abs_url)
+		return;
+
+	tmp = StrNew(abs_url);
+	p = StrFirstOcc(tmp, "?"); // filename: last path segment, no query/fragment
+	if (p)
+		*p = 0;
+	p = StrFirstOcc(tmp, "#");
+	if (p)
+		*p = 0;
+	p = StrLastOcc(tmp, "/");
+	if (p)
+		p++;
+	else
+		p = tmp;
+	for (i = 0; p[i] && n < 100; i++)
+	{ // ZealOS FileRead rejects spaces and most punctuation: keep [A-Za-z0-9_.-]
+		if ('A' <= p[i] <= 'Z' || 'a' <= p[i] <= 'z' || '0' <= p[i] <= '9' ||
+			p[i] == '.' || p[i] == '-' || p[i] == '_')
+			name[n++] = p[i];
+		else
+			name[n++] = '_';
+	}
+	name[n] = 0;
+	Free(tmp);
+	if (!name[0])
+		StrCopy(name, "DOWNLOAD.BIN");
+
+	StrPrint(zinc_note, "Downloading %s...", name);
+	r = HttpGet(abs_url);
+	if (r && r->status == 200 && r->body)
+	{
+		DirMake("::/Tmp/Downloads");
+		StrPrint(path, "::/Tmp/Downloads/%s", name);
+		FileWrite(path, r->body, r->body_length);
+		StrPrint(zinc_note, "Saved %s (%d bytes)", path, r->body_length);
+	}
+	else if (r)
+		StrPrint(zinc_note, "Download failed: HTTP %d", r->status);
+	else
+		StrPrint(zinc_note, "Download failed: no response");
+	HttpResponseFree(r);
+}
+
+U0 GxRightClick(I64 x, I64 y)
+{ // context menu: link/image actions under the cursor, page actions otherwise
+	I64	 i, cy, pick;
+	CGxOp *op;
+	U8	*link = NULL, *img = NULL, *abs;
+
+	if (y < GX_CHROME_H || y >= Fs->pix_height - GX_STATUS_H)
+		return;
+	cy = y - GX_CHROME_H + gx.scroll;
+	for (i = 0; i < gx.op_count; i++)
+	{
+		op = &gx.ops[i];
+		if (op->x <= x < op->x + op->w && op->y <= cy < op->y + op->h)
+		{
+			if (op->type == GXO_TEXT && op->href && !link)
+				link = op->href;
+			if (op->type == GXO_IMG && op->img_url && !img)
+				img = op->img_url;
+		}
+	}
+
+	if (link)
+	{
+		pick = PopUpPickList("Open Link\0Download Link\0Copy Link URL\0Cancel\0");
+		abs = ZincResolveLink(link);
+		if (pick == 0)
+		{
+			GxNavTo(abs); // takes ownership
+			return;
+		}
+		if (pick == 1)
+			GxDownload(abs);
+		else if (pick == 2)
+			GxClipSet(abs);
+		Free(abs);
+		return;
+	}
+	if (img)
+	{
+		pick = PopUpPickList("Download Image\0Copy Image URL\0Cancel\0");
+		if (pick == 0)
+			GxDownload(img);
+		else if (pick == 1)
+			GxClipSet(img);
+		return;
+	}
+	pick = PopUpPickList("Back\0Forward\0Reload\0Save Page\0Copy Page URL\0Cancel\0");
+	switch (pick)
+	{
+		case 0: GxNavTo(StrNew("b")); break;
+		case 1: GxNavTo(StrNew("f")); break;
+		case 2: GxNavTo(StrNew("r")); break;
+		case 3: GxDownload(gx.url);   break;
+		case 4: GxClipSet(gx.url);	  break;
+	}
+}
+
 U0 GxClick(I64 x, I64 y)
 {
 	I64 w = Fs->pix_width, view_h = Fs->pix_height - GX_CHROME_H - GX_STATUS_H;
@@ -1456,6 +1636,8 @@ public U0 ZincGX(U8 *start_url=NULL)
 	gx.ops = CAlloc(sizeof(CGxOp) * GX_OPS_MAX);
 	gx.fetch = TRUE;
 	gx.last_wheel = mouse.pos.z;
+	zinc_defer_ext_js = TRUE; //external scripts load in the background here
+	zinc_js_queue_count = 0;  //stale entries died with any previous GX task
 
 	AutoComplete(OFF);
 	DocCursor(OFF);
@@ -1491,6 +1673,7 @@ public U0 ZincGX(U8 *start_url=NULL)
 			while (gx.img_busy) //Wait out any in-flight image fetch.
 				Sleep(5);
 			GxImgCacheFree; //New page: drop old decoded images.
+			GxJsReset;		//New page: drop queued/fetched external scripts.
 			zinc_note[0] = 0;
 			DocClear(Fs->display_doc);
 
@@ -1582,6 +1765,8 @@ public U0 ZincGX(U8 *start_url=NULL)
 					StrPrint(Fs->task_title, "GX:%s", title);
 				else
 					StrCopy(Fs->task_title, "ZincGX");
+				if (zinc_js_queue_count && !gx.js_task)
+					gx.js_task = Spawn(&GxJsFetchTask, NULL, "ZincGX JS", 4);
 			}
 			if (gx.fetch)
 				goto gx_next;
@@ -1633,6 +1818,26 @@ public U0 ZincGX(U8 *start_url=NULL)
 			GxLayout;
 		}
 
+		//Run background-fetched external scripts, in document order, as they
+		//arrive. The page is already rendered and interactive at this point.
+		while (gx.js_ran < zinc_js_queue_count && gx.js_done[gx.js_ran])
+		{
+			vi = gx.js_ran++;
+			if (gx.js_body[vi])
+			{
+				if (zinc_js && !JsRun(zinc_js, gx.js_body[vi]))
+					ZincJsNote;
+				Free(gx.js_body[vi]);
+				gx.js_body[vi] = NULL;
+				gx.relayout = TRUE; //DOM may have changed.
+				if (zinc_js && zinc_js->navigate)
+				{//script assigned location: treat as a click navigation
+					GxNavTo(StrNew(zinc_js->navigate));
+					zinc_js->navigate = NULL;
+				}
+			}
+		}
+
 		//Wheel scroll.
 		view_h = Fs->pix_height - GX_CHROME_H - GX_STATUS_H;
 		if (mouse.pos.z != gx.last_wheel)
@@ -1648,6 +1853,9 @@ public U0 ZincGX(U8 *start_url=NULL)
 			{
 				case MESSAGE_MS_L_DOWN:
 					GxClick(a1, a2);
+					break;
+				case MESSAGE_MS_R_DOWN:
+					GxRightClick(a1, a2);
 					break;
 				case MESSAGE_KEY_DOWN:
 					if (gx.url_focus)
@@ -1783,6 +1991,8 @@ gx_next:
 		Kill(gx.img_task);
 	if (TaskValidate(gx.load_task))
 		Kill(gx.load_task);
+	GxJsReset;
+	zinc_defer_ext_js = FALSE; //classic Zinc keeps its blocking fetches
 	GxOpsReset;
 	GxImgCacheFree;
 	Free(gx.ops);
