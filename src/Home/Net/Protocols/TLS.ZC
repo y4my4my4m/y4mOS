@@ -32,6 +32,14 @@
 #define TLS_FLIGHT_MAX				65536	// server handshake flight reassembly
 #define TLS_TIMEOUT					12000	// ms
 
+// Cooperative cancellation for in-flight network reads. A UI (e.g. the
+// browser's Stop button) sets net_abort; TLSReadN and the HTTP receive loop
+// poll it so a slow/stalled fetch can be aborted instead of blocking for the
+// full socket timeout. Defined here because TLS is included before HTTP.
+Bool net_abort = FALSE;
+#define NET_READ_STALL_MS			9000	// give up if no bytes arrive for this long
+#define NET_READ_POLL_MS			400		// per-recv socket timeout: poll cadence for abort checks
+
 class CTLS
 {
 	CTCPSocket	*sock;
@@ -66,18 +74,34 @@ U0 TLSBuildNonce(U8 *iv, U64 seq, U8 *nonce_out)
 }
 
 I64 TLSReadN(CTLS *tls, U8 *buf, I64 n)
-{ // read exactly n bytes from the TCP socket or fail
+{ // read exactly n bytes from the TCP socket or fail.
+  // The socket runs with a short timeout so this loop stays responsive: a
+  // timeout (-1) is not an error, we just keep waiting (up to a stall
+  // deadline) and poll net_abort so the fetch can be cancelled promptly.
 	I64 got = 0, r;
+	I64 deadline = counts.jiffies + NET_READ_STALL_MS * JIFFY_FREQ / 1000;
 
 	while (got < n)
 	{
+		if (net_abort)
+			return -1;
 		r = TCPSocketReceive(tls->sock, buf + got, n - got);
-		if (r <= 0)
+		if (r > 0)
 		{
-			NetErr("TLS: socket read failed (%d) wanting %d more bytes.", r, n - got);
+			got += r;
+			deadline = counts.jiffies + NET_READ_STALL_MS * JIFFY_FREQ / 1000;
+		}
+		else if (r == 0)
+		{ // peer closed the connection mid-record
+			NetErr("TLS: peer closed wanting %d more bytes.", n - got);
 			return -1;
 		}
-		got += r;
+		else if (counts.jiffies > deadline)
+		{ // stalled too long with no data
+			NetErr("TLS: read stalled wanting %d more bytes.", n - got);
+			return -1;
+		}
+		// r < 0 and within deadline: a timeout tick, keep waiting
 	}
 	return got;
 }
@@ -576,7 +600,7 @@ CTLS *TLSConnect(U8 *hostname, CTCPSocket *sock)
 	U8		 ccs = 0x01;
 
 	tls->sock = sock;
-	tls->sock->timeout = TLS_TIMEOUT;
+	tls->sock->timeout = NET_READ_POLL_MS; // short polls; TLSReadN's deadline bounds patience
 	SHA256Init(&tls->transcript);
 
 	// ephemeral key pair + randoms

@@ -8,7 +8,11 @@
 #define HTTPS_PORT_DEFAULT	443
 #define HTTP_MAX_REDIRECTS	5
 #define HTTP_RECV_CHUNK		8192
-#define HTTP_TIMEOUT		10000 // ms of receive silence before giving up
+// The receive loop polls the socket every NET_READ_POLL_MS (TLS.ZC) so the
+// Stop button / net_abort takes effect within a fraction of a second instead
+// of blocking for the whole response. NET_READ_STALL_MS bounds a genuinely
+// stalled connection.
+#define HTTP_BODY_MAX		2097152 // 2 MB cap: keep a giant page from freezing the parser
 
 class CHttpUrl
 {
@@ -433,6 +437,8 @@ CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 	U8			  *request, *buf, *new_buf, *header_end, *status_ptr;
 	U8			  *cookie_hdr, *encoding, *unzipped;
 	I64			   buf_size, buf_used, received, header_block_len, unzipped_len;
+	I64			   deadline;
+	Bool		   aborted;
 
 	sock = TCPConnectionCreate(url->host, url->port);
 	if (sock <= 0)
@@ -441,7 +447,7 @@ CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 		return NULL;
 	}
 
-	sock->timeout = HTTP_TIMEOUT;
+	sock->timeout = NET_READ_POLL_MS; // short polls so reads stay cancellable
 
 	if (url->is_https)
 	{ // TLS 1.3 owns the socket from here on (TLSClose closes it)
@@ -500,15 +506,16 @@ CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 	buf_size = HTTP_RECV_CHUNK * 4;
 	buf_used = 0;
 	buf = MAlloc(buf_size);
+	aborted = FALSE;
+	deadline = counts.jiffies + NET_READ_STALL_MS * JIFFY_FREQ / 1000;
 
-	if (tls)
-		received = TLSRead(tls, buf, HTTP_RECV_CHUNK);
-	else
-		received = TCPSocketReceive(sock, buf, HTTP_RECV_CHUNK);
-
-	while (received > 0)
+	while (TRUE)
 	{
-		buf_used += received;
+		if (net_abort)
+		{
+			aborted = TRUE;
+			break;
+		}
 
 		if (buf_used + HTTP_RECV_CHUNK + 1 > buf_size)
 		{
@@ -523,7 +530,32 @@ CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 			received = TLSRead(tls, buf + buf_used, HTTP_RECV_CHUNK);
 		else
 			received = TCPSocketReceive(sock, buf + buf_used, HTTP_RECV_CHUNK);
+
+		if (received > 0)
+		{
+			buf_used += received;
+			deadline = counts.jiffies + NET_READ_STALL_MS * JIFFY_FREQ / 1000;
+			if (buf_used >= HTTP_BODY_MAX)
+			{ // giant response: stop here rather than exhaust memory / freeze
+				NetErr("HTTP %s: Response exceeded %d bytes, truncating.",
+					   method, HTTP_BODY_MAX);
+				break;
+			}
+		}
+		else if (received == 0)
+			break;			// EOF: HTTP/1.0 close-delimited response complete
+		else
+		{ // -1: TLS already waited internally (real end/error); plain = poll tick
+			if (tls)
+				break;
+			if (counts.jiffies > deadline)
+				break;		// plain-TCP connection stalled
+			// otherwise a timeout tick: loop and poll net_abort again
+		}
 	}
+
+	if (net_abort) // a TLS read returning -1 from an abort exits via the break above
+		aborted = TRUE;
 
 	if (tls)
 		TLSClose(tls);      // closes the socket too
@@ -531,6 +563,13 @@ CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 		TCPSocketClose(sock);
 
 	buf[buf_used] = 0;
+
+	if (aborted)
+	{
+		NetLog("HTTP %s: Aborted by user.", method);
+		Free(buf);
+		return NULL;
+	}
 
 	if (buf_used < 12)
 	{
@@ -610,7 +649,7 @@ CHttpResponse *HttpNav(U8 *url, U8 *method, U8 *content_type, U8 *body, I64 body
 
 	while (!done && redirects <= HTTP_MAX_REDIRECTS)
 	{
-		if (HttpUrlParse(current, &parsed) < 0)
+		if (net_abort || HttpUrlParse(current, &parsed) < 0)
 			done = TRUE;
 		else
 		{

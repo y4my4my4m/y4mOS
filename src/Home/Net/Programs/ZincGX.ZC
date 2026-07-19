@@ -1629,7 +1629,7 @@ U0 GxClick(I64 x, I64 y)
 public U0 ZincGX(U8 *start_url=NULL)
 {
 	U8	*current, *target;
-	I64	 msg, a1, a2, view_h, vi, nav_chain = 0;
+	I64	 msg, a1, a2, view_h, vi, nav_chain = 0, cancel_deadline = 0;
 	U8	 title[80];
 
 	MemSet(&gx, 0, sizeof(CGxGlobals));
@@ -1693,6 +1693,8 @@ public U0 ZincGX(U8 *start_url=NULL)
 				StrCopy(gx.load_url, current);
 				gx.loading = TRUE;
 				gx.cancel = FALSE;
+				net_abort = FALSE; // clear any stale abort from a prior fetch
+				cancel_deadline = 0;
 				StrCopy(zinc_note, "Loading...");
 				gx.load_task = Spawn(&GxFetchTask, NULL, "ZincGX Fetch", 4);
 				while (gx.loading)
@@ -1707,11 +1709,20 @@ public U0 ZincGX(U8 *start_url=NULL)
 							gx.cancel = TRUE;
 					if (gx.cancel && TaskValidate(gx.load_task))
 					{
-						Kill(gx.load_task);
-						gx.load_task = NULL;
-						gx.loading = FALSE;
-						gx_fetch_ok = FALSE;
-						StrCopy(zinc_note, "Cancelled.");
+						StrCopy(zinc_note, "Stopping...");
+						// Ask the fetch to abort cooperatively (it closes its
+						// socket and returns, clearing gx.loading itself). Only
+						// hard-Kill as a backstop if it doesn't stop in time.
+						net_abort = TRUE;
+						if (!cancel_deadline)
+							cancel_deadline = counts.jiffies + 2000 * JIFFY_FREQ / 1000;
+						else if (counts.jiffies > cancel_deadline)
+						{
+							Kill(gx.load_task);
+							gx.load_task = NULL;
+							gx.loading = FALSE;
+							gx_fetch_ok = FALSE;
+						}
 					}
 					else if (!gx.cancel && !TaskValidate(gx.load_task))
 					{//Fetch task died (e.g. faulted) without clearing loading.
@@ -1720,6 +1731,9 @@ public U0 ZincGX(U8 *start_url=NULL)
 					}
 					Sleep(20);
 				}
+				net_abort = FALSE; // don't leak the abort into background img/js fetches
+				if (gx.cancel)
+					StrCopy(zinc_note, "Cancelled.");
 				//Parse the fetched body (or an error page) in the main heap.
 				if (gx.cancel)
 					ZincSetPage(current, "<p>Load cancelled.</p>");

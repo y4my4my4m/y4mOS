@@ -434,6 +434,7 @@ U0 inflate_huffman(upng_t *upng, U8 *out, U64 outsize, U8 *in, U64 *bp,
   U64 codelengthcodetree_buffer[(32 * 2)];
   U64 codeD, distance, numextrabitsD;
   U64 start, forward, backward, numextrabits;
+  U64 yield_ctr = 0;
 
   huffman_tree codetree;
   huffman_tree codetreeD;
@@ -463,6 +464,10 @@ U0 inflate_huffman(upng_t *upng, U8 *out, U64 outsize, U8 *in, U64 *bp,
                              in, bp, inlength);
   }
   while (done == 0) {
+    // Yield periodically so a large inflate (a big gzipped page or PNG) does
+    // not freeze the machine and stays cancellable by another task.
+    if (!(++yield_ctr & 0x3FFF))
+      Yield;
     code = huffman_decode_symbol(upng, in, bp, &codetree, inlength);
     if (upng->error != UPNG_EOK) {
       return;
