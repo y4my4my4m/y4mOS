@@ -155,28 +155,51 @@ U0 GrUpdateTaskWin(CTask *task)
 	sys_task_being_screen_updated = NULL;
 }
 
+U0 GrDrawCore0Wins()
+{//Draw every shown, uncovered Core0 window in z-order into text_base + dc2.
+	CTask *task, *task1;
+
+	task1 = task = sys_winmgr_task;
+	do
+	{
+		if (!TaskValidate(task))
+			break;
+		if (Bt(&task->display_flags, DISPLAYf_SHOW) && Bt(gr.win_uncovered_bitmap, task->win_z_num))
+			GrUpdateTaskWin(task);
+		if (!TaskValidate(task))
+			break;
+		task = task->next_task;
+	}
+	while (task != task1);
+}
+
 U0 GrUpdateTasks()
 {//Only called by WinMgr
 	I64		 i;
-	CTask	*task, *task1;
+	CTask	*task, *task1, *gt = gr.translucent_task;
 
 	try
 	{
 		winmgr.ode_time = 0;
 		if (Bt(&sys_semas[SEMA_UPDATE_WIN_Z_BUF], 0))
 			WinZBufUpdate;
-		task1 = task = sys_winmgr_task;
-		do
-		{ //Loop through Core0 tasks.
-			if (!TaskValidate(task))
-				break;
-			if (Bt(&task->display_flags, DISPLAYf_SHOW) && Bt(gr.win_uncovered_bitmap, task->win_z_num))
-				GrUpdateTaskWin(task);
-			if (!TaskValidate(task))
-				break;
-			task = task->next_task;
+
+		if (gt && TaskValidate(gt) && Bt(&gt->display_flags, DISPLAYf_SHOW))
+		{//Glass: draw the BACKGROUND first with the translucent window hidden,
+		//so text_base/dc2 hold the windows underneath at its cells. Then draw
+		//the translucent window alone into its private layer (redirect). The
+		//compositor blends the layer over that real background - not just the
+		//wallpaper.
+			LBtr(&gt->display_flags, DISPLAYf_SHOW);
+			WinZBufUpdate;
+			GrDrawCore0Wins;
+			LBts(&gt->display_flags, DISPLAYf_SHOW);
+			WinZBufUpdate;
+			if (TaskValidate(gt))
+				GrUpdateTaskWin(gt); //redirect == translucent -> fills the layer
 		}
-		while (task != task1);
+		else
+			GrDrawCore0Wins;
 
 		for (i = 0; i < mp_count; i++)
 		{ //Loop through all cores.
@@ -762,13 +785,12 @@ U0 GrWinLayerComposite()
 					if (brow & 1 << px)
 						dstp[px] = fg;
 					else
-					{//Blend base: the wallpaper if the DE registered one (the
-					//z-buffer left these cells unpainted), else what's in dc2.
+					{//Blend base: dc2 holds the real background (windows under
+					//the glass + wallpaper), drawn with the glass window hidden.
 						sx = cx * FONT_WIDTH + px;
-						if (wall_row && sx < wall->width)
+						d = dstp[px];
+						if (!d && wall_row && sx < wall->width)
 							d = wall_row[sx];
-						else
-							d = dstp[px];
 						br	= ((bg >> 16 & 0xFF) * a + (d >> 16 & 0xFF) * ia) / 255;
 						bgc	= ((bg >> 8  & 0xFF) * a + (d >> 8  & 0xFF) * ia) / 255;
 						bl	= ((bg       & 0xFF) * a + (d       & 0xFF) * ia) / 255;

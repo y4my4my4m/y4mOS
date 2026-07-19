@@ -517,7 +517,7 @@ U0 inflate_huffman(upng_t *upng, U8 *out, U64 outsize, U8 *in, U64 *bp,
       distance += read_bits(bp, in, numextrabitsD);
       start = (*pos);
       backward = start - distance;
-      if ((*pos) + length >= outsize) {
+      if ((*pos) + length > outsize) {
         do {
           (upng)->error = (UPNG_EMALFORMED);
           (upng)->error_line = 541;
@@ -560,7 +560,7 @@ U0 inflate_uncompressed(upng_t *upng, U8 *out, U64 outsize, U8 *in, U64 *bp,
     } while (0);
     return;
   }
-  if ((*pos) + len >= outsize) {
+  if ((*pos) + len > outsize) {
     do {
       (upng)->error = (UPNG_EMALFORMED);
       (upng)->error_line = 586;

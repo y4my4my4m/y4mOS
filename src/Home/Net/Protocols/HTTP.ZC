@@ -354,6 +354,11 @@ U8 *HttpGunzip(U8 *src, I64 src_len, I64 *_out_len)
 	}
 
 	out = MAlloc(isize + 1);
+	if (!out)
+	{
+		NetErr("HTTP GUNZIP: Cannot allocate %d bytes.", isize + 1);
+		return NULL;
+	}
 	MemSet(&uz, 0, sizeof(upng_t));
 	uz_inflate_data(&uz, out, isize, src, src_len - 8, pos);
 	if (uz.error != UPNG_EOK)
@@ -620,7 +625,13 @@ CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 				response->body_length = unzipped_len;
 			}
 			else
-				NetErr("HTTP %s: gzip decode failed, keeping raw body.", method);
+			{//Never hand the raw gzip bytes to the HTML parser: binary garbage
+			//there has crashed the renderer. Replace with a readable message.
+				NetErr("HTTP %s: gzip decode failed; discarding compressed body.", method);
+				Free(response->body);
+				response->body = StrNew("<html><body><p>[gzip decode failed]</p></body></html>");
+				response->body_length = StrLen(response->body);
+			}
 		}
 		Free(encoding);
 	}

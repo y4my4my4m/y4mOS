@@ -30,10 +30,84 @@ class CDEGlobals
 	CTask	*bar_tasks[DE_BAR_TASKS_MAX];
 	I64		 bar_x0[DE_BAR_TASKS_MAX], bar_x1[DE_BAR_TASKS_MAX], bar_count;
 	I64		 chip_x0, chip_x1;
-	I64		 saved_vol;					//For the media mute toggle.
+	I64		 saved_vol;					//Volume before mute, for the toggle.
+	Bool	 muted;						//Master mute state (widget + media key).
 	I64		*media_vol, *media_mute;	//Kernel counters, or NULL on old kernels.
-	Bool	 on, net_up, glass;
+	I64		 vol_icon_x0, vol_icon_x1;	//Taskbar volume widget hit zones.
+	I64		 vol_bar_x0, vol_bar_x1;
+	U8		 wallpaper_path[256];		//Current wallpaper, remembered for config.
+	Bool	 on, net_up, glass, cfg_dirty;
 } de;
+
+#define DE_CFG_PATH		"::/Home/YDE.CFG"
+
+U0 DEConfigSave()
+{//Persist the tweakable desktop settings as a plain key=value text file the
+//user can hand-edit. Called after any settings change.
+	U8 *buf;
+
+	if (!de.on || !DriveIsWritable)
+		return;
+	buf = MStrPrint(
+		"# YDE desktop settings - edit freely, reloaded on boot.\n"
+		"hue %d\n"
+		"chrome %d\n"
+		"flatmenu %d\n"
+		"glass %d\n"
+		"syslog %d\n"
+		"volume %d\n"
+		"muted %d\n"
+		"wallpaper %s\n",
+		de_theme.hue,
+		gr.tc_chrome != 0,
+		gr.tc_flat_menu != 0,
+		de.glass != 0,
+		Bt(&sys_task->display_flags, DISPLAYf_SHOW) != 0,
+		ac97.volume,
+		de.muted != 0,
+		de.wallpaper_path);
+	FileWrite(DE_CFG_PATH, buf, StrLen(buf));
+	Free(buf);
+}
+
+I64 DEConfigValI64(U8 *body, U8 *key, I64 default)
+{//Read "key <int>" from the config text; default if missing.
+	U8	*p = StrFind(key, body);
+	I64	 klen = StrLen(key);
+
+	while (p)
+	{//Match only at line start followed by whitespace (avoid substring hits).
+		if ((p == body || p[-1] == '\n') && (p[klen] == ' ' || p[klen] == '\t'))
+			return Str2I64(p + klen + 1);
+		p = StrFind(key, p + 1);
+	}
+
+	return default;
+}
+
+U0 DEConfigValStr(U8 *body, U8 *key, U8 *out, I64 out_sz)
+{//Read "key <rest-of-line>" into out; out untouched if missing.
+	U8	*p = StrFind(key, body), *e;
+	I64	 klen = StrLen(key), n;
+
+	while (p)
+	{
+		if ((p == body || p[-1] == '\n') && (p[klen] == ' ' || p[klen] == '\t'))
+		{
+			p += klen + 1;
+			e = p;
+			while (*e && *e != '\r' && *e != '\n')
+				e++;
+			n = e - p;
+			if (n > out_sz - 1)
+				n = out_sz - 1;
+			MemCopy(out, p, n);
+			out[n] = 0;
+			return;
+		}
+		p = StrFind(key, p + 1);
+	}
+}
 
 CDC *DEDCScaleNew(CDC *src, I64 w, I64 h, CTask *mem_task=NULL)
 {//Nearest-neighbor scale of a truecolor DC into a new DC. mem_task matters:
@@ -68,6 +142,12 @@ U0 DEWallpaperLoad(U8 *filename)
 	I64  x, y, r, g, b;
 	U32 *dst;
 
+	if (filename && filename != de.wallpaper_path)
+	{
+		StrCopy(de.wallpaper_path, filename);
+		de.wallpaper_path[255] = 0;
+	}
+
 	if (png)
 	{//Always route through the scaler (1:1 = copy) so the final DC lives on
 	//the SYSTEM heap - callers may be short-lived app tasks (Settings!), and
@@ -96,6 +176,54 @@ U0 DEWallpaperLoad(U8 *filename)
 		Sleep(50); //Let any in-flight compositor frame drop the old pointer.
 		DCDel(old);
 	}
+}
+
+Bool DEConfigLoad()
+{//Apply saved settings from DE_CFG_PATH. Returns TRUE if a config existed.
+//Called near the end of DEStart, so it overrides the built-in defaults.
+	I64	 size, hue, vol;
+	U8	*body = FileRead(DE_CFG_PATH, &size);
+	U8	 wall[256];
+
+	if (!body)
+		return FALSE;
+
+	hue = DEConfigValI64(body, "hue", de_theme.hue);
+	DEThemeAccentSet(hue);
+
+	if (DEConfigValI64(body, "chrome", 1))
+		GuiChromeTrueColor(de_theme.accent, ColorRGB(0x0A, 0x10, 0x1A), de_theme.accent_dim);
+	else
+		GuiChromePalette;
+
+	GuiMenuBarModern(DEConfigValI64(body, "flatmenu", 0) != 0);
+
+	de.glass = DEConfigValI64(body, "glass", 0) != 0;
+	if (!de.glass)
+		WinOpaque;
+
+	if (DEConfigValI64(body, "syslog", 0))
+		LBts(&sys_task->display_flags, DISPLAYf_SHOW);
+	else
+		LBtr(&sys_task->display_flags, DISPLAYf_SHOW);
+
+	vol = DEConfigValI64(body, "volume", ac97.volume);
+	de.muted = DEConfigValI64(body, "muted", 0) != 0;
+	if (de.muted)
+	{
+		de.saved_vol = vol;
+		AC97MasterVolumeSet(0);
+	}
+	else
+		AC97MasterVolumeSet(vol);
+
+	wall[0] = 0;
+	DEConfigValStr(body, "wallpaper", wall, sizeof(wall));
+	if (wall[0] && StrCompare(wall, de.wallpaper_path))
+		DEWallpaperLoad(wall);
+
+	Free(body);
+	return TRUE;
 }
 
 extern U0 DEStop(); //Fwd ref for the launcher menu; body at end of file.
@@ -229,6 +357,100 @@ U0 DEBarTasksUpdate()
 	}
 }
 
+#define DE_VOL_ICON_W	16
+#define DE_VOL_BAR_W	54
+
+U0 DEVolApply(I64 pct)
+{//Set master volume and leave mute. Config persisted lazily via cfg_dirty
+//because these run in the WinMgr ctrl task, which must not block on I/O.
+	de.muted = FALSE;
+	AC97MasterVolumeSet(ClampI64(pct, 0, 100));
+	de.cfg_dirty = TRUE;
+}
+
+U0 DEVolStep(I64 delta)
+{//Volume-key / scroll bump; unmutes, stepping from the pre-mute level.
+	I64 base = ac97.volume;
+
+	if (de.muted)
+		base = de.saved_vol;
+	de.muted = FALSE;
+	AC97MasterVolumeSet(ClampI64(base + delta, 0, 100));
+	de.cfg_dirty = TRUE;
+}
+
+U0 DEVolMuteToggle()
+{
+	if (de.muted)
+	{
+		de.muted = FALSE;
+		AC97MasterVolumeSet(ClampI64(de.saved_vol, 5, 100));
+	}
+	else
+	{
+		de.saved_vol = ac97.volume;
+		if (de.saved_vol < 5)
+			de.saved_vol = 60; //Was already ~silent; give unmute something.
+		de.muted = TRUE;
+		AC97MasterVolumeSet(0);
+	}
+	de.cfg_dirty = TRUE;
+}
+
+I64 DEVolWidgetDraw(CDC *dc, I64 x, I64 y0)
+{//Compact speaker + level bar at the bottom-left of the bar. Returns the
+//width consumed. Records hit zones for DEBarClick.
+	I64  cy = y0 + DE_BAR_HEIGHT / 2, ix = x, dx, h, level, bx, fill;
+	Bool audible = !de.muted && ac97.volume > 0;
+
+	//Speaker: little body box + a cone widening to the right.
+	dc->color = de_theme.text;
+	if (!audible)
+		dc->color = de_theme.text_dim;
+	GrRect(dc, ix, cy - 2, 3, 5);
+	for (dx = 0; dx < 5; dx++)
+	{
+		h = 5 + dx * 2;
+		GrRect(dc, ix + 3 + dx, cy - h / 2, 1, h);
+	}
+	if (audible)
+	{//Two sound "waves".
+		dc->color = de_theme.accent;
+		GrRect(dc, ix + 10, cy - 2, 1, 5);
+		GrRect(dc, ix + 12, cy - 4, 1, 9);
+	}
+	else
+	{//Muted: red slash over the speaker.
+		dc->color = ColorRGB(0xE0, 0x50, 0x50);
+		GrLine(dc, ix, cy + 5, ix + 13, cy - 5);
+	}
+	de.vol_icon_x0 = ix;
+	de.vol_icon_x1 = ix + DE_VOL_ICON_W - 1;
+
+	//Level bar.
+	bx = ix + DE_VOL_ICON_W;
+	dc->color = de_theme.bttn;
+	GrRect(dc, bx, cy - 4, DE_VOL_BAR_W, 8);
+	level = ac97.volume;
+	if (de.muted)
+		level = 0;
+	fill = level * DE_VOL_BAR_W / 100;
+	if (fill > 0)
+	{
+		dc->color = de_theme.accent;
+		if (de.muted)
+			dc->color = de_theme.text_dim;
+		GrRect(dc, bx, cy - 4, fill, 8);
+	}
+	dc->color = de_theme.bar_edge;
+	GrRect(dc, bx, cy - 4, DE_VOL_BAR_W, 1);
+	GrRect(dc, bx, cy + 3, DE_VOL_BAR_W, 1);
+	de.vol_bar_x0 = bx;
+	de.vol_bar_x1 = bx + DE_VOL_BAR_W - 1;
+
+	return DE_VOL_ICON_W + DE_VOL_BAR_W;
+}
+
 U0 DEBarDraw(CDC *dc, CCtrl *c)
 {//Taskbar paint, called every frame from the WinMgr ctrl pass. dc is the
 //z-clipped screen alias; the bar strip is reserved, so it always shows.
@@ -253,7 +475,10 @@ U0 DEBarDraw(CDC *dc, CCtrl *c)
 	GrPrint(dc, x + (DE_CHIP_WIDTH - 3 * FONT_WIDTH) / 2, ty, "YDE");
 	de.chip_x0 = x;
 	de.chip_x1 = x + DE_CHIP_WIDTH - 1;
-	x += DE_CHIP_WIDTH + 8;
+	x += DE_CHIP_WIDTH + 10;
+
+	//Volume widget, bottom-left just past the launcher chip.
+	x += DEVolWidgetDraw(dc, x, y0) + 12;
 
 	//One button per visible window task, in stable arrival order.
 	DEBarTasksUpdate;
@@ -300,6 +525,16 @@ U0 DEBarClick(CCtrl *c, I64 x, I64 y, Bool down)
 	{
 		if (!TaskValidate(de.menu_task))
 			de.menu_task = Spawn(&DEMenuTask, NULL, "DE Menu");
+		return;
+	}
+	if (de.vol_icon_x0 <= x <= de.vol_icon_x1)
+	{//Speaker icon: toggle mute.
+		DEVolMuteToggle;
+		return;
+	}
+	if (de.vol_bar_x0 <= x <= de.vol_bar_x1)
+	{//Level bar: set volume proportional to the click position.
+		DEVolApply((x - de.vol_bar_x0) * 100 / (de.vol_bar_x1 - de.vol_bar_x0));
 		return;
 	}
 	for (i = 0; i < de.bar_count; i++)
@@ -372,19 +607,18 @@ U0 DETaskMain()
 			DEWinPolicyEnforce;
 		if (de.media_vol && *de.media_vol)
 		{//Volume knob / media keys, latched raw by the kernel kbd driver.
-			AC97MasterVolumeSet(ClampI64(ac97.volume + *de.media_vol * 4, 0, 100));
+			DEVolStep(*de.media_vol * 4);
 			*de.media_vol = 0;
 		}
 		if (de.media_mute && *de.media_mute)
 		{
 			*de.media_mute = 0;
-			if (ac97.volume)
-			{
-				de.saved_vol = ac97.volume;
-				AC97MasterVolumeSet(0);
-			}
-			else
-				AC97MasterVolumeSet(ClampI64(de.saved_vol, 10, 100));
+			DEVolMuteToggle;
+		}
+		if (de.cfg_dirty && (cnt & 63) == 0)
+		{//Persist volume/mute (and any other) changes, debounced off the hot path.
+			de.cfg_dirty = FALSE;
+			DEConfigSave;
 		}
 		if (de.glass)
 		{//Glass follows the focus, but only doc/terminal windows: the cell
@@ -427,6 +661,16 @@ public U0 DEStart(U8 *wallpaper_filename="::/DE/Wallpaper.PNG")
 	if (de.on)
 		return;
 
+	//JIT globals are not guaranteed zeroed: init the fields read before their
+	//first write here, or DEWallpaperLoad's DCDel(old) frees a garbage pointer.
+	de.wallpaper		 = NULL;
+	de.wallpaper_path[0] = 0;
+	de.menu_task		 = NULL;
+	de.bar				 = NULL;
+	de.muted			 = FALSE;
+	de.cfg_dirty		 = FALSE;
+	de.saved_vol		 = 60;
+
 	DEWallpaperLoad(wallpaper_filename);
 	de.old_wall_paper = gr.fp_wall_paper;
 	gr.fp_wall_paper = NULL; //Retire the text-stats wallpaper.
@@ -466,6 +710,7 @@ public U0 DEStart(U8 *wallpaper_filename="::/DE/Wallpaper.PNG")
 	de.media_mute = DESymAddr("kbd_media_mute");
 
 	de.on = TRUE;
+	DEConfigLoad; //Restore saved hue/chrome/glass/volume/wallpaper if present.
 	Spawn(&DETaskMain, NULL, "DE");
 	"YDE started. DEStop; returns to stock.\n";
 }

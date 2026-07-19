@@ -54,8 +54,11 @@ U0 YDEEarlySplash()
 
 YDEEarlySplash;
 
-Option(OPTf_WARN_PAREN, ON);
-Option(OPTf_WARN_DUP_TYPES, ON);
+//Keep the System compile quiet so its paren/dup-type warnings do not flood
+//over the boot splash. (Stock ZealOS turns these ON here for dev visibility;
+//errors still print. Flip to ON if you are debugging the System build.)
+Option(OPTf_WARN_PAREN, OFF);
+Option(OPTf_WARN_DUP_TYPES, OFF);
 HashTablePurge(sys_task->hash_table);
 
 #include "/System/MakeSystem"
@@ -71,12 +74,19 @@ LBts(&Fs->display_flags, DISPLAYf_SHOW);
 
 //YDE splash as soon as the compositor exists: covers Registry, wallpaper,
 //DE and Home compile time. Any key (or a timeout) dismisses it.
+//yde_splash_active gates StartUpTasks (HomeSys) so the two default terminals
+//and AutoComplete are not spawned - and do not flicker - until it is gone.
+public Bool yde_splash_active = FALSE;
 if (sys_boot_src.u16[0] != BOOT_SRC_RAM)
 {
+	yde_splash_active = TRUE;
 	if (FileFind("::/DE/Splash.ZC"))
 		PopUp("ExeFile(\"::/DE/Splash\");");
 	else
+	{
+		yde_splash_active = FALSE;
 		PopUp("ExeFile2(\"::/System/ZSplash.ZC\");");
+	}
 }
 
 RegInit;

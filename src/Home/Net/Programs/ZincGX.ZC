@@ -83,6 +83,12 @@ class CGxGlobals
 	U8		 url[256];
 	I64		 url_len, url_caret;
 	Bool	 url_focus, url_selall, quit, fetch, relayout;
+	//Inline text-field editing (YDE-styled, like the URL bar). field_op is the
+	//GXO_WIDGET being edited; field_buf mirrors its DOM node->value.
+	CGxOp	*field_op;
+	U8		 field_buf[512];
+	I64		 field_len, field_caret;
+	Bool	 field_selall;
 	U8		*hover_href;
 	U8		 run[GX_RUN_MAX];
 	I64		 run_len, run_x, run_y, run_scale;
@@ -178,6 +184,16 @@ CColorROPU32 GxPenBg(I64 rgb, CColorROPU32 def)
 U0 GxOpsReset()
 {
 	I64 i;
+
+	//A focused inline field points into gx.ops, which we are about to free.
+	//Commit its buffer into the DOM node (persists across the relayout) and
+	//drop the focus so the pointer never dangles.
+	if (gx.field_op)
+	{
+		Free(gx.field_op->node->value);
+		gx.field_op->node->value = StrNew(gx.field_buf);
+		gx.field_op = NULL;
+	}
 
 	for (i = 0; i < gx.op_count; i++)
 	{
@@ -1151,7 +1167,39 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 					dc->color = de_theme.accent;
 					GrRect(dc, op->x + 3, oy + 3, op->w - 6, op->h - 6);
 				}
-				if (op->wkind != GXW_CHECK && op->wkind != GXW_RADIO)
+				if (op == gx.field_op)
+				{//Focused inline field: accent border, value, selection, caret.
+					I64 fy = oy + (op->h - FONT_HEIGHT) / 2, vis, fstart, fn, cx2;
+
+					dc->color = de_theme.accent;
+					GrRect(dc, op->x, oy, op->w, 1);
+					GrRect(dc, op->x, oy + op->h - 1, op->w, 1);
+					GrRect(dc, op->x, oy, 1, op->h);
+					GrRect(dc, op->x + op->w - 1, oy, 1, op->h);
+					vis = MaxI64(1, (op->w - 12) / FONT_WIDTH);
+					fstart = 0;
+					if (gx.field_caret > vis) //horizontal scroll to keep caret shown
+						fstart = gx.field_caret - vis;
+					fn = MinI64(gx.field_len - fstart, vis);
+					if (fn > 167)
+						fn = 167;
+					MemCopy(buf, gx.field_buf + fstart, fn);
+					buf[fn] = 0;
+					if (gx.field_selall && gx.field_len)
+					{
+						dc->color = de_theme.bttn_focus;
+						GrRect(dc, op->x + 5, fy - 1, fn * FONT_WIDTH, FONT_HEIGHT + 2);
+					}
+					dc->color = de_theme.text;
+					GrPrint(dc, op->x + 6, fy, "%s", buf);
+					if (!gx.field_selall && Blink)
+					{
+						cx2 = op->x + 6 + (gx.field_caret - fstart) * FONT_WIDTH;
+						dc->color = de_theme.accent;
+						GrRect(dc, cx2, fy, 1, FONT_HEIGHT);
+					}
+				}
+				else if (op->wkind != GXW_CHECK && op->wkind != GXW_RADIO)
 				{
 					dc->color = de_theme.text;
 					GrPrint(dc, op->x + 6, oy + (op->h - FONT_HEIGHT) / 2, "%s", op->text);
@@ -1386,12 +1434,81 @@ U0 GxUrlDel(I64 at)
 	gx.url[--gx.url_len] = 0;
 }
 
+//--- Inline text-field editing (mirrors the URL bar) --------------------------
+U0 GxFieldCommit()
+{//Write the edit buffer back into the DOM node value + the op's display text,
+//so form submit picks it up and the field renders the typed text.
+	if (!gx.field_op)
+		return;
+	Free(gx.field_op->node->value);
+	gx.field_op->node->value = StrNew(gx.field_buf);
+	Free(gx.field_op->text);
+	gx.field_op->text = StrNew(gx.field_buf);
+}
+
+U0 GxFieldBlur()
+{
+	if (gx.field_op)
+	{
+		GxFieldCommit;
+		gx.field_op = NULL;
+	}
+}
+
+U0 GxFieldFocus(CGxOp *op)
+{//Begin editing a text field: seed the buffer from its current value.
+	U8 buf[512];
+
+	GxFieldBlur;          //commit any previously-focused field
+	gx.url_focus = FALSE; //fields and the URL bar are mutually exclusive
+	GxWidgetLabel(op->node, buf, sizeof(buf));
+	gx.field_len = StrLen(buf);
+	if (gx.field_len > 510)
+		gx.field_len = 510;
+	MemCopy(gx.field_buf, buf, gx.field_len);
+	gx.field_buf[gx.field_len] = 0;
+	gx.field_caret = gx.field_len;
+	gx.field_selall = FALSE;
+	gx.field_op = op;
+}
+
+U0 GxFieldIns(I64 ch)
+{
+	I64 i;
+
+	if (gx.field_selall)
+	{
+		gx.field_len = 0;
+		gx.field_caret = 0;
+		gx.field_selall = FALSE;
+	}
+	if (gx.field_len >= 510)
+		return;
+	for (i = gx.field_len; i > gx.field_caret; i--)
+		gx.field_buf[i] = gx.field_buf[i - 1];
+	gx.field_buf[gx.field_caret++] = ch;
+	gx.field_buf[++gx.field_len] = 0;
+}
+
+U0 GxFieldDel(I64 at)
+{
+	I64 i;
+
+	if (at < 0 || at >= gx.field_len)
+		return;
+	for (i = at; i < gx.field_len - 1; i++)
+		gx.field_buf[i] = gx.field_buf[i + 1];
+	gx.field_buf[--gx.field_len] = 0;
+}
+
 U0 GxClickContent(I64 x, I64 y)
 {
 	I64	 i, cy = y - GX_CHROME_H + gx.scroll;
 	CGxOp *op;
 	U8	*s, *sub;
 
+	GxFieldBlur; //clicking anywhere commits/leaves the current field; a text
+	             //field hit below re-focuses via GxFieldFocus.
 	for (i = 0; i < gx.op_count; i++)
 	{
 		op = &gx.ops[i];
@@ -1408,13 +1525,7 @@ U0 GxClickContent(I64 x, I64 y)
 			{
 				case GXW_TEXT:
 				case GXW_AREA:
-					s = PopUpGetStr("Value:");
-					if (s)
-					{
-						Free(op->node->value);
-						op->node->value = s;
-						gx.relayout = TRUE;
-					}
+					GxFieldFocus(op); //edit inline, YDE-styled (no popup)
 					break;
 				case GXW_CHECK:
 					op->node->checked = !op->node->checked;
@@ -1595,6 +1706,7 @@ U0 GxClick(I64 x, I64 y)
 
 	if (y < GX_CHROME_H)
 	{//Chrome.
+		GxFieldBlur; //any chrome click leaves an inline field
 		gx.url_focus = FALSE;
 		if (4 <= x < 30)
 			GxNavTo(StrNew("b"));		//Marker: back.
@@ -1628,7 +1740,7 @@ U0 GxClick(I64 x, I64 y)
 
 public U0 ZincGX(U8 *start_url=NULL)
 {
-	U8	*current, *target;
+	U8	*current, *target, *sub;
 	I64	 msg, a1, a2, view_h, vi, nav_chain = 0, cancel_deadline = 0;
 	U8	 title[80];
 
@@ -1872,7 +1984,92 @@ public U0 ZincGX(U8 *start_url=NULL)
 					GxRightClick(a1, a2);
 					break;
 				case MESSAGE_KEY_DOWN:
-					if (gx.url_focus)
+					if (gx.field_op)
+					{//Inline text-field editing: same keys as the URL bar.
+						if (a1 == '\n')
+						{//Enter commits and submits the field's form.
+							GxFieldCommit;
+							sub = ZincFormSubmitUrl(gx.field_op->node);
+							gx.field_op = NULL;
+							if (sub)
+								GxNavTo(sub);
+						}
+						else if (a1 == CH_ESC)
+							GxFieldBlur;
+						else if (a1 == CH_BACKSPACE)
+						{
+							if (gx.field_selall)
+							{
+								gx.field_len = 0;
+								gx.field_caret = 0;
+								gx.field_buf[0] = 0;
+								gx.field_selall = FALSE;
+							}
+							else if (gx.field_caret > 0)
+								GxFieldDel(--gx.field_caret);
+						}
+						else if (a1 == 1)  //Ctrl+A: select all.
+							gx.field_selall = TRUE;
+						else if (a1 == 3)  //Ctrl+C: copy.
+						{
+							MemCopy(gx_clip, gx.field_buf, gx.field_len + 1);
+							gx_clip_len = gx.field_len;
+						}
+						else if (a1 == 24) //Ctrl+X: cut.
+						{
+							MemCopy(gx_clip, gx.field_buf, gx.field_len + 1);
+							gx_clip_len = gx.field_len;
+							gx.field_len = 0;
+							gx.field_caret = 0;
+							gx.field_buf[0] = 0;
+							gx.field_selall = FALSE;
+						}
+						else if (a1 == 22) //Ctrl+V: paste.
+						{
+							if (gx.field_selall)
+							{
+								gx.field_len = 0;
+								gx.field_caret = 0;
+								gx.field_buf[0] = 0;
+								gx.field_selall = FALSE;
+							}
+							for (vi = 0; vi < gx_clip_len; vi++)
+								if (' ' <= gx_clip[vi] < 0x7F)
+									GxFieldIns(gx_clip[vi]);
+						}
+						else if (' ' <= a1 < 0x7F)
+							GxFieldIns(a1);
+						else if (!a1)
+							switch (a2.u8[0])
+							{
+								case SC_CURSOR_LEFT:
+									gx.field_selall = FALSE;
+									gx.field_caret = MaxI64(0, gx.field_caret - 1);
+									break;
+								case SC_CURSOR_RIGHT:
+									gx.field_selall = FALSE;
+									gx.field_caret = MinI64(gx.field_len, gx.field_caret + 1);
+									break;
+								case SC_HOME:
+									gx.field_caret = 0;
+									break;
+								case SC_END:
+									gx.field_caret = gx.field_len;
+									break;
+								case SC_DELETE:
+									if (gx.field_selall)
+									{
+										gx.field_len = 0;
+										gx.field_caret = 0;
+										gx.field_buf[0] = 0;
+										gx.field_selall = FALSE;
+									}
+									else
+										GxFieldDel(gx.field_caret);
+									break;
+							}
+					}
+					else if (gx.url_focus)
 					{
 						if (a1 == '\n')
 						{

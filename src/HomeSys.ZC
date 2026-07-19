@@ -21,8 +21,21 @@ U0 ServerStartUp()
 
 U0 StartUpTasks()
 {
-	CTask *user = User;
+	CTask			*user;
+	I64				 spins = 0;
+	Bool			*splash = NULL;
+	CHashGlobalVar	*hg;
 
+	//Hold off the terminals + AutoComplete until the YDE splash is dismissed,
+	//so they do not flicker in/out underneath it. yde_splash_active is a
+	//StartOS.ZC global; resolve it at runtime so an old kernel just skips this.
+	hg = HashFind("yde_splash_active", sys_task->hash_table, HTT_GLOBAL_VAR);
+	if (hg)
+		splash = hg->data_addr;
+	while (splash && *splash && spins++ < 320) //Cap ~8s in case the splash faults.
+		Sleep(25);
+
+	user = User;
 	if (sys_boot_src.u16[0] != BOOT_SRC_DVD)
 		User;
 

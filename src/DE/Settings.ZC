@@ -6,6 +6,7 @@ Bool de_settings_done;
 U0 DESettingsHue(CDEWidget *wg)
 {
 	DEThemeAccentSet(wg->val);
+	de.cfg_dirty = TRUE;
 }
 
 U0 DESettingsChrome(CDEWidget *wg)
@@ -14,11 +15,13 @@ U0 DESettingsChrome(CDEWidget *wg)
 		GuiChromeTrueColor(de_theme.accent, ColorRGB(0x0A, 0x10, 0x1A), de_theme.accent_dim);
 	else
 		GuiChromePalette;
+	de.cfg_dirty = TRUE;
 }
 
 U0 DESettingsMenuBar(CDEWidget *wg)
 {
 	GuiMenuBarModern(wg->checked);
+	de.cfg_dirty = TRUE;
 }
 
 U0 DESettingsGlass(CDEWidget *wg)
@@ -26,6 +29,7 @@ U0 DESettingsGlass(CDEWidget *wg)
 	de.glass = wg->checked;
 	if (!wg->checked)
 		WinOpaque;
+	de.cfg_dirty = TRUE;
 }
 
 U0 DESettingsSysLog(CDEWidget *wg)
@@ -34,6 +38,7 @@ U0 DESettingsSysLog(CDEWidget *wg)
 		LBts(&sys_task->display_flags, DISPLAYf_SHOW);
 	else
 		LBtr(&sys_task->display_flags, DISPLAYf_SHOW);
+	de.cfg_dirty = TRUE;
 }
 
 U0 DESettingsPickWall(CDEWidget *wg)
@@ -44,17 +49,20 @@ U0 DESettingsPickWall(CDEWidget *wg)
 	{
 		DEWallpaperLoad(file);
 		Free(file);
+		de.cfg_dirty = TRUE;
 	}
 }
 
 U0 DESettingsReloadWall(CDEWidget *wg)
 {
 	DEWallpaperLoad("::/DE/Wallpaper.PNG");
+	de.cfg_dirty = TRUE;
 }
 
 U0 DESettingsGradient(CDEWidget *wg)
 {//Load a name that never resolves -> procedural gradient fallback.
 	DEWallpaperLoad("::/DE/NoSuchWallpaper.PNG");
+	de.cfg_dirty = TRUE;
 }
 
 U0 DESettingsStopDE(CDEWidget *wg)
@@ -70,7 +78,7 @@ U0 DESettingsExit(CDEWidget *wg)
 
 U0 DESettingsVolume(CDEWidget *wg)
 {
-	AC97MasterVolumeSet(wg->val);
+	DEVolApply(wg->val);
 }
 
 public U0 DESettings()
@@ -110,5 +118,6 @@ public U0 DESettings()
 	while (!de_settings_done && DEWinPoll(ctx))
 		Sleep(30);
 
+	DEConfigSave; //Persist on exit (also covers the debounced live changes).
 	DEWinExit(ctx);
 }

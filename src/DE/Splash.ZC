@@ -63,12 +63,15 @@ U0 YDESplashDraw(CTask *task, CDC *dc)
 	GrPrint(dc, (w - 21 * FONT_WIDTH) / 2, h - 24, "Any key skips the wait");
 }
 
+extern Bool yde_splash_active; //Defined in StartOS.ZC; gates StartUpTasks.
+
 U0 YDESplash()
 {
 	I64	 msg, a1, a2;
 	F64	 t0 = tS;
 	Bool done = FALSE;
 
+	yde_splash_active = TRUE;
 	yde_splash_motto = MStrPrint("%Z", RandU8 % DefineCount("YDE_MOTTOS"), "YDE_MOTTOS");
 	YDESplashLogoMake;
 	if (!Fs->put_doc)
@@ -82,19 +85,18 @@ U0 YDESplash()
 
 	WinToTop;
 	WinZBufUpdate;
-	while (!done && tS - t0 < 12.0)
+	while (!done && tS - t0 < 7.0)
 	{
 		while (msg = MessageScan(&a1, &a2))
 			if (msg == MESSAGE_KEY_DOWN)
 				done = TRUE;
-		WinMax;   //Boot tiling (WinTileVert) keeps resizing us; stay big...
-		WinToTop; //...and above the fresh terminals.
-		if (ac.task && TaskValidate(ac.task))
-			LBtr(&ac.task->display_flags, DISPLAYf_SHOW); //AC floats above all.
-		Sleep(60);
+		WinMax;   //Stay big and on top; nothing else should be spawning yet
+		WinToTop; //because StartUpTasks waits on yde_splash_active.
+		Sleep(30);
 	}
-	if (ac.task && TaskValidate(ac.task))
-		LBts(&ac.task->display_flags, DISPLAYf_SHOW);
+
+	//Release the boot: StartUpTasks may now spawn the terminals + AutoComplete.
+	yde_splash_active = FALSE;
 
 	Fs->draw_it = NULL;
 	DCDel(yde_splash_logo);
