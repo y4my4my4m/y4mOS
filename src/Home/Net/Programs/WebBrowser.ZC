@@ -51,8 +51,9 @@ U8 *zinc_welcome =
 	"<p class=dim><i>Like Chrome, but a cheaper element.</i></p>"
 	"<p>A small web browser for <b>ZealOS</b>: HTML, a CSS subset, a JS "
 	"subset, GET forms, http and https (TLS 1.3, unverified certs).</p>"
-	"<p class=dim>Tip: click the address bar or just type an address and "
-	"press ENTER, e.g. <b>frogfind.com</b>.</p>"
+	"<p class=dim>Tip: click the address bar and type an address "
+	"(<b>frogfind.com</b>) or just a <b>search</b> - plain words are sent to "
+	"FrogFind, which returns clean no-JavaScript pages.</p>"
 	"<hr>"
 	"<ul>"
 	"<li><a href=\"http://frogfind.com/\">FrogFind</a> search engine</li>"
@@ -829,20 +830,74 @@ Bool ZincAllDigits(U8 *s)
 	return TRUE;
 }
 
-Bool ZincLooksLikeUrl(U8 *s)
-{ // typed into the command line: treat as an address?
+// Default search engine for plain-text queries typed in the address bar.
+// FrogFind is HTTP (no TLS handshake cost), returns minimal no-JS HTML, and
+// reader-izes the pages you click through to -- ideal for this renderer.
+// %s is replaced with the URL-encoded query. Swap for a different engine:
+//   "https://lite.duckduckgo.com/lite/?q=%s"   (more results, but HTTPS)
+//   "https://html.duckduckgo.com/html/?q=%s"
+U8 *zinc_search_url = "http://frogfind.com/?q=%s";
+
+U8 *ZincUrlEncode(U8 *s)
+{ // percent-encode a query for use in a URL; MAlloc'ed. Space -> '+'.
+	U8	*out = MAlloc(StrLen(s) * 3 + 1);
+	U8	*d = out;
+	U8	 c;
+	U8	*hex = "0123456789ABCDEF";
+
+	while (c = *s++)
+	{
+		if ('A' <= c <= 'Z' || 'a' <= c <= 'z' || '0' <= c <= '9' ||
+			c == '-' || c == '_' || c == '.' || c == '~')
+			*d++ = c;
+		else if (c == ' ')
+			*d++ = '+';
+		else
+		{
+			*d++ = '%';
+			*d++ = hex[c >> 4];
+			*d++ = hex[c & 15];
+		}
+	}
+	*d = 0;
+
+	return out;
+}
+
+Bool ZincInputIsUrl(U8 *s)
+{ // decide address-bar input: an address to visit, or a search query?
 	if (!StrNICompare(s, "http://", 7) || !StrNICompare(s, "https://", 8) ||
 		!StrNICompare(s, "zinc:", 5))
 		return TRUE;
+	if (StrFind(" ", s))
+		return FALSE;			// has a space -> a search query
+	if (StrFind(".", s))
+		return TRUE;			// dotted, no space -> host.tld/path
+	return FALSE;				// bare word (e.g. "templeos") -> search it
+}
 
-	return StrFind(".", s) != NULL; // frogfind.com, example.com/page, ...
+Bool ZincLooksLikeUrl(U8 *s)
+{ // kept for callers; anything not a URL becomes a search, so this is TRUE now
+	return TRUE;
+	no_warn s;
 }
 
 U8 *ZincResolveInput(U8 *s)
-{ // absolute URL from user-typed text; MAlloc'ed
+{ // absolute URL from user-typed text; MAlloc'ed.
+  // URLs pass through; anything else is sent to the default search engine.
+	U8	*enc, *url;
+
 	if (!StrNICompare(s, "http://", 7) || !StrNICompare(s, "https://", 8) ||
 		!StrNICompare(s, "zinc:", 5))
 		return StrNew(s);
+
+	if (!ZincInputIsUrl(s))
+	{
+		enc = ZincUrlEncode(s);
+		url = MStrPrint(zinc_search_url, enc);
+		Free(enc);
+		return url;
+	}
 
 	return MStrPrint("http://%s", s);
 }
