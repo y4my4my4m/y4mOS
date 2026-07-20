@@ -126,11 +126,14 @@ CDNSHash *DNSCachePut(U8 *hostname, CAddressInfo *info)
 	entry = HashFind(hostname, dns_cache, HTT_DNS);
 	if (!entry)
 	{
-		entry = CAlloc(sizeof(CDNSHash));
-		entry->str	= StrNew(hostname);
+		// Cache nodes live in the shared, persistent dns_cache but this runs in
+		// killable browser fetch tasks - pin every allocation to sys_task so a
+		// dying task's heap can't free a still-linked node (UAF -> GP in HashFind).
+		entry = CAlloc(sizeof(CDNSHash), sys_task);
+		entry->str	= StrNew(hostname, sys_task);
 		entry->type = HTT_DNS;
 
-		AddressInfoCopy(&entry->info, info);
+		AddressInfoCopy(&entry->info, info, sys_task);
 
 		HashAdd(entry, dns_cache);
 	}
@@ -138,7 +141,7 @@ CDNSHash *DNSCachePut(U8 *hostname, CAddressInfo *info)
 	{
 		NetWarn("DNS CACHE PUT: Entry was already found in Cache. Overwriting.");
 		Free(entry->info.address);
-		AddressInfoCopy(&entry->info, info);
+		AddressInfoCopy(&entry->info, info, sys_task);
 	}
 	DNSCacheUnlock;
 

@@ -5,7 +5,7 @@
 
 class CDETheme
 {
-	CColorROPU32	bar_bg, bar_edge,
+	CColorROPU32	bar_bg, bar_bg2, bar_edge,
 					chip, chip_hot,
 					bttn, bttn_hot, bttn_focus,
 					panel, panel_edge,
@@ -53,6 +53,7 @@ U0 DEThemeAccentSet(I64 hue)
 U0 DEThemeInit()
 {
 	de_theme.bar_bg		= ColorRGB(0x14, 0x18, 0x22);
+	de_theme.bar_bg2	= ColorRGB(0x0C, 0x10, 0x18);
 	de_theme.bar_edge	= ColorRGB(0x30, 0x64, 0x8C);
 	de_theme.bttn		= ColorRGB(0x1E, 0x28, 0x38);
 	de_theme.bttn_hot	= ColorRGB(0x2A, 0x38, 0x4E);

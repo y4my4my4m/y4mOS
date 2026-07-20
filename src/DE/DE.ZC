@@ -35,6 +35,13 @@ class CDEGlobals
 	I64		*media_vol, *media_mute;	//Kernel counters, or NULL on old kernels.
 	I64		 vol_icon_x0, vol_icon_x1;	//Taskbar volume widget hit zones.
 	I64		 vol_bar_x0, vol_bar_x1;
+	I64		 clock_x0, clock_x1;		//Clock hit zone (click -> calendar).
+	I64		 net_x0, net_x1;			//Network tray icon hit zone.
+	F64		 cal_last;					//Debounce for clock -> calendar spawns.
+	CTask	*ctx_task, *ctx_target;		//Right-click menu task + the task it acts on.
+	CTask	*net_task;					//One-shot task that brings the net stack up.
+	CTask	*min_tasks[DE_BAR_TASKS_MAX];//Windows minimized from the taskbar.
+	I64		 min_count;
 	U8		 wallpaper_path[256];		//Current wallpaper, remembered for config.
 	Bool	 on, net_up, glass, cfg_dirty;
 } de;
@@ -319,6 +326,93 @@ U0 DEMenuTask()
 	de.menu_task = NULL;
 }
 
+U8 *DEWeekday(I64 d)
+{//0 = Sun .. 6 = Sat.
+	switch (d)
+	{
+		case 1:  return "Mon";
+		case 2:  return "Tue";
+		case 3:  return "Wed";
+		case 4:  return "Thu";
+		case 5:  return "Fri";
+		case 6:  return "Sat";
+		default: return "Sun";
+	}
+}
+
+U8 *DEMonthName(I64 m)
+{//m = 1 .. 12.
+	switch (m)
+	{
+		case 2:  return "Feb";
+		case 3:  return "Mar";
+		case 4:  return "Apr";
+		case 5:  return "May";
+		case 6:  return "Jun";
+		case 7:  return "Jul";
+		case 8:  return "Aug";
+		case 9:  return "Sep";
+		case 10: return "Oct";
+		case 11: return "Nov";
+		case 12: return "Dec";
+		default: return "Jan";
+	}
+}
+
+CColorROPU32 DEColorLerp(CColorROPU32 a, CColorROPU32 b, I64 t, I64 d)
+{//Blend a -> b by the fraction t/d, on the low 24 RGB bits. Returns a fresh pen.
+	I64 ar = a >> 16 & 0xFF, ag = a >> 8 & 0xFF, ab = a & 0xFF;
+	I64 br = b >> 16 & 0xFF, bg = b >> 8 & 0xFF, bb = b & 0xFF;
+
+	if (d < 1)
+		d = 1;
+	return ColorRGB((ar * (d - t) + br * t) / d,
+					(ag * (d - t) + bg * t) / d,
+					(ab * (d - t) + bb * t) / d);
+}
+
+Bool DEIsMinimized(CTask *t)
+{//TRUE if t was minimized from the taskbar.
+	I64 i;
+
+	for (i = 0; i < de.min_count; i++)
+		if (de.min_tasks[i] == t)
+			return TRUE;
+
+	return FALSE;
+}
+
+U0 DEMinDrop(CTask *t)
+{//Remove t from the minimized set, preserving order.
+	I64 i, j = 0;
+
+	for (i = 0; i < de.min_count; i++)
+		if (de.min_tasks[i] != t)
+			de.min_tasks[j++] = de.min_tasks[i];
+	de.min_count = j;
+}
+
+U0 DEMinimize(CTask *t)
+{//Hide a window but keep its (dimmed) taskbar button so it can be restored.
+	if (!TaskValidate(t) || DEIsMinimized(t))
+		return;
+	if (de.min_count < DE_BAR_TASKS_MAX)
+		de.min_tasks[de.min_count++] = t;
+	LBtr(&t->display_flags, DISPLAYf_SHOW);
+	LBts(&sys_semas[SEMA_UPDATE_WIN_Z_BUF], 0);
+}
+
+U0 DERestore(CTask *t)
+{//Un-minimize: show, focus, raise.
+	DEMinDrop(t);
+	if (!TaskValidate(t))
+		return;
+	LBts(&t->display_flags, DISPLAYf_SHOW);
+	LBts(&sys_semas[SEMA_UPDATE_WIN_Z_BUF], 0);
+	WinFocus(t);
+	WinToTop(t);
+}
+
 U0 DEBarTasksUpdate()
 {//Maintain a STABLE-ordered task array. The raw task list is z-order and
 //WinToTop reshuffles it on every focus, so drawing from it made buttons jump.
@@ -326,12 +420,21 @@ U0 DEBarTasksUpdate()
 	I64		 i, j;
 	Bool	 found;
 
-	//Prune dead/hidden entries, keeping arrival order.
+	//Drop dead windows from the minimized set first.
+	j = 0;
+	for (i = 0; i < de.min_count; i++)
+		if (TaskValidate(de.min_tasks[i]))
+			de.min_tasks[j++] = de.min_tasks[i];
+	de.min_count = j;
+
+	//Prune dead entries, keeping arrival order. Minimized windows are hidden but
+	//stay in the bar so their (dimmed) button can restore them.
 	j = 0;
 	for (i = 0; i < de.bar_count; i++)
 	{
 		t = de.bar_tasks[i];
-		if (TaskValidate(t) && Bt(&t->display_flags, DISPLAYf_SHOW) && t != de.task)
+		if (TaskValidate(t) && t != de.task &&
+			(Bt(&t->display_flags, DISPLAYf_SHOW) || DEIsMinimized(t)))
 			de.bar_tasks[j++] = t;
 	}
 	de.bar_count = j;
@@ -342,7 +445,7 @@ U0 DEBarTasksUpdate()
 	{
 		if (!TaskValidate(t))
 			break;
-		if (Bt(&t->display_flags, DISPLAYf_SHOW) && t != de.task)
+		if ((Bt(&t->display_flags, DISPLAYf_SHOW) || DEIsMinimized(t)) && t != de.task)
 		{
 			found = FALSE;
 			for (i = 0; i < de.bar_count; i++)
@@ -451,6 +554,26 @@ I64 DEVolWidgetDraw(CDC *dc, I64 x, I64 y0)
 	return DE_VOL_ICON_W + DE_VOL_BAR_W;
 }
 
+#define DE_NET_W	18
+
+I64 DENetIconDraw(CDC *dc, I64 x, I64 y0)
+{//Little link glyph (two nodes joined by a line) in the right tray. Accent when
+//the net stack is up, dim otherwise. Records the hit zone for DEBarClick.
+	I64 cy = y0 + DE_BAR_HEIGHT / 2;
+
+	if (de.net_up)
+		dc->color = de_theme.accent;
+	else
+		dc->color = de_theme.text_dim;
+	GrRect(dc, x, cy - 5, 5, 5);					//Upper-left node.
+	GrRect(dc, x + DE_NET_W - 5, cy, 5, 5);			//Lower-right node.
+	GrLine(dc, x + 2, cy - 3, x + DE_NET_W - 3, cy + 2);
+	de.net_x0 = x;
+	de.net_x1 = x + DE_NET_W - 1;
+
+	return DE_NET_W;
+}
+
 U0 DEBarDraw(CDC *dc, CCtrl *c)
 {//Taskbar paint, called every frame from the WinMgr ctrl pass. dc is the
 //z-clipped screen alias; the bar strip is reserved, so it always shows.
@@ -458,16 +581,23 @@ U0 DEBarDraw(CDC *dc, CCtrl *c)
 	CDateStruct	 ds;
 	I64			 i, y0 = GR_HEIGHT - DE_BAR_HEIGHT, x = 4, n = 0,
 				 ty = y0 + (DE_BAR_HEIGHT - FONT_HEIGHT) / 2,
-				 clock_x, vol_x, right_limit;
-	U8			 buf[STR_LEN], clk[16];
+				 clock_x, vol_x, net_x, right_limit,
+				 gy, mx = mouse.pos.x, my = mouse.pos.y,
+				 clk_w, dat_w, blk_w, bw, by, bh = DE_BAR_HEIGHT - 6;
+	Bool		 in_bar = my >= y0, minimized, focused, hover;
+	U8			 buf[STR_LEN], clk[16], dat[24];
 
-	dc->color = de_theme.bar_bg;
-	GrRect(dc, 0, y0, GR_WIDTH, DE_BAR_HEIGHT);
+	//Gradient bar background, then the accent top edge.
+	for (gy = 0; gy < DE_BAR_HEIGHT; gy++)
+	{
+		dc->color = DEColorLerp(de_theme.bar_bg, de_theme.bar_bg2, gy, DE_BAR_HEIGHT - 1);
+		GrRect(dc, 0, y0 + gy, GR_WIDTH, 1);
+	}
 	dc->color = de_theme.bar_edge;
 	GrRect(dc, 0, y0, GR_WIDTH, 1);
 
-	//YDE launcher chip.
-	if (TaskValidate(de.menu_task))
+	//YDE launcher chip - hot when the menu is open or the cursor is over it.
+	if (TaskValidate(de.menu_task) || (in_bar && x <= mx <= x + DE_CHIP_WIDTH - 1))
 		dc->color = de_theme.chip_hot;
 	else
 		dc->color = de_theme.chip;
@@ -478,16 +608,25 @@ U0 DEBarDraw(CDC *dc, CCtrl *c)
 	de.chip_x1 = x + DE_CHIP_WIDTH - 1;
 	x += DE_CHIP_WIDTH + 10;
 
-	//Right-side tray: clock at the far right, volume widget to its left.
-	//Compute these first so the task buttons know where to stop. The clock
-	//string lives in its own buffer - the button loop reuses buf.
+	//Right-side tray, laid out from the right edge: clock, then volume, then the
+	//net icon. Compute these first so the task buttons know where to stop. The
+	//clock strings get their own buffers; the button loop reuses buf.
 	Date2Struct(&ds, Now);
-	StrPrint(clk, "%02d:%02d:%02d", ds.hour, ds.min, ds.sec);
-	clock_x		= GR_WIDTH - FONT_WIDTH * StrLen(clk) - 8;
+	StrPrint(clk, "%02d:%02d", ds.hour, ds.min);
+	StrPrint(dat, "%s %d %s", DEWeekday(ds.day_of_week), ds.day_of_mon, DEMonthName(ds.mon));
+	clk_w = FONT_WIDTH * StrLen(clk);
+	dat_w = FONT_WIDTH * StrLen(dat);
+	blk_w = clk_w;
+	if (dat_w > blk_w)
+		blk_w = dat_w;
+	clock_x		= GR_WIDTH - blk_w - 8;
+	de.clock_x0	= clock_x;
+	de.clock_x1	= GR_WIDTH - 1;
 	vol_x		= clock_x - (DE_VOL_ICON_W + DE_VOL_BAR_W) - 16;
-	right_limit	= vol_x - 8;
+	net_x		= vol_x - DE_NET_W - 12;
+	right_limit	= net_x - 8;
 
-	//One button per visible window task, in stable arrival order.
+	//One button per visible/minimized window task, in stable arrival order.
 	DEBarTasksUpdate;
 	for (i = 0; i < de.bar_count; i++)
 	{
@@ -501,30 +640,76 @@ U0 DEBarDraw(CDC *dc, CCtrl *c)
 		{
 			de.bar_x0[i] = x;
 			de.bar_x1[i] = x + DE_BTTN_WIDTH - 6;
-			if (t == sys_focus_task)
+			bw			= DE_BTTN_WIDTH - 6;
+			by			= y0 + 3;
+			minimized	= DEIsMinimized(t);
+			focused		= t == sys_focus_task && !minimized;
+			hover		= in_bar && de.bar_x0[i] <= mx <= de.bar_x1[i];
+			if (focused)
 				dc->color = de_theme.bttn_focus;
+			else if (hover)
+				dc->color = de_theme.bttn_hot;
 			else
 				dc->color = de_theme.bttn;
-			GrRect(dc, x, y0 + 3, DE_BTTN_WIDTH - 6, DE_BAR_HEIGHT - 6);
+			GrRect(dc, x, by, bw, bh);
+			//Bevel: lighter top edge, darker bottom edge.
+			dc->color = de_theme.bttn_hot;
+			GrRect(dc, x, by, bw, 1);
+			dc->color = de_theme.bar_bg2;
+			GrRect(dc, x, by + bh - 1, bw, 1);
+			//Title (dimmed when minimized).
 			MemCopy(buf, t->task_title, 15);
 			buf[15] = 0;
-			dc->color = de_theme.text;
+			if (minimized)
+				dc->color = de_theme.text_dim;
+			else
+				dc->color = de_theme.text;
 			GrPrint(dc, x + 6, ty, "%s", buf);
+			//Indicator: accent underline when focused, else a small running dot.
+			if (focused)
+			{
+				dc->color = de_theme.accent;
+				GrRect(dc, x, by + bh - 2, bw, 2);
+			}
+			else if (!minimized)
+			{
+				dc->color = de_theme.text_dim;
+				GrRect(dc, x + bw / 2 - 1, by + bh - 3, 2, 2);
+			}
 			x += DE_BTTN_WIDTH;
 			n++;
 		}
 	}
 
-	//Volume widget (right tray), then the clock.
+	//Net icon + volume widget (right tray), then the two-line clock.
+	DENetIconDraw(dc, net_x, y0);
 	DEVolWidgetDraw(dc, vol_x, y0);
 	dc->color = de_theme.text;
-	GrPrint(dc, clock_x, ty, "%s", clk);
+	GrPrint(dc, clock_x + (blk_w - clk_w) / 2, y0 + 2, "%s", clk);
+	dc->color = de_theme.text_dim;
+	GrPrint(dc, clock_x + (blk_w - dat_w) / 2, y0 + 2 + FONT_HEIGHT + 1, "%s", dat);
+}
+
+U0 DECalLaunchTask()
+{//Open the calendar without blocking the WinMgr in User()'s TaskWait.
+	User("DECalendar;\n");
+}
+
+U0 DENetUpTask()
+{//Compile the system-wide net stack (net + TLS + Zinc) once, off the hot path.
+	if (!de.net_up)
+	{
+		Sys("ExeFile(\"::/DE/BrowserBoot\");");
+		de.net_up = TRUE;
+	}
+	de.net_task = NULL;
 }
 
 U0 DEBarClick(CCtrl *c, I64 x, I64 y, Bool down)
 {//Native ctrl click routing: the WinMgr swallows these before any window
 //focus change. Runs in the WinMgr task - keep it quick, spawn the slow bits.
-	I64 i;
+	I64	   i;
+	CTask *t;
 
 	if (!down)
 		return;
@@ -544,16 +729,100 @@ U0 DEBarClick(CCtrl *c, I64 x, I64 y, Bool down)
 		DEVolApply((x - de.vol_bar_x0) * 100 / (de.vol_bar_x1 - de.vol_bar_x0));
 		return;
 	}
-	for (i = 0; i < de.bar_count; i++)
-		if (de.bar_x0[i] <= x <= de.bar_x1[i])
+	if (de.net_x0 >= 0 && de.net_x0 <= x <= de.net_x1)
+	{//Net icon: bring the net stack up off the WinMgr hot path (BrowserBoot
+	//compiles net + TLS + Zinc - slow, never inline). Guarded so repeat clicks
+	//can't double-compile.
+		if (!de.net_up && !TaskValidate(de.net_task))
+			de.net_task = Spawn(&DENetUpTask, NULL, "NetUp");
+		return;
+	}
+	if (de.clock_x0 >= 0 && de.clock_x0 <= x <= de.clock_x1)
+	{//Clock: open the calendar from a throwaway task (User() blocks in TaskWait,
+	//so never call it inline). Debounced so a double-click won't stack windows.
+		if (tS - de.cal_last > 1.0)
 		{
-			if (TaskValidate(de.bar_tasks[i]))
-			{
-				WinFocus(de.bar_tasks[i]);
-				WinToTop(de.bar_tasks[i]);
+			de.cal_last = tS;
+			Spawn(&DECalLaunchTask, NULL, "Calendar");
+		}
+		return;
+	}
+	for (i = 0; i < de.bar_count; i++)
+		if (de.bar_x0[i] >= 0 && de.bar_x0[i] <= x <= de.bar_x1[i])
+		{
+			t = de.bar_tasks[i];
+			if (TaskValidate(t))
+			{//Taskbar toggle: restore a minimized window, minimize the focused
+			//one, otherwise focus + raise.
+				if (DEIsMinimized(t))
+					DERestore(t);
+				else if (t == sys_focus_task)
+					DEMinimize(t);
+				else
+				{
+					WinFocus(t);
+					WinToTop(t);
+				}
 			}
 			return;
 		}
+}
+
+U0 DECtxMenuTask()
+{//Right-click task-button menu, in its own task so the WinMgr never blocks.
+	CTask *t = de.ctx_target;
+	I64	   i;
+
+	if (TaskValidate(t))
+	{
+		i = PopUpPickList("Focus\0Minimize\0Close\0");
+		if (TaskValidate(t))
+			switch (i)
+			{
+				case 0:
+					WinFocus(t);
+					WinToTop(t);
+					break;
+				case 1:
+					DEMinimize(t);
+					break;
+				case 2:
+					Kill(t);
+					break;
+			}
+	}
+	de.ctx_task = NULL;
+}
+
+U0 DEBarRightClick(CCtrl *c, I64 x, I64 y, Bool down)
+{//Right-click a task button -> Focus / Minimize / Close.
+	I64 i;
+
+	if (!down)
+		return;
+	for (i = 0; i < de.bar_count; i++)
+		if (de.bar_x0[i] >= 0 && de.bar_x0[i] <= x <= de.bar_x1[i])
+		{
+			if (TaskValidate(de.bar_tasks[i]) && !TaskValidate(de.ctx_task))
+			{
+				de.ctx_target = de.bar_tasks[i];
+				de.ctx_task	  = Spawn(&DECtxMenuTask, NULL, "DE Menu");
+			}
+			return;
+		}
+}
+
+U0 DEBarWheel(CCtrl *c, I64 delta)
+{//Scroll over the volume tray to step the volume up/down.
+	I64 mx = mouse.pos.x;
+
+	if (de.vol_icon_x0 <= mx <= de.vol_bar_x1)
+	{
+		if (delta > 0)
+			DEVolStep(4);
+		else
+			DEVolStep(-4);
+	}
 }
 
 U0 DEWinPolicyEnforce()
@@ -677,6 +946,15 @@ public U0 DEStart(U8 *wallpaper_filename="::/DE/Wallpaper.PNG")
 	de.muted			 = FALSE;
 	de.cfg_dirty		 = FALSE;
 	de.saved_vol		 = 60;
+	de.cal_last			 = 0;
+	de.ctx_task			 = NULL;
+	de.ctx_target		 = NULL;
+	de.net_task			 = NULL;
+	de.min_count		 = 0;
+	de.clock_x0			 = -1;
+	de.clock_x1			 = -1;
+	de.net_x0			 = -1;
+	de.net_x1			 = -1;
 
 	DEWallpaperLoad(wallpaper_filename);
 	de.old_wall_paper = gr.fp_wall_paper;
@@ -699,6 +977,8 @@ public U0 DEStart(U8 *wallpaper_filename="::/DE/Wallpaper.PNG")
 	c->type			= CTRLT_GENERIC;
 	c->draw_it		= &DEBarDraw;
 	c->left_click	= &DEBarClick;
+	c->right_click	= &DEBarRightClick;
+	c->wheel_chg	= &DEBarWheel;
 	c->left			= 0;
 	c->right		= GR_WIDTH - 1;
 	c->top			= GR_HEIGHT - DE_BAR_HEIGHT;
@@ -731,6 +1011,12 @@ public U0 DEStop()
 	if (TaskValidate(de.menu_task))
 		Kill(de.menu_task);
 	de.menu_task = NULL;
+
+	if (TaskValidate(de.ctx_task))
+		Kill(de.ctx_task);
+	de.ctx_task = NULL;
+	de.net_task = NULL;
+	de.min_count = 0;
 
 	gr.reserved_bottom_rows = 0;
 	sys_winmgr_task->draw_it = NULL;
