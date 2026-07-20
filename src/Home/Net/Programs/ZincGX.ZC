@@ -14,7 +14,10 @@
 
 #define GX_OPS_MAX		9000
 #define GX_RUN_MAX		512
-#define GX_CHROME_H		30
+#define GX_TAB_H		20	//Tab strip row (above the nav row).
+#define GX_TAB_W		110	//One tab's width in the strip.
+#define GX_TABS			6
+#define GX_CHROME_H		50	//GX_TAB_H + 30px nav row; content starts below.
 #define GX_STATUS_H		16
 #define GX_SBAR_W		10
 #define GX_MARGIN		10
@@ -40,6 +43,7 @@
 #define GX_IMG_CACHE	48
 #define GX_IMG_MAXW		480
 #define GX_IMG_MAXH		360
+#define GX_IV_MAXDIM	2000	//Image-view: cap stored full-size decode.
 
 class CGxOp
 {
@@ -51,6 +55,7 @@ class CGxOp
 	CZNode			*node;		//Widget node.
 	I64				 wkind;
 	U8				*img_url;	//GXO_IMG: absolute URL (MAlloc'ed).
+	I64				 radius;	//GXO_WIDGET: border-radius px (-1 = unset).
 	Bool			 bold, ul, has_bg;
 };
 
@@ -61,6 +66,27 @@ class CGxImg
 	U8	*url;
 	CDC	*dc;		//NULL = fetched-and-failed (don't retry); absent = todo.
 	Bool fetched;
+};
+
+class CGxTab
+{//A background tab's parked page: the engine globals swap in/out on switch.
+//Ops are NOT saved - switching relayouts from the restored DOM, so display
+//ops never point at freed image DCs.
+	Bool	 used;
+	U8		*url;			//Tab's current URL (StrNew'd).
+	U8		 title[48];
+	I64		 scroll;
+	CZNode	*dom;			//zinc_dom while parked.
+	CJsInterp *js;			//zinc_js while parked (timers freeze).
+	CHttpUrl base;
+	Bool	 base_ok;
+	U8		*css;			//ZCssStateSave blob (rules + custom properties).
+	CDC		*iv_dc;			//Parked direct-image view.
+	Bool	 iv_one2one;
+	U8		*back[ZINC_HISTORY];
+	I64		 back_count;
+	U8		*fwd[ZINC_HISTORY];
+	I64		 fwd_count;
 };
 
 class CGxGlobals
@@ -78,6 +104,11 @@ class CGxGlobals
 	I64		 line_align;	//0 left, 1 center, 2 right for the current line.
 	I64		 page_bg, page_fg;	//body/html colors; -1 unset.
 	Bool	 page_has_bg;
+	//Containing block for position:absolute children: the content-box origin +
+	//width of the nearest positioned (relative/absolute/fixed) ancestor. abs
+	//offsets (top/left/right) resolve against this, not the page edge.
+	//cb_h: CB height for percent top offsets; 0 = unknown (no explicit height).
+	I64		 cb_x, cb_y, cb_w, cb_h;
 	CColorROPU32 text_pen;	//Resolved default text pen for this page.
 	I64		 list_typ[8], list_ctr[8], list_sp;	//0 = ul, 1 = ol.
 	U8		 url[256];
@@ -106,6 +137,18 @@ class CGxGlobals
 	CTask	*img_task;
 	Bool	 img_dirty;		//An image finished; relayout wanted.
 	Bool	 img_busy;		//Img task is mid fetch/decode; don't free cache.
+	//Image view: navigating straight to an image URL (or data: URI) shows the
+	//picture itself - scaled to fit the window; a click toggles 1:1.
+	CDC		*iv_dc;			//Full-size decode (sys_task heap; capped).
+	CDC		*iv_sc;			//Owned scaled fit copy (NULL when shown 1:1).
+	Bool	 iv_one2one;
+	//Tabs. tab[tab_cur].used is always TRUE; the current tab's page lives in
+	//the engine globals, background tabs' pages are parked in tab[].
+	CGxTab	 tab[GX_TABS];
+	I64		 tab_cur;
+	I64		 tab_go;		//Click requests: -1 none, else target index.
+	I64		 tab_close;		//-1 none, else index to close.
+	Bool	 tab_new;
 	//Async external <script src>: bodies fetched in the background (sys-task
 	//heap), run IN ORDER by the main loop, page stays interactive meanwhile.
 	CTask	*js_task;
@@ -125,17 +168,22 @@ CGxImg *GxImgFind(U8 *url)
 }
 
 CGxImg *GxImgGet(U8 *url)
-{//Find or create a cache slot for url.
+{//Find or create a cache slot for url. Append is lock-free vs the image task
+//(single writer = the layout task): fully initialize the slot, THEN publish it
+//by bumping img_count, so the concurrent reader never sees a half-built entry.
 	CGxImg *e = GxImgFind(url);
+	I64		i;
 
 	if (e)
 		return e;
 	if (gx.img_count >= GX_IMG_CACHE)
 		return NULL;
-	e = &gx.img[gx.img_count++];
-	e->url = StrNew(url);
+	i = gx.img_count;
+	e = &gx.img[i];
 	e->dc = NULL;
 	e->fetched = FALSE;
+	e->url = StrNew(url);
+	gx.img_count = i + 1; // publish last
 	return e;
 }
 
@@ -150,6 +198,53 @@ U0 GxImgCacheFree()
 			DCDel(gx.img[i].dc);
 	}
 	gx.img_count = 0;
+}
+
+U0 GxImgViewFree()
+{//Drop the direct-image view (navigating away / new page).
+	if (gx.iv_sc)
+		DCDel(gx.iv_sc);
+	gx.iv_sc = NULL;
+	if (gx.iv_dc)
+		DCDel(gx.iv_dc);
+	gx.iv_dc = NULL;
+	gx.iv_one2one = FALSE;
+}
+
+CDC *GxImgViewCap(CDC *dc)
+{//Cap the stored full-size decode so 1:1 view can't eat the heap.
+	CDC *scaled;
+	I64	 sf;
+
+	if (!dc || (dc->width <= GX_IV_MAXDIM && dc->height <= GX_IV_MAXDIM))
+		return dc;
+	sf = MinI64(GX_IV_MAXDIM * 1000 / dc->width,
+				GX_IV_MAXDIM * 1000 / dc->height);
+	scaled = DEDCScaleNew(dc, MaxI64(1, dc->width  * sf / 1000),
+							  MaxI64(1, dc->height * sf / 1000), sys_task);
+	DCDel(dc);
+	return scaled;
+}
+
+CDC *GxImgViewDecode(U8 *buf, I64 len)
+{//Sniff + decode an image body (PNG / JPEG / SVG text) for direct viewing.
+	CDC *dc = NULL;
+	U8	*b0 = buf;
+
+	if (!buf || len < 8)
+		return NULL;
+	if (buf[1] == 'P' && buf[2] == 'N' && buf[3] == 'G')
+		dc = PNGReadBuf(buf, len, 255, sys_task);
+	else if (buf[0] == 0xFF && buf[1] == 0xD8)
+		dc = JPGReadBuf(buf, len, sys_task);
+	else
+	{
+		while (*b0 == ' ' || *b0 == '\n' || *b0 == '\r' || *b0 == '\t')
+			b0++;
+		if (*b0 == '<' && StrFind("<svg", buf))
+			dc = SVGReadBuf(buf, len, 0, 0, sys_task);
+	}
+	return GxImgViewCap(dc);
 }
 
 CColorROPU32 GxPen(I64 rgb, CColorROPU32 def)
@@ -431,6 +526,7 @@ U0 GxWidgetLabel(CZNode *node, U8 *out, I64 max)
 U0 GxWidget(CZNode *node, I64 kind)
 {
 	CGxOp	*op;
+	CZStyle	 wa;
 	U8		 label[64];
 	I64		 w, h = 20;
 
@@ -455,6 +551,8 @@ U0 GxWidget(CZNode *node, I64 kind)
 		op->node  = node;
 		op->wkind = kind;
 		op->text  = StrNew(label);
+		ZCssApply(node, &wa); // honor the page's border-radius (no default pill)
+		op->radius = wa.radius;
 	}
 	gx.x += w + FONT_WIDTH;
 	if (h + GX_LINE_LEAD > gx.line_h)
@@ -1157,9 +1255,59 @@ U0 GxPageStyle()
 //inline flow above. Provides L2Node + the zinc_layout2/Layout2() toggle.
 #include "Zinc/Layout"
 
+U0 GxImgViewLayout()
+{//Direct image view: one centered GXO_IMG op. Fit-to-window by default;
+//gx.iv_one2one (click toggle) shows natural size, vertical scroll pans.
+	I64	 avail_w = MaxI64(64, Fs->pix_width - GX_SBAR_W - 8);
+	I64	 avail_h = MaxI64(64, Fs->pix_height - GX_CHROME_H - GX_STATUS_H - 16);
+	I64	 iw = gx.iv_dc->width, ih = gx.iv_dc->height, sf, sw, sh, x0;
+	CDC	*show = gx.iv_dc;
+	CGxOp *op;
+
+	if (gx.iv_sc)
+	{//Window size (or mode) changed since the last fit: rebuild the copy.
+		DCDel(gx.iv_sc);
+		gx.iv_sc = NULL;
+	}
+	if (!gx.iv_one2one)
+	{
+		sf = MinI64(1000, MinI64(avail_w * 1000 / iw, avail_h * 1000 / ih));
+		if (sf < 1000)
+		{
+			gx.iv_sc = DEDCScaleNew(gx.iv_dc, MaxI64(1, iw * sf / 1000),
+											  MaxI64(1, ih * sf / 1000), sys_task);
+			if (gx.iv_sc)
+				show = gx.iv_sc;
+		}
+	}
+	sw = show->width;
+	sh = show->height;
+	x0 = MaxI64(4, (Fs->pix_width - GX_SBAR_W - sw) / 2);
+	op = GxOpAdd(GXO_IMG, x0, 8, sw, sh);
+	if (op)
+		op->sc = show; //Borrowed: GxOpsReset never frees GXO_IMG sc.
+	gx.doc_h = sh + 16;
+	if (gx.iv_one2one)
+		StrPrint(zinc_note, "%dx%d - actual size (click: fit)", iw, ih);
+	else
+		StrPrint(zinc_note, "%dx%d - fit (click: actual size)", iw, ih);
+}
+
 U0 GxLayout()
 {
 	CZStyle root;
+
+	if (gx.iv_dc)
+	{//Direct image view replaces the DOM render entirely.
+		gx.busy = TRUE;
+		GxOpsReset;
+		GxImgViewLayout;
+		gx.last_w = Fs->pix_width;
+		if (gx.scroll > gx.doc_h)
+			gx.scroll = 0;
+		gx.busy = FALSE;
+		return;
+	}
 
 	gx.busy = TRUE;
 	GxOpsReset;
@@ -1177,6 +1325,10 @@ U0 GxLayout()
 	gx.line_align = 0;
 	l2_root_wrap = gx.wrap_w;
 	l2_meas_depth = 0;
+	gx.cb_x = GX_MARGIN;	// default containing block = the viewport
+	gx.cb_y = 8;
+	gx.cb_w = gx.wrap_w - GX_MARGIN;
+	gx.cb_h = MaxI64(60, Fs->pix_height - GX_CHROME_H - GX_STATUS_H - 16);
 	ZStyleReset(&root);
 	root.fg = gx.page_fg; //-1: theme text over the theme background.
 	root.fsize = 16;
@@ -1198,20 +1350,59 @@ U0 GxLayout()
 //--- Drawing -----------------------------------------------------------------
 U0 GxDrawChrome(CDC *dc)
 {
-	I64 w = Fs->pix_width, bx = 4, ty = (GX_CHROME_H - FONT_HEIGHT) / 2;
+	I64 w = Fs->pix_width, bx = 4;
+	I64 ny = GX_TAB_H;	//Nav row sits below the tab strip.
+	I64 ty = ny + (GX_CHROME_H - GX_TAB_H - FONT_HEIGHT) / 2;
+	I64 i, x0 = 4, tty = (GX_TAB_H - FONT_HEIGHT) / 2, n;
 	U8	buf[264];
+	CGxTab *t;
 
 	dc->color = de_theme.bar_bg;
 	GrRect(dc, 0, 0, w, GX_CHROME_H);
 	dc->color = de_theme.bar_edge;
 	GrRect(dc, 0, GX_CHROME_H - 1, w, 1);
 
+	//Tab strip.
+	for (i = 0; i < GX_TABS; i++)
+	{
+		t = &gx.tab[i];
+		if (t->used)
+		{
+			if (i == gx.tab_cur)
+				dc->color = de_theme.bttn_focus;
+			else
+				dc->color = de_theme.panel;
+			GrRect(dc, x0, 1, GX_TAB_W, GX_TAB_H - 2);
+			if (i == gx.tab_cur)
+			{
+				dc->color = de_theme.accent;
+				GrRect(dc, x0, GX_TAB_H - 3, GX_TAB_W, 2);
+			}
+			if (t->title[0])
+				StrPrint(buf, "%s", t->title);
+			else
+				StrCopy(buf, "(new tab)");
+			n = ClampI64((GX_TAB_W - 24) / FONT_WIDTH, 0, 262);
+			buf[n] = 0;
+			dc->color = de_theme.text;
+			GrPrint(dc, x0 + 4, tty, "%s", buf);
+			dc->color = de_theme.text_dim;
+			GrPrint(dc, x0 + GX_TAB_W - 12, tty, "x");
+			x0 += GX_TAB_W + 2;
+		}
+	}
+	//New-tab button.
+	dc->color = de_theme.chip;
+	GrRect(dc, x0, 2, 20, GX_TAB_H - 4);
+	dc->color = de_theme.text;
+	GrPrint(dc, x0 + 6, tty, "+");
+
 	//Back, forward, reload, home.
 	dc->color = de_theme.bttn;
-	GrRect(dc, bx, 4, 26, GX_CHROME_H - 8);
-	GrRect(dc, bx + 30, 4, 26, GX_CHROME_H - 8);
-	GrRect(dc, bx + 60, 4, 26, GX_CHROME_H - 8);
-	GrRect(dc, bx + 90, 4, 26, GX_CHROME_H - 8);
+	GrRect(dc, bx, ny + 4, 26, GX_CHROME_H - ny - 8);
+	GrRect(dc, bx + 30, ny + 4, 26, GX_CHROME_H - ny - 8);
+	GrRect(dc, bx + 60, ny + 4, 26, GX_CHROME_H - ny - 8);
+	GrRect(dc, bx + 90, ny + 4, 26, GX_CHROME_H - ny - 8);
 	dc->color = de_theme.text;
 	GrPrint(dc, bx + 9, ty, "<");
 	GrPrint(dc, bx + 39, ty, ">");
@@ -1223,21 +1414,22 @@ U0 GxDrawChrome(CDC *dc)
 
 	//URL box.
 	dc->color = de_theme.win_bg;
-	GrRect(dc, bx + 122, 4, w - bx - 122 - 40, GX_CHROME_H - 8);
+	GrRect(dc, bx + 122, ny + 4, w - bx - 122 - 40, GX_CHROME_H - ny - 8);
 	if (gx.url_focus)
 		dc->color = de_theme.accent;
 	else
 		dc->color = de_theme.panel_edge;
-	GrRect(dc, bx + 122, 4, w - bx - 122 - 40, 1);
+	GrRect(dc, bx + 122, ny + 4, w - bx - 122 - 40, 1);
 	GrRect(dc, bx + 122, GX_CHROME_H - 5, w - bx - 122 - 40, 1);
-	GrRect(dc, bx + 122, 4, 1, GX_CHROME_H - 8);
-	GrRect(dc, w - 44, 4, 1, GX_CHROME_H - 8);
+	GrRect(dc, bx + 122, ny + 4, 1, GX_CHROME_H - ny - 8);
+	GrRect(dc, w - 44, ny + 4, 1, GX_CHROME_H - ny - 8);
 	StrPrint(buf, "%s", gx.url);
 	buf[ClampI64((w - bx - 130 - 44) / FONT_WIDTH, 0, 262)] = 0; //Clip to the box.
 	if (gx.url_focus && gx.url_selall)
 	{//Select-all highlight behind the text.
 		dc->color = de_theme.bttn_focus;
-		GrRect(dc, bx + 127, 6, StrLen(buf) * FONT_WIDTH + 2, GX_CHROME_H - 12);
+		GrRect(dc, bx + 127, ny + 6, StrLen(buf) * FONT_WIDTH + 2,
+			   GX_CHROME_H - ny - 12);
 	}
 	dc->color = de_theme.text;
 	GrPrint(dc, bx + 128, ty, "%s", buf);
@@ -1250,7 +1442,7 @@ U0 GxDrawChrome(CDC *dc)
 
 	//Go.
 	dc->color = de_theme.chip;
-	GrRect(dc, w - 36, 4, 32, GX_CHROME_H - 8);
+	GrRect(dc, w - 36, ny + 4, 32, GX_CHROME_H - ny - 8);
 	dc->color = de_theme.text;
 	GrPrint(dc, w - 32, ty, "Go");
 }
@@ -1401,18 +1593,18 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 				}
 				break;
 			case GXO_WIDGET:
+				//Corner radius: the page's border-radius if it set one, else a
+				//small default (2px) - NOT a pill. Only the site's own CSS makes
+				//a search box round.
+				wr = 2;
+				if (op->radius >= 0)
+					wr = MinI64(op->radius, op->h / 2);
 				if (op->wkind == GXW_SUBMIT || op->wkind == GXW_BUTTON)
-				{//Rounded button.
-					wr = MinI64(op->h / 2, 9);
 					GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
 								de_theme.bttn, de_theme.panel_edge);
-				}
 				else if (op->wkind == GXW_TEXT || op->wkind == GXW_AREA)
-				{//Rounded text field / search pill.
-					wr = MinI64(op->h / 2, 14);
 					GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
 								de_theme.win_bg, de_theme.panel_edge);
-				}
 				else
 				{//check / radio / select: keep the crisp square look.
 					dc->color = de_theme.win_bg;
@@ -1509,7 +1701,9 @@ U0 GxNavTo(U8 *target_new)
 //main task, not here).
 U8	*gx_fetch_body;
 I64	 gx_fetch_status;
+I64	 gx_fetch_len;	//Body byte count: image bodies are binary (NULs inside).
 Bool gx_fetch_html, gx_fetch_ok;
+Bool gx_fetch_img;	//Response IS an image (content-type / magic): view it.
 
 U0 GxJsReset()
 {//Stop the background script fetcher and drop queued/fetched scripts.
@@ -1559,12 +1753,15 @@ U0 GxFetchTask()
 
 	gx_fetch_body = NULL;
 	gx_fetch_status = 0;
+	gx_fetch_len = 0;
 	gx_fetch_html = TRUE;
+	gx_fetch_img = FALSE;
 	gx_fetch_ok = FALSE;
 	r = ZincNavFetch(gx.load_url); // POSTs the pending form body if one is queued
 	if (r && r->body)
 	{
 		gx_fetch_status = r->status;
+		gx_fetch_len = r->body_length;
 		gx_fetch_body = MAlloc(r->body_length + 1, sys_task);
 		MemCopy(gx_fetch_body, r->body, r->body_length + 1);
 		ct = HttpHeaderGet(r->headers, "Content-Type");
@@ -1572,9 +1769,23 @@ U0 GxFetchTask()
 		{
 			if (!StrIMatch("html", ct) && !StrIMatch("xhtml", ct))
 				gx_fetch_html = FALSE;
+			if (StrIMatch("image/", ct))
+				gx_fetch_img = TRUE; //incl. image/svg+xml
 			Free(ct);
 		}
-		if (!gx_fetch_html && gx_fetch_body[0] == '<')
+		//Magic-byte sniff: servers lie / omit content-type. PNG or JPEG body
+		//means "view the picture", whatever the headers said.
+		if (gx_fetch_len > 8)
+		{
+			if (gx_fetch_body[1] == 'P' && gx_fetch_body[2] == 'N' &&
+				gx_fetch_body[3] == 'G')
+				gx_fetch_img = TRUE;
+			else if (gx_fetch_body[0] == 0xFF && gx_fetch_body[1] == 0xD8)
+				gx_fetch_img = TRUE;
+		}
+		if (gx_fetch_img)
+			gx_fetch_html = FALSE;
+		else if (!gx_fetch_html && gx_fetch_body[0] == '<')
 			gx_fetch_html = TRUE;
 		gx_fetch_ok = TRUE;
 	}
@@ -1594,12 +1805,29 @@ U0 GxImgTask()
 
 	while (TRUE)
 	{
-		if (gx.busy || gx.loading)
+		//Gate on page teardown (gx.fetch) / body fetch (gx.loading) ONLY, NOT
+		//on gx.busy. v2 layout holds gx.busy for long, frequent windows; gating
+		//on it starved image fetches to one-per-relayout (images looked broken).
+		//Fetching alongside layout is safe: GxImgGet publishes new cache slots
+		//last (lock-free append) and the teardown at gx.fetch waits out img_busy
+		//before freeing the cache.
+		if (gx.fetch || gx.loading)
 		{
 			Sleep(30);
 			goto img_loop;
 		}
 		//Find a cache entry that still needs fetching (created during layout).
+		//Claim the cache for this whole find+fetch: the teardown (gx.fetch)
+		//waits out img_busy before GxImgCacheFree, so raising it BEFORE the scan
+		//keeps the free from yanking slots mid-iteration now that we run
+		//concurrently with layout.
+		gx.img_busy = TRUE;
+		if (gx.fetch || gx.loading)
+		{//Teardown raced in after the gate above; back off before touching cache.
+			gx.img_busy = FALSE;
+			Sleep(30);
+			goto img_loop;
+		}
 		ce = NULL;
 		for (i = 0; i < gx.img_count; i++)
 			if (!gx.img[i].fetched)
@@ -1609,11 +1837,11 @@ U0 GxImgTask()
 			}
 		if (!ce)
 		{
+			gx.img_busy = FALSE;
 			Sleep(80);
 			goto img_loop;
 		}
 		ce->fetched = TRUE; //Mark first: fetch once even on failure.
-		gx.img_busy = TRUE; //Cache must not be freed under us now.
 		if (!StrNICompare(ce->url, "http", 4))
 		{
 			r = HttpGet(ce->url);
@@ -1787,12 +2015,161 @@ U0 GxFieldDel(I64 at)
 	gx.field_buf[--gx.field_len] = 0;
 }
 
+//--- Tabs --------------------------------------------------------------------
+//The engine keeps ONE live page (zinc_dom/zinc_js/CSS arrays/history). A tab
+//switch parks that state in gx.tab[] and swaps another tab's state in, then
+//relayouts from the restored DOM (ops are never saved: they may reference
+//image DCs the shared cache has since dropped).
+
+U0 GxTabSaveCur(U8 *current)
+{//Park the live page into the current tab slot.
+	CGxTab *t = &gx.tab[gx.tab_cur];
+	I64		i;
+
+	gx.busy = TRUE;
+	GxOpsReset;		//Commits any focused field; empties the display list.
+	gx.hover_href = NULL;
+	t->used = TRUE;
+	Free(t->url);
+	t->url = StrNew(current);
+	t->scroll = gx.scroll;
+	t->dom = zinc_dom;
+	zinc_dom = NULL;
+	t->js = zinc_js;
+	zinc_js = NULL;
+	MemCopy(&t->base, &zinc_base, sizeof(CHttpUrl));
+	t->base_ok = zinc_base_ok;
+	t->css = ZCssStateSave;
+	ZCssReset;
+	t->iv_dc = gx.iv_dc;
+	gx.iv_dc = NULL;
+	t->iv_one2one = gx.iv_one2one;
+	gx.iv_one2one = FALSE;
+	if (gx.iv_sc)
+	{//The fit copy is cheap; the loader relayout would rebuild it anyway.
+		DCDel(gx.iv_sc);
+		gx.iv_sc = NULL;
+	}
+	for (i = 0; i < zinc_back_count; i++)
+		t->back[i] = zinc_back[i];
+	t->back_count = zinc_back_count;
+	zinc_back_count = 0;
+	for (i = 0; i < zinc_fwd_count; i++)
+		t->fwd[i] = zinc_fwd[i];
+	t->fwd_count = zinc_fwd_count;
+	zinc_fwd_count = 0;
+	GxJsReset;		//Still-pending external scripts are dropped (ran ones live
+					//on inside the parked interpreter).
+	gx.busy = FALSE;
+}
+
+U8 *GxTabLoadCur()
+{//Swap the current tab slot's parked page into the engine. Returns the new
+//"current" URL (caller owns it).
+	CGxTab *t = &gx.tab[gx.tab_cur];
+	U8	   *cur;
+	I64		i, view_h;
+
+	zinc_dom = t->dom;
+	t->dom = NULL;
+	zinc_js = t->js;
+	t->js = NULL;
+	MemCopy(&zinc_base, &t->base, sizeof(CHttpUrl));
+	zinc_base_ok = t->base_ok;
+	ZCssStateLoad(t->css); //NULL-safe; frees the blob.
+	t->css = NULL;
+	gx.iv_dc = t->iv_dc;
+	t->iv_dc = NULL;
+	gx.iv_one2one = t->iv_one2one;
+	for (i = 0; i < t->back_count; i++)
+		zinc_back[i] = t->back[i];
+	zinc_back_count = t->back_count;
+	t->back_count = 0;
+	for (i = 0; i < t->fwd_count; i++)
+		zinc_fwd[i] = t->fwd[i];
+	zinc_fwd_count = t->fwd_count;
+	t->fwd_count = 0;
+	cur = t->url;
+	t->url = NULL;
+	if (!cur)
+		cur = StrNew("zinc:welcome");
+	GxUrlSet(cur);
+	zinc_note[0] = 0;
+	if (t->title[0])
+		StrPrint(Fs->task_title, "GX:%s", t->title);
+	else
+		StrCopy(Fs->task_title, "ZincGX");
+	GxLayout;		//Rebuild ops from the restored DOM; cached images
+					//re-resolve, evicted ones re-queue for the image task.
+	view_h = Fs->pix_height - GX_CHROME_H - GX_STATUS_H;
+	gx.scroll = ClampI64(t->scroll, 0, MaxI64(0, gx.doc_h - view_h));
+
+	return cur;
+}
+
+U0 GxTabFree(CGxTab *t)
+{//Free a PARKED (background) tab's page outright (tab close).
+	I64 i;
+
+	Free(t->url);
+	t->url = NULL;
+	if (t->js)
+		JsInterpFree(t->js);
+	t->js = NULL;
+	if (t->dom)
+		ZNodeFree(t->dom);
+	t->dom = NULL;
+	Free(t->css);
+	t->css = NULL;
+	if (t->iv_dc)
+		DCDel(t->iv_dc);
+	t->iv_dc = NULL;
+	for (i = 0; i < t->back_count; i++)
+		Free(t->back[i]);
+	t->back_count = 0;
+	for (i = 0; i < t->fwd_count; i++)
+		Free(t->fwd[i]);
+	t->fwd_count = 0;
+	t->title[0] = 0;
+	t->used = FALSE;
+}
+
+U0 GxTabClick(I64 x)
+{//Hit-test the tab strip: switch, close (right edge of a tab), or new (+).
+	I64 i, x0 = 4;
+
+	for (i = 0; i < GX_TABS; i++)
+	{
+		if (!gx.tab[i].used)
+			goto gx_tab_next;
+		if (x0 <= x < x0 + GX_TAB_W)
+		{
+			if (x >= x0 + GX_TAB_W - 16)
+				gx.tab_close = i;
+			else
+				gx.tab_go = i;
+			return;
+		}
+		x0 += GX_TAB_W + 2;
+gx_tab_next:;
+	}
+	if (x0 <= x < x0 + 22)
+		gx.tab_new = TRUE;
+}
+
 U0 GxClickContent(I64 x, I64 y)
 {
 	I64	 i, cy = y - GX_CHROME_H + gx.scroll;
 	CGxOp *op;
 	U8	*s, *sub;
 
+	if (gx.iv_dc)
+	{//Direct image view: any content click toggles fit <-> actual size.
+		gx.iv_one2one = !gx.iv_one2one;
+		gx.scroll = 0;
+		gx.relayout = TRUE;
+		return;
+	}
 	GxFieldBlur; //clicking anywhere commits/leaves the current field; a text
 	             //field hit below re-focuses via GxFieldFocus.
 	for (i = 0; i < gx.op_count; i++)
@@ -2007,6 +2384,13 @@ U0 GxClick(I64 x, I64 y)
 	I64 w = Fs->pix_width, view_h = Fs->pix_height - GX_CHROME_H - GX_STATUS_H;
 	I64 th, tyy;
 
+	if (y < GX_TAB_H)
+	{//Tab strip.
+		GxFieldBlur;
+		gx.url_focus = FALSE;
+		GxTabClick(x);
+		return;
+	}
 	if (y < GX_CHROME_H)
 	{//Chrome.
 		GxFieldBlur; //any chrome click leaves an inline field
@@ -2044,13 +2428,17 @@ U0 GxClick(I64 x, I64 y)
 public U0 ZincGX(U8 *start_url=NULL)
 {
 	U8	*current, *target, *sub;
-	I64	 msg, a1, a2, view_h, vi, nav_chain = 0, cancel_deadline = 0;
+	I64	 msg, a1, a2, view_h, vi, nav_chain = 0, cancel_deadline = 0, ti, tn;
 	U8	 title[80];
 
 	MemSet(&gx, 0, sizeof(CGxGlobals));
 	gx.ops = CAlloc(sizeof(CGxOp) * GX_OPS_MAX);
 	gx.fetch = TRUE;
 	gx.last_wheel = mouse.pos.z;
+	gx.tab_cur = 0;
+	gx.tab[0].used = TRUE;
+	gx.tab_go = -1;
+	gx.tab_close = -1;
 	http_pool_task = Fs; //this task is persistent: it alone may keep-alive.
 					     //Spawned/killable fetch tasks never pool (their socket
 					     //would dangle when the task dies -> RX-interrupt crash).
@@ -2094,6 +2482,7 @@ public U0 ZincGX(U8 *start_url=NULL)
 			while (gx.img_busy) //Wait out any in-flight image fetch.
 				Sleep(5);
 			GxImgCacheFree; //New page: drop old decoded images.
+			GxImgViewFree;	//New page: leave any direct-image view.
 			GxJsReset;		//New page: drop queued/fetched external scripts.
 			zinc_note[0] = 0;
 			DocClear(Fs->display_doc);
@@ -2107,6 +2496,15 @@ public U0 ZincGX(U8 *start_url=NULL)
 				else
 					ZincSetPage(current, zinc_welcome);
 				zinc_base_ok = FALSE;
+			}
+			else if (!StrNICompare(current, "data:", 5))
+			{//Inline data: URI (usually an image blob a page linked to):
+			//decode locally, no network at all.
+				ZincSetPlainPage(current, "");
+				zinc_base_ok = FALSE;
+				gx.iv_dc = GxImgViewCap(DataURIToDC(current, sys_task));
+				if (!gx.iv_dc)
+					StrCopy(zinc_note, "data: URI: not a decodable image.");
 			}
 			else
 			{//Network fetch runs in a child so ESC / Stop can cancel it. The
@@ -2123,7 +2521,7 @@ public U0 ZincGX(U8 *start_url=NULL)
 					while (msg = MessageScan(&a1, &a2))
 						if (msg == MESSAGE_MS_L_DOWN)
 						{//Stop button lives where Reload normally is.
-							if (a2 < GX_CHROME_H && 64 <= a1 < 90)
+							if (GX_TAB_H <= a2 < GX_CHROME_H && 64 <= a1 < 90)
 								gx.cancel = TRUE;
 						}
 						else if (msg == MESSAGE_KEY_DOWN && (a1 == CH_ESC || a1 == CH_SHIFT_ESC))
@@ -2166,7 +2564,16 @@ public U0 ZincGX(U8 *start_url=NULL)
 					if (gx_fetch_status != 200)
 						StrPrint(zinc_note, "HTTP status %d", gx_fetch_status);
 					zinc_base_ok = (HttpUrlParse(current, &zinc_base) >= 0);
-					if (gx_fetch_html)
+					if (gx_fetch_img)
+					{//The URL IS a picture: show it in the image view.
+						ZincSetPlainPage(current, "");
+						gx.iv_dc = GxImgViewDecode(gx_fetch_body, gx_fetch_len);
+						if (!gx.iv_dc)
+							StrCopy(zinc_note,
+								"Image format unsupported (progressive JPEG / "
+								"GIF / WebP not decodable yet).");
+					}
+					else if (gx_fetch_html)
 						ZincSetPage(current, gx_fetch_body);
 					else
 						ZincSetPlainPage(current, gx_fetch_body);
@@ -2203,11 +2610,86 @@ public U0 ZincGX(U8 *start_url=NULL)
 					StrPrint(Fs->task_title, "GX:%s", title);
 				else
 					StrCopy(Fs->task_title, "ZincGX");
+				title[44] = 0; //Tab strip label (CGxTab.title is 48).
+				StrCopy(gx.tab[gx.tab_cur].title, title);
 				if (zinc_js_queue_count && !gx.js_task)
 					gx.js_task = Spawn(&GxJsFetchTask, NULL, "ZincGX JS", 4);
 			}
 			if (gx.fetch)
 				goto gx_next;
+		}
+
+		//Tab strip requests (set by GxTabClick).
+		if (gx.tab_new || gx.tab_go >= 0 || gx.tab_close >= 0)
+		{
+			if (gx.tab_new)
+			{
+				ti = -1;
+				for (tn = 0; tn < GX_TABS; tn++)
+					if (ti < 0 && !gx.tab[tn].used)
+						ti = tn;
+				if (ti >= 0)
+				{
+					GxTabSaveCur(current);
+					Free(current);
+					gx.tab_cur = ti;
+					gx.tab[ti].used = TRUE;
+					gx.tab[ti].title[0] = 0;
+					current = StrNew("zinc:welcome");
+					gx.fetch = TRUE; //Loads the welcome page into the new tab.
+				}
+			}
+			else if (gx.tab_go >= 0)
+			{
+				if (gx.tab_go != gx.tab_cur && gx.tab_go < GX_TABS &&
+					gx.tab[gx.tab_go].used)
+				{
+					GxTabSaveCur(current);
+					Free(current);
+					gx.tab_cur = gx.tab_go;
+					current = GxTabLoadCur;
+				}
+			}
+			else if (gx.tab_close < GX_TABS && gx.tab[gx.tab_close].used)
+			{
+				tn = 0;
+				for (ti = 0; ti < GX_TABS; ti++)
+					if (gx.tab[ti].used)
+						tn++;
+				if (tn > 1)
+				{//The last tab can't be closed (use the window close for that).
+					if (gx.tab_close == gx.tab_cur)
+					{//Close the LIVE tab: tear its page down, hop to another.
+						gx.busy = TRUE;
+						GxOpsReset;
+						while (gx.img_busy)
+							Sleep(5);
+						GxImgViewFree;
+						GxJsReset;
+						ZincPageFree;
+						gx.busy = FALSE;
+						while (zinc_back_count)
+							Free(zinc_back[--zinc_back_count]);
+						while (zinc_fwd_count)
+							Free(zinc_fwd[--zinc_fwd_count]);
+						Free(current);
+						gx.tab[gx.tab_cur].used = FALSE;
+						gx.tab[gx.tab_cur].title[0] = 0;
+						ti = 0;
+						for (tn = GX_TABS - 1; tn >= 0; tn--)
+							if (gx.tab[tn].used)
+								ti = tn;
+						gx.tab_cur = ti;
+						current = GxTabLoadCur;
+					}
+					else
+						GxTabFree(&gx.tab[gx.tab_close]);
+				}
+			}
+			gx.tab_new = FALSE;
+			gx.tab_go = -1;
+			gx.tab_close = -1;
+			goto gx_next;
 		}
 
 		//Deferred navigation from click handlers.
@@ -2537,6 +3019,10 @@ gx_next:
 	zinc_defer_ext_js = FALSE; //classic Zinc keeps its blocking fetches
 	GxOpsReset;
 	GxImgCacheFree;
+	GxImgViewFree;
+	for (ti = 0; ti < GX_TABS; ti++)
+		if (ti != gx.tab_cur)
+			GxTabFree(&gx.tab[ti]);
 	Free(gx.ops);
 	ZincPageFree;
 	Free(current);

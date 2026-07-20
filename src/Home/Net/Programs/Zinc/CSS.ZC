@@ -180,6 +180,11 @@ U8	zcss_var_name[ZCSS_VAR_MAX][40];
 U8	zcss_var_val[ZCSS_VAR_MAX][144];
 I64 zcss_var_count = 0; // reset per page; JIT does not zero plain globals
 
+// 1rem in px. Default 16, but pages routinely rebase it: wikipedia's
+// html{font-size:62.5%} makes 1rem = 10px so "5.46rem" sizes are decimal-
+// friendly. Set at rule-add time from an html/:root font-size; reset per page.
+public I64 zcss_rem_px = 16;
+
 U8 *ZCssVarGet(U8 *name)
 {
 	I64 i;
@@ -311,7 +316,54 @@ U0 ZCssReset()
 {
 	zcss_rule_count = 0;
 	zcss_var_count = 0;
+	zcss_rem_px = 16; // page may rebase via html{font-size:%}
 	zh_dom_gen++; // stylesheet set changed: invalidate memoized styles
+}
+
+//Whole-engine state snapshot, for browser tabs: a background tab keeps its
+//parsed rules + custom properties while another page owns the live arrays.
+//Rules embed no pointers (fixed char arrays), so a flat copy is complete.
+
+public U8 *ZCssStateSave()
+{ // snapshot rules+vars into one MAlloc'd blob; ZCssStateLoad consumes it
+	I64	 rsz = zcss_rule_count * sizeof(CZCssRule);
+	I64	 nsz = zcss_var_count * 40, vsz = zcss_var_count * 144;
+	U8	*b = MAlloc(24 + rsz + nsz + vsz), *p = b + 24;
+	I64	*hdr = b;
+
+	hdr[0] = zcss_rule_count;
+	hdr[1] = zcss_var_count;
+	hdr[2] = zcss_rem_px; // inline style= attrs parse lazily at layout time
+	MemCopy(p, zcss_rules, rsz);
+	p += rsz;
+	MemCopy(p, zcss_var_name, nsz);
+	p += nsz;
+	MemCopy(p, zcss_var_val, vsz);
+
+	return b;
+}
+
+public U0 ZCssStateLoad(U8 *b)
+{ // restore a ZCssStateSave blob into the live arrays and free it
+	I64	*hdr = b;
+	I64	 rsz, nsz, vsz;
+	U8	*p = b + 24;
+
+	if (!b)
+		return;
+	zcss_rule_count = ClampI64(hdr[0], 0, ZCSS_MAX_RULES);
+	zcss_var_count	= ClampI64(hdr[1], 0, ZCSS_VAR_MAX);
+	zcss_rem_px		= ClampI64(hdr[2], 4, 64);
+	rsz = zcss_rule_count * sizeof(CZCssRule);
+	nsz = zcss_var_count * 40;
+	vsz = zcss_var_count * 144;
+	MemCopy(zcss_rules, p, rsz);
+	p += rsz;
+	MemCopy(zcss_var_name, p, nsz);
+	p += nsz;
+	MemCopy(zcss_var_val, p, vsz);
+	zh_dom_gen++; // restored sheet set: invalidate memoized styles
+	Free(b);
 }
 
 /* ---- color parsing ---- */
@@ -555,6 +607,32 @@ I64 ZCssColor(U8 *val)
 
 /* ---- lengths ---- */
 
+I64 ZCssPct(U8 *val)
+{ // "60%" -> 60; -1 if not a plain percentage
+	I64	 n = 0;
+	Bool any = FALSE;
+	U8	*p = val;
+
+	while (*p == ' ' || *p == '\t')
+		p++;
+	while ('0' <= *p <= '9')
+	{
+		n = n * 10 + *p - '0';
+		any = TRUE;
+		p++;
+	}
+	if (*p == '.')
+	{ // ignore the fraction: whole percent is plenty for layout
+		p++;
+		while ('0' <= *p <= '9')
+			p++;
+	}
+	if (!any || *p != '%')
+		return -1;
+
+	return n;
+}
+
 I64 ZCssPx(U8 *val)
 { // CSS length -> px; -1 if unparsable/percent; negatives clamp to 0
 	I64	 ip = 0, frac = 0, fdiv = 1;
@@ -599,7 +677,7 @@ I64 ZCssPx(U8 *val)
 	if (!StrNICompare(p, "pt", 2))
 		return ip * 4 / 3;
 	if (!StrNICompare(p, "rem", 3))
-		return ip * 16 + frac * 16 / fdiv;
+		return ip * zcss_rem_px + frac * zcss_rem_px / fdiv;
 	if (!StrNICompare(p, "em", 2))
 		return ip * 16 + frac * 16 / fdiv;
 	if (!StrNICompare(p, "vh", 2) || !StrNICompare(p, "vw", 2) ||
@@ -1036,22 +1114,41 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 			out->pos = 0; // static / sticky flow normally
 	}
 	else if (!StrICompare(name, "top"))
-	{
+	{//Percent offsets (top:20%) encode as -(2000+p): resolved against the
+	//containing block at layout time (wikipedia rings its globe this way).
 		n = ZCssPx(val);
 		if (0 <= n <= 4000)
 			out->off_t = n;
+		else
+		{
+			n = ZCssPct(val);
+			if (0 <= n <= 100)
+				out->off_t = -(2000 + n);
+		}
 	}
 	else if (!StrICompare(name, "left"))
 	{
 		n = ZCssPx(val);
 		if (0 <= n <= 4000)
 			out->off_l = n;
+		else
+		{
+			n = ZCssPct(val);
+			if (0 <= n <= 100)
+				out->off_l = -(2000 + n);
+		}
 	}
 	else if (!StrICompare(name, "right"))
 	{
 		n = ZCssPx(val);
 		if (0 <= n <= 4000)
 			out->off_r = n;
+		else
+		{
+			n = ZCssPct(val);
+			if (0 <= n <= 100)
+				out->off_r = -(2000 + n);
+		}
 	}
 	else if (!StrICompare(name, "padding-top"))
 	{
@@ -1369,6 +1466,12 @@ U0 ZCssRuleAdd(U8 *sel, U8 *sel_end, CZStyle *style)
 		rule->spec = 1; // bare '*'
 
 	MemCopy(&rule->style, style, sizeof(CZStyle));
+	//A root font-size rebases rem for every later length in the sheet.
+	if (style->fsize > 0 && !rule->sel_class[0] && !rule->sel_id[0] &&
+		!rule->has_anc &&
+		(!StrICompare(rule->sel_tag, "html") ||
+		 !StrICompare(rule->sel_tag, ":root")))
+		zcss_rem_px = style->fsize;
 	zcss_rule_count++;
 	zh_dom_gen++; // new rule: memoized computed styles are stale
 }

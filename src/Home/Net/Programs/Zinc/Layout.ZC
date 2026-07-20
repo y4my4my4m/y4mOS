@@ -114,8 +114,9 @@ Bool L2Handles(CZNode *node, CZStyle *author)
 		return FALSE;
 	if (author->display == ZCSS_DISP_FLEX)
 		return TRUE;
-	if (author->pos == 2 || author->pos == 3)
-		return TRUE; // absolute/fixed need the v2 out-of-flow path
+	if (author->pos >= 1)
+		return TRUE; // relative establishes a containing block; absolute/fixed
+					 // need the v2 out-of-flow + containing-block positioning
 	if (author->display == ZCSS_DISP_BLOCK)
 		return TRUE;
 	if (author->display == ZCSS_DISP_INLINE)
@@ -336,6 +337,15 @@ U0 L2FlexRow(CZNode *node, CZStyle *style, CZStyle *author)
 
 /* ---- block box ---- */
 
+I64 L2OffPx(I64 off, I64 span)
+{//Decode a CZStyle position offset: >= 0 is px; -(2000+p) is p percent of the
+//containing-block span (see the top/left/right parsers in CSS.ZC).
+	if (off <= -2000)
+		return span * (-off - 2000) / 100;
+
+	return off;
+}
+
 U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 {
 	CZStyle	 kid;
@@ -344,11 +354,18 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	I64		 mt_eff, mb_eff, ml_eff, mr_eff, pt_eff, pb_eff, pl_eff, pr_eff;
 	I64		 box_op, op0, avail, bw, center_add, save_wrap, save_wrap2;
 	I64		 box_y0, dx, dy, mw, mh, x0, saved_y, saved_indent, saved_wrapa;
-	Bool	 boxed, is_body, is_abs, is_flex;
+	I64		 save_cbx, save_cby, save_cbw, save_cbh;
+	Bool	 boxed, is_body, is_abs, is_flex, is_posn;
 
 	is_body = L2IsBody(node->tag);
 	is_flex = author->display == ZCSS_DISP_FLEX && author->flex_col != 1;
 	is_abs	= author->pos == 2 || author->pos == 3;
+	is_posn	= author->pos >= 1; // relative/absolute/fixed establish a containing
+								// block for descendant abs elements
+	save_cbx = gx.cb_x;
+	save_cby = gx.cb_y;
+	save_cbw = gx.cb_w;
+	save_cbh = gx.cb_h;
 
 	GxRunFlush;
 	if (gx.x > GX_MARGIN + gx.indent)
@@ -406,11 +423,14 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	saved_indent = 0;
 	saved_wrapa = 0;
 	if (is_abs)
-	{ // out of flow: position against the page, consume no flow height
+	{ // out of flow: position against the CONTAINING BLOCK, no flow height.
+	  // gx.cb_* is the nearest positioned ancestor's content origin+width, so
+	  // e.g. Wikipedia's absolutely-placed language boxes land around their
+	  // centered container instead of piling up on the page's left edge.
 		saved_y		 = gx.y;
 		saved_indent = gx.indent;
 		saved_wrapa	 = gx.wrap_w;
-		avail = l2_root_wrap - GX_MARGIN;
+		avail = gx.cb_w;
 		if (avail < 60)
 			avail = 60;
 		bw = 0;
@@ -426,23 +446,19 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 		if (bw < 40)
 			bw = 40;
 		if (author->off_l > ZCSS_OFF_UNSET)
-			x0 = GX_MARGIN + author->off_l;
+			x0 = gx.cb_x + L2OffPx(author->off_l, gx.cb_w);
 		else if (author->off_r > ZCSS_OFF_UNSET)
-			x0 = l2_root_wrap - author->off_r - bw;
+			x0 = gx.cb_x + gx.cb_w - L2OffPx(author->off_r, gx.cb_w) - bw;
 		else
-			x0 = GX_MARGIN;
+			x0 = gx.cb_x;
 		if (x0 < 0)
 			x0 = 0;
 		gx.indent = x0 - GX_MARGIN;
 		gx.wrap_w = x0 + bw;
-		// Anchor to the CURRENT flow position (not the document top): we do not
-		// track positioned ancestors, and abs/fixed elements sit near their DOM
-		// position in practice. This keeps full-page inset:0 wrappers from all
-		// stacking at y=8 (overlap) while still taking no flow height.
-		if (author->off_t > 0)
-			gx.y = saved_y + author->off_t;
-		// else: leave gx.y = saved_y (drawn where it appears; content that
-		// follows in source order paints on top, so backgrounds land behind)
+		if (author->off_t > ZCSS_OFF_UNSET) // % resolves against the CB height
+			gx.y = gx.cb_y + L2OffPx(author->off_t, gx.cb_h);
+		else
+			gx.y = saved_y; // no offset: draw where it appears in flow
 		gx.x = GX_MARGIN + gx.indent;
 	}
 	else
@@ -498,6 +514,19 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	gx.y += pt_eff;
 	gx.x = GX_MARGIN + gx.indent;
 
+	if (is_posn)
+	{ // this element is the containing block for its absolute descendants
+		gx.cb_x = GX_MARGIN + gx.indent;
+		gx.cb_y = gx.y;
+		gx.cb_w = gx.wrap_w - (GX_MARGIN + gx.indent);
+		if (gx.cb_w < 40)
+			gx.cb_w = 40;
+		//Percent top offsets need the CB height: knowable up front only from
+		//an explicit CSS height (wikipedia's globe ring sets 32.5rem). 0 =
+		//unknown; top:N% then degrades to the container top.
+		gx.cb_h = MaxI64(0, author->height);
+	}
+
 	if (is_flex)
 		L2FlexRow(node, style, author);
 	else
@@ -509,6 +538,11 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 			child = child->next;
 		}
 	}
+
+	gx.cb_x = save_cbx; // restore the parent containing block
+	gx.cb_y = save_cby;
+	gx.cb_w = save_cbw;
+	gx.cb_h = save_cbh;
 
 	GxRunFlush;
 	if (gx.x > GX_MARGIN + gx.indent)
@@ -546,11 +580,11 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 			dx = 0;
 			dy = 0;
 			if (author->off_l > ZCSS_OFF_UNSET)
-				dx = author->off_l;
+				dx = L2OffPx(author->off_l, gx.cb_w);
 			else if (author->off_r > ZCSS_OFF_UNSET)
-				dx = -author->off_r;
+				dx = -L2OffPx(author->off_r, gx.cb_w);
 			if (author->off_t > ZCSS_OFF_UNSET)
-				dy = author->off_t;
+				dy = L2OffPx(author->off_t, gx.cb_h);
 			if (dx || dy)
 			{
 				for (bw = op0; bw < gx.op_count; bw++)

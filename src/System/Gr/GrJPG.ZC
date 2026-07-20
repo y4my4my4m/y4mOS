@@ -1,7 +1,9 @@
-//Native baseline JPEG (JFIF/EXIF) decoder for YDE. Pure ZealC - no ELF.
-//Supports: baseline + extended sequential DCT (SOF0/SOF1), 8-bit, grayscale
-//or YCbCr, chroma subsampling 4:4:4 / 4:2:2 / 4:4:0 / 4:2:0, restart markers.
-//NOT supported (returns NULL): progressive (SOF2), arithmetic coding, 12-bit,
+//Native JPEG (JFIF/EXIF) decoder for YDE. Pure ZealC - no ELF.
+//Supports: baseline + extended sequential DCT (SOF0/SOF1) AND progressive
+//(SOF2: spectral selection + successive approximation, DC/AC first and
+//refinement scans, EOB runs), 8-bit, grayscale or YCbCr, chroma subsampling
+//4:4:4 / 4:2:2 / 4:4:0 / 4:2:0, restart markers.
+//NOT supported (returns NULL): arithmetic coding, hierarchical, 12-bit,
 //CMYK. Callers fall back to a placeholder.
 //
 //API mirrors GrPNG.ZC:
@@ -56,6 +58,10 @@ class CJpgComp
 	I64	dc_pred;
 	I64	pw, ph;				//Plane dims.
 	U8 *plane;
+	//Progressive: coefficients accumulate across scans, IDCT runs at the end.
+	I16 *coef;				//bw*bh blocks x 64 coefs, in ZIGZAG order.
+	I64	 bw, bh;			//Block grid dims (MCU-padded; storage stride).
+	I64	 ncw, nch;			//Blocks actually coded by non-interleaved scans.
 };
 
 class CJpg
@@ -69,6 +75,8 @@ class CJpg
 	I64		 quant[4][64];
 	CJpgHuff hdc[4], hac[4];
 	I64		 hmax, vmax, mcux, mcuy;
+	Bool	 progressive;	//SOF2: coefficients built up over several scans.
+	I64		 eobrun;		//Progressive AC scans: pending end-of-band run.
 };
 
 I64 JpgBit(CJpg *j)
@@ -135,11 +143,33 @@ I64 JpgHuffDecode(CJpg *j, CJpgHuff *h)
 	return -1;
 }
 
+U0 JpgIdct(I64 *coef, F64 *pix)
+{//Separable 2D IDCT: natural-order dequantized coef[64] -> spatial pix[64].
+	I64 i, k, r;
+	F64 tmp[64], sum;
+
+	for (i = 0; i < 8; i++)		//i = row y.
+		for (k = 0; k < 8; k++)	//k = column x.
+		{
+			sum = 0;
+			for (r = 0; r < 8; r++)
+				sum += coef[i * 8 + r] * jpg_idct_tab[k][r];
+			tmp[i * 8 + k] = sum;
+		}
+	for (i = 0; i < 8; i++)		//i = column x.
+		for (k = 0; k < 8; k++)	//k = row y.
+		{
+			sum = 0;
+			for (r = 0; r < 8; r++)
+				sum += tmp[r * 8 + i] * jpg_idct_tab[k][r];
+			pix[k * 8 + i] = sum;
+		}
+}
+
 Bool JpgDecodeBlock(CJpg *j, CJpgComp *c, F64 *pix)
 {//One 8x8 block: huffman -> dequant -> dezigzag -> IDCT into pix[64].
 	I64	 i, k, s, r, diff, zz;
 	I64	 coef[64];
-	F64	 tmp[64], sum;
 	I64	*q = &j->quant[c->tq][0];
 
 	MemSet(coef, 0, sizeof(coef));
@@ -177,23 +207,7 @@ Bool JpgDecodeBlock(CJpg *j, CJpgComp *c, F64 *pix)
 		}
 	}
 
-	//Separable IDCT: rows then columns.
-	for (i = 0; i < 8; i++)		//i = row y.
-		for (k = 0; k < 8; k++)	//k = column x.
-		{
-			sum = 0;
-			for (r = 0; r < 8; r++)
-				sum += coef[i * 8 + r] * jpg_idct_tab[k][r];
-			tmp[i * 8 + k] = sum;
-		}
-	for (i = 0; i < 8; i++)		//i = column x.
-		for (k = 0; k < 8; k++)	//k = row y.
-		{
-			sum = 0;
-			for (r = 0; r < 8; r++)
-				sum += tmp[r * 8 + i] * jpg_idct_tab[k][r];
-			pix[k * 8 + i] = sum;
-		}
+	JpgIdct(coef, pix);
 
 	return TRUE;
 }
@@ -244,6 +258,312 @@ Bool JpgHuffBuild(CJpgHuff *h, U8 *counts, U8 *syms, I64 nsyms)
 	h->defined = TRUE;
 
 	return TRUE;
+}
+
+//--- Progressive (SOF2) ------------------------------------------------------
+//Coefficients are decoded over several scans into per-component I16 arrays
+//(zigzag order), then dequantized + IDCT'ed once at the end.
+
+U0 JpgRestartSync(CJpg *j)
+{//Byte-align at a restart: consume an RSTn marker; a real marker ends the scan.
+	j->bitcnt = 0;
+	j->hit_marker = FALSE;
+	while (j->p + 1 < j->end)
+	{
+		if (j->p[0] == 0xFF && j->p[1] != 0x00)
+		{
+			if (0xD0 <= j->p[1] <= 0xD7)
+				j->p += 2;
+			else
+				j->hit_marker = TRUE; //Not a restart: leave p ON the marker.
+			return;
+		}
+		j->p++;
+	}
+}
+
+Bool JpgProgDCFirst(CJpg *j, CJpgComp *c, I16 *cf, I64 al)
+{//DC first scan (Ah=0): normal DC diff, scaled up by the approximation shift.
+	I64 s, diff;
+
+	s = JpgHuffDecode(j, &j->hdc[c->td]);
+	if (s < 0 || s > 11)
+		return FALSE;
+	diff = JpgExtend(JpgBits(j, s), s);
+	c->dc_pred += diff;
+	cf[0] = c->dc_pred << al;
+
+	return TRUE;
+}
+
+Bool JpgProgDCRefine(CJpg *j, I16 *cf, I64 al)
+{//DC refinement scan (Ah>0): one correction bit per block.
+	if (JpgBit(j))
+		cf[0] = cf[0] | 1 << al;
+
+	return TRUE;
+}
+
+Bool JpgProgACFirst(CJpg *j, CJpgComp *c, I16 *cf, I64 ss, I64 se, I64 al)
+{//AC first scan (Ah=0) for one block: run-length + EOB-run coding.
+	I64 k, s, r;
+
+	if (j->eobrun)
+	{//This block (and maybe more) has no coefficients in this band.
+		j->eobrun--;
+		return TRUE;
+	}
+	k = ss;
+	while (k <= se)
+	{
+		s = JpgHuffDecode(j, &j->hac[c->ta]);
+		if (s < 0)
+			return FALSE;
+		r = s >> 4;
+		s = s & 0xF;
+		if (s)
+		{
+			k += r;
+			if (k > se)
+				return FALSE;
+			cf[k] = JpgExtend(JpgBits(j, s), s) << al;
+			k++;
+		}
+		else if (r == 15)
+			k += 16;			//ZRL: sixteen zeros.
+		else
+		{//EOB run: this block done; the next (eobrun) blocks are empty too.
+			j->eobrun = 1 << r;
+			if (r)
+				j->eobrun += JpgBits(j, r);
+			j->eobrun--;		//Counts THIS block as well.
+			break;
+		}
+	}
+
+	return TRUE;
+}
+
+Bool JpgProgACRefine(CJpg *j, CJpgComp *c, I16 *cf, I64 ss, I64 se, I64 al)
+{//AC refinement scan (Ah>0) for one block: new +-1 coefficients at bit Al,
+//plus one correction bit for every already-nonzero coefficient passed.
+	I64 k, s, r;
+	I64 p1 = 1 << al, m1 = -(1 << al);
+
+	k = ss;
+	if (!j->eobrun)
+	{
+		while (k <= se)
+		{
+			s = JpgHuffDecode(j, &j->hac[c->ta]);
+			if (s < 0)
+				return FALSE;
+			r = s >> 4;
+			s = s & 0xF;
+			if (s)
+			{//A newly nonzero coefficient: value is +-(1 << Al).
+				if (JpgBit(j))
+					s = p1;
+				else
+					s = m1;
+			}
+			else if (r != 15)
+			{//EOB run: switch to the correction-only phase below.
+				j->eobrun = 1 << r;
+				if (r)
+					j->eobrun += JpgBits(j, r);
+				break;
+			}
+			//Advance over r zero-history coefficients; nonzero ones passed on
+			//the way each carry one correction bit. (r=15 + s=0 is ZRL: skip
+			//sixteen zero-history coefficients.)
+			while (k <= se)
+			{
+				if (cf[k])
+				{
+					if (JpgBit(j) && !(cf[k] & p1))
+					{
+						if (cf[k] >= 0)
+							cf[k] += p1;
+						else
+							cf[k] += m1;
+					}
+				}
+				else
+				{
+					r--;
+					if (r < 0)
+						break;	//Reached the target zero coefficient.
+				}
+				k++;
+			}
+			if (s && k <= se)
+				cf[k] = s;		//Place the new coefficient.
+			k++;
+		}
+	}
+	if (j->eobrun)
+	{//End-of-band phase: only correction bits for remaining nonzero coefs.
+		while (k <= se)
+		{
+			if (cf[k])
+			{
+				if (JpgBit(j) && !(cf[k] & p1))
+				{
+					if (cf[k] >= 0)
+						cf[k] += p1;
+					else
+						cf[k] += m1;
+				}
+			}
+			k++;
+		}
+		j->eobrun--;
+	}
+
+	return TRUE;
+}
+
+Bool JpgProgScanRun(CJpg *j, I64 *sci, I64 scnt, I64 ss, I64 se, I64 ah, I64 al)
+{//Decode one progressive scan's entropy data. sci = scan component indices.
+	CJpgComp *c;
+	I16	*cf;
+	I64	 mx, my, ci, v, i, row, col, ri_count = 0;
+	Bool ok = TRUE;
+
+	j->bitcnt = 0;
+	j->hit_marker = FALSE;
+	j->eobrun = 0;
+	for (i = 0; i < j->ncomp; i++)
+		j->comp[i].dc_pred = 0;
+
+	if (scnt == 1)
+	{//Non-interleaved (all AC scans; single-component DC too): the scan walks
+	//the component's own block grid row-major, NOT the MCU grid.
+		c = &j->comp[sci[0]];
+		for (row = 0; row < c->nch && ok; row++)
+			for (col = 0; col < c->ncw && ok; col++)
+			{
+				cf = c->coef + (row * c->bw + col) * 64;
+				if (!ss)
+				{
+					if (!ah)
+						ok = JpgProgDCFirst(j, c, cf, al);
+					else
+						ok = JpgProgDCRefine(j, cf, al);
+				}
+				else
+				{
+					if (!ah)
+						ok = JpgProgACFirst(j, c, cf, ss, se, al);
+					else
+						ok = JpgProgACRefine(j, c, cf, ss, se, al);
+				}
+				ri_count++;
+				if (j->restart_interval && ri_count == j->restart_interval &&
+					!(row == c->nch - 1 && col == c->ncw - 1))
+				{
+					ri_count = 0;
+					JpgRestartSync(j);
+					j->eobrun = 0;
+					for (i = 0; i < j->ncomp; i++)
+						j->comp[i].dc_pred = 0;
+				}
+			}
+	}
+	else
+	{//Interleaved (multi-component DC scans): full MCU order like baseline.
+		for (my = 0; my < j->mcuy && ok; my++)
+			for (mx = 0; mx < j->mcux && ok; mx++)
+			{
+				for (ci = 0; ci < scnt && ok; ci++)
+				{
+					c = &j->comp[sci[ci]];
+					for (v = 0; v < c->vs && ok; v++)
+						for (i = 0; i < c->hs && ok; i++)
+						{
+							cf = c->coef +
+								 ((my * c->vs + v) * c->bw + mx * c->hs + i) * 64;
+							if (!ah)
+								ok = JpgProgDCFirst(j, c, cf, al);
+							else
+								ok = JpgProgDCRefine(j, cf, al);
+						}
+				}
+				ri_count++;
+				if (j->restart_interval && ri_count == j->restart_interval &&
+					!(my == j->mcuy - 1 && mx == j->mcux - 1))
+				{
+					ri_count = 0;
+					JpgRestartSync(j);
+					j->eobrun = 0;
+					for (i = 0; i < j->ncomp; i++)
+						j->comp[i].dc_pred = 0;
+				}
+			}
+	}
+
+	return ok;
+}
+
+U0 JpgProgFinishBlocks(CJpg *j)
+{//All scans read: dequantize + dezigzag + IDCT every block into the planes.
+	CJpgComp *c;
+	I16	*cf;
+	I64	*q;
+	I64	 ci, row, col, k, zz, nat[64];
+	F64	 pix[64];
+
+	for (ci = 0; ci < j->ncomp; ci++)
+	{
+		c = &j->comp[ci];
+		q = &j->quant[c->tq][0];
+		for (row = 0; row < c->bh; row++)
+			for (col = 0; col < c->bw; col++)
+			{
+				cf = c->coef + (row * c->bw + col) * 64;
+				for (k = 0; k < 64; k++)
+				{
+					zz = jpg_zigzag[k];
+					nat[zz] = cf[k] * q[zz];
+				}
+				JpgIdct(nat, pix);
+				JpgPlaceBlock(c, pix, col * 8, row * 8);
+			}
+	}
+}
+
+U0 JpgPlanesSetup(CJpg *j)
+{//Sampling-derived dims + pixel planes; progressive also gets coef storage.
+	I64 i, cw, ch;
+
+	j->hmax = 1;
+	j->vmax = 1;
+	for (i = 0; i < j->ncomp; i++)
+	{
+		j->hmax = MaxI64(j->hmax, j->comp[i].hs);
+		j->vmax = MaxI64(j->vmax, j->comp[i].vs);
+	}
+	j->mcux = (j->width  + 8 * j->hmax - 1) / (8 * j->hmax);
+	j->mcuy = (j->height + 8 * j->vmax - 1) / (8 * j->vmax);
+	for (i = 0; i < j->ncomp; i++)
+	{
+		j->comp[i].pw = j->mcux * 8 * j->comp[i].hs;
+		j->comp[i].ph = j->mcuy * 8 * j->comp[i].vs;
+		j->comp[i].plane = CAlloc(j->comp[i].pw * j->comp[i].ph);
+		if (j->progressive)
+		{//Padded block grid for storage; the block count non-interleaved
+		//scans actually code derives from the REAL component size.
+			j->comp[i].bw = j->mcux * j->comp[i].hs;
+			j->comp[i].bh = j->mcuy * j->comp[i].vs;
+			cw = (j->width  * j->comp[i].hs + j->hmax - 1) / j->hmax;
+			ch = (j->height * j->comp[i].vs + j->vmax - 1) / j->vmax;
+			j->comp[i].ncw = (cw + 7) / 8;
+			j->comp[i].nch = (ch + 7) / 8;
+			j->comp[i].coef = CAlloc(j->comp[i].bw * j->comp[i].bh * 64 *
+									 sizeof(I16));
+		}
+	}
 }
 
 CDC *JpgFinish(CJpg *j, CTask *mem_task)
@@ -299,20 +619,22 @@ CDC *JpgFinish(CJpg *j, CTask *mem_task)
 }
 
 public CDC *JPGReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
-{//Decode a baseline JPEG from memory. NULL if unsupported/corrupt.
+{//Decode a baseline or progressive JPEG from memory. NULL if unsupported.
 	CJpg	*j;
 	CDC		*dc = NULL;
 	I64		 i, k, n, m, seg, len, prec, cnt, nsyms, id, mx, my, ci, bx, by, v;
 	I64		 tc, th, ri_count, next;
+	I64		 ss, se, ah, al, sci[4], prog_scans = 0;
 	U8		*p = buf, *end = buf + size, *sp;
 	U8		 counts[17], syms[256];
 	F64		 pix[64];
-	Bool	 ok, sof_seen = FALSE, sos_hit = FALSE;
+	Bool	 ok, sof_seen = FALSE, sos_hit = FALSE, planes_done = FALSE;
 
 	if (size < 16 || p[0] != 0xFF || p[1] != 0xD8)
 		return NULL;
 	JpgTabsInit;
 	j = CAlloc(sizeof(CJpg));
+	j->end = end;	//Progressive scans decode inside the segment loop below.
 	p += 2;
 
 	while (p + 4 <= end && !sos_hit)
@@ -329,6 +651,8 @@ public CDC *JPGReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
 		seg = *p++;
 		if (seg == 0xD8 || (0xD0 <= seg <= 0xD7) || seg == 0x01)
 			goto jpg_next_seg;	//No payload.
+		if (seg == 0xD9)
+			break;				//EOI (progressive reaches it; baseline stops at SOS).
 		if (p + 2 > end)
 			break;
 		len = p[0] << 8 | p[1];
@@ -339,6 +663,9 @@ public CDC *JPGReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
 
 		switch (seg)
 		{
+			case 0xC2:		//SOF2 progressive: same header, multi-scan coding.
+				j->progressive = TRUE;
+				//Fall through to the shared frame-header parse.
 			case 0xC0:		//SOF0 baseline.
 			case 0xC1:		//SOF1 extended sequential.
 				prec = sp[0];
@@ -361,8 +688,7 @@ public CDC *JPGReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
 				}
 				sof_seen = TRUE;
 				break;
-			case 0xC2:		//Progressive: unsupported.
-			case 0xC3:
+			case 0xC3:		//Lossless/hierarchical/arithmetic: unsupported.
 			case 0xC5:
 			case 0xC6:
 			case 0xC7:
@@ -430,20 +756,50 @@ public CDC *JPGReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
 				if (!sof_seen)
 					goto jpg_fail;
 				cnt = sp[0];
-				if (cnt != j->ncomp)
+				if (j->progressive)
+				{
+					if (cnt < 1 || cnt > j->ncomp)
+						goto jpg_fail;
+				}
+				else if (cnt != j->ncomp)
 					goto jpg_fail;
-				for (i = 0; i < cnt; i++)
+				for (i = 0; i < cnt && i < 4; i++)
 				{
 					id = sp[1 + i * 2];
+					sci[i] = 0;
 					for (k = 0; k < j->ncomp; k++)
 						if (j->comp[k].id == id)
 						{
 							j->comp[k].td = sp[2 + i * 2] >> 4 & 3;
 							j->comp[k].ta = sp[2 + i * 2] & 3;
+							sci[i] = k;
 						}
 				}
 				j->p = p;	//Entropy-coded data starts after the SOS header.
-				sos_hit = TRUE;
+				if (!j->progressive)
+				{
+					sos_hit = TRUE;
+					break;
+				}
+				//Progressive: decode this scan now, then keep walking the
+				//segment stream (more DHT/SOS segments follow).
+				ss = sp[1 + cnt * 2];
+				se = sp[2 + cnt * 2];
+				ah = sp[3 + cnt * 2] >> 4 & 0xF;
+				al = sp[3 + cnt * 2] & 0xF;
+				if (ss > 63 || se > 63 || se < ss || (ss == 0 && se != 0) ||
+					(ss > 0 && cnt != 1))
+					goto jpg_fail;
+				if (!planes_done)
+				{
+					JpgPlanesSetup(j);
+					planes_done = TRUE;
+				}
+				if (!JpgProgScanRun(j, sci, cnt, ss, se, ah, al))
+					goto jpg_prog_done; //Corrupt scan: show what we have.
+				prog_scans++;
+				//Resume segment parsing where the scan's entropy data ended.
+				p = j->p;
 				break;
 			default:		//APPn, COM, others: skip.
 				break;
@@ -451,27 +807,22 @@ public CDC *JPGReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
 jpg_next_seg:;
 	}
 
+	if (j->progressive)
+	{
+jpg_prog_done:
+		//All scans (or as many as survived) accumulated: IDCT + color out.
+		if (!planes_done || !prog_scans)
+			goto jpg_fail;
+		JpgProgFinishBlocks(j);
+		dc = JpgFinish(j, mem_task);
+		goto jpg_fail;	//Shared cleanup; dc carries the result.
+	}
+
 	if (!sos_hit)
 		goto jpg_fail;
 
-	//Plane setup.
-	j->hmax = 1;
-	j->vmax = 1;
-	for (i = 0; i < j->ncomp; i++)
-	{
-		j->hmax = MaxI64(j->hmax, j->comp[i].hs);
-		j->vmax = MaxI64(j->vmax, j->comp[i].vs);
-	}
-	j->mcux = (j->width  + 8 * j->hmax - 1) / (8 * j->hmax);
-	j->mcuy = (j->height + 8 * j->vmax - 1) / (8 * j->vmax);
-	for (i = 0; i < j->ncomp; i++)
-	{
-		j->comp[i].pw = j->mcux * 8 * j->comp[i].hs;
-		j->comp[i].ph = j->mcuy * 8 * j->comp[i].vs;
-		j->comp[i].plane = CAlloc(j->comp[i].pw * j->comp[i].ph);
-	}
+	JpgPlanesSetup(j);
 
-	j->end = end;
 	j->bitcnt = 0;
 	j->hit_marker = FALSE;
 	ok = TRUE;
@@ -519,7 +870,10 @@ jpg_next_seg:;
 
 jpg_fail:
 	for (i = 0; i < 3; i++)
+	{
 		Free(j->comp[i].plane);
+		Free(j->comp[i].coef);
+	}
 	Free(j);
 
 	return dc;

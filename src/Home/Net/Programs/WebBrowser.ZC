@@ -912,8 +912,8 @@ U8 *ZincResolveInput(U8 *s)
 U8 *ZincResolveLink(U8 *href)
 { // absolute URL from a page link; MAlloc'ed or NULL
 	if (!StrNICompare(href, "http://", 7) || !StrNICompare(href, "https://", 8) ||
-		!StrNICompare(href, "zinc:", 5))
-		return StrNew(href);
+		!StrNICompare(href, "zinc:", 5) || !StrNICompare(href, "data:", 5))
+		return StrNew(href); // data: is self-contained (inline image blobs)
 	if (zinc_base_ok)
 		return HttpUrlResolve(&zinc_base, href);
 
