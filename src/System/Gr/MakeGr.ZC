@@ -16,6 +16,7 @@ Cd(__DIR__);;
 #include "GrComposites"
 #include "GrPNG"
 #include "GrJPG"
+#include "GrFont"
 #include "ScreenCast"
 
 #define SPE_ABORT 	(-1)

@@ -1,0 +1,818 @@
+//y4mOS scalable TrueType text renderer. Pure ZealC - no ELF, no FFI.
+//A System/Gr FACILITY: truecolor GUI apps (the web browser, YDE widgets) draw
+//proportional, any-size text through it. The 8x8 DolDoc cell font is untouched;
+//this does not replace it, it sits beside it for apps that opt in.
+//
+//Pipeline (validated against freetype before porting): parse the sfnt tables ->
+//glyph outlines (simple + composite) -> flatten quadratic beziers -> 4x
+//supersampled non-zero-winding scanline fill -> 0..255 coverage -> alpha blend
+//onto a truecolor CDC. Rasterized glyphs are cached by (glyph, pixel size).
+//
+//API:
+//  GrFontInit(buf, size)                      -> install .ttf bytes as UI font
+//  GrFontRenderDC(sz, color, bg, str)         -> text -> owned off-screen CDC
+//  GrFontText(dc, x, baseline_y, sz, col, bg, s) -> draw; returns width px
+//  GrFontWidth/GrFontAdvPx/GrFontAscent/GrFontLineH  -> metrics for layout
+
+#define GRF_SS			4		//supersampling factor per axis
+#define GRF_MAXPTS		2048	//points in one simple glyph
+#define GRF_MAXEDGE		8000	//flattened line segments per glyph
+#define GRF_MAXCROSS	256		//edge crossings on one scanline
+#define GRF_CACHE		1200	//cached rasterized glyphs
+
+class CGrFont
+{
+	U8	*data;			//whole font file (owned, sys_task heap)
+	I64	 size;
+	I64	 upm;			//units per em
+	I64	 nglyph;
+	I64	 loca_long;		//indexToLocFormat: 0 short, 1 long
+	I64	 nhmetrics;
+	I64	 ascent, descent, line_gap;
+	U8	*glyf, *loca, *hmtx, *cmap4;
+	Bool ok;
+};
+
+class CGrGlyph
+{
+	I64	 key;			//(gi << 9) | pixel_size ; -1 empty
+	I64	 w, h, ox, oy, adv;
+	U8	*cov;			//w*h coverage, sys_task heap
+};
+
+public CGrFont	grf_ui_font;		//the one UI font (browser/widgets)
+CGrGlyph		grf_cache[GRF_CACHE];
+I64				grf_cache_n = 0;	//JIT zeroes nothing: explicit
+
+//Per-glyph scratch (globals, not stack: outlines get large).
+I64	grf_px[GRF_MAXPTS], grf_py[GRF_MAXPTS];
+U8	grf_on[GRF_MAXPTS];		//on-curve bool per point
+U8	grf_flag[GRF_MAXPTS];	//full TrueType flag byte per point
+I64	grf_ends[256];
+F64	grf_ex0[GRF_MAXEDGE], grf_ey0[GRF_MAXEDGE];
+F64	grf_ex1[GRF_MAXEDGE], grf_ey1[GRF_MAXEDGE];
+I64	grf_nedge = 0;
+F64	grf_cx[GRF_MAXCROSS];
+I64	grf_cw[GRF_MAXCROSS];
+//Reordered single-contour point list (start rotated/synthesized on-curve).
+F64	grf_lx[GRF_MAXPTS + 2], grf_ly[GRF_MAXPTS + 2];
+U8	grf_lon[GRF_MAXPTS + 2];
+
+//--- big-endian readers ------------------------------------------------------
+I64 GrfU16(U8 *p)
+{
+	return p[0] << 8 | p[1];
+}
+I64 GrfS16(U8 *p)
+{
+	I64 v = p[0] << 8 | p[1];
+
+	if (v >= 0x8000)
+		return v - 0x10000;
+
+	return v;
+}
+I64 GrfU32(U8 *p)
+{
+	return p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3];
+}
+
+I64 GrfFloor(F64 f)
+{
+	I64 i = ToI64(f);
+
+	if (ToF64(i) > f)
+		i--;
+
+	return i;
+}
+I64 GrfRound(F64 f)
+{
+	return GrfFloor(f + 0.5);
+}
+
+//--- parsing -----------------------------------------------------------------
+Bool GrFontOpen(U8 *buf, I64 size, CGrFont *f)
+{//Parse the sfnt table directory and the tables we render from.
+	I64	 ntab, i, o, off, len, head = 0, maxp = 0, hhea = 0, cmap = 0;
+	I64	 n, sub, fmt, pid, eid, best = 0;
+	U8	*tag;
+
+	f->data = buf;
+	f->size = size;
+	f->ok	= FALSE;
+	if (size < 12)
+		return FALSE;
+	ntab = GrfU16(buf + 4);
+	f->glyf = NULL;
+	f->loca = NULL;
+	f->hmtx = NULL;
+	f->cmap4 = NULL;
+	for (i = 0; i < ntab; i++)
+	{
+		o	= 12 + i * 16;
+		if (o + 16 > size)
+			break;
+		tag = buf + o;
+		off = GrfU32(buf + o + 8);
+		len = GrfU32(buf + o + 12);
+		if (off < 0 || off >= size)
+			goto grf_tab_next;
+		if (!MemCompare(tag, "head", 4))
+			head = off;
+		else if (!MemCompare(tag, "maxp", 4))
+			maxp = off;
+		else if (!MemCompare(tag, "hhea", 4))
+			hhea = off;
+		else if (!MemCompare(tag, "hmtx", 4))
+			f->hmtx = buf + off;
+		else if (!MemCompare(tag, "loca", 4))
+			f->loca = buf + off;
+		else if (!MemCompare(tag, "glyf", 4))
+			f->glyf = buf + off;
+		else if (!MemCompare(tag, "cmap", 4))
+			cmap = off;
+grf_tab_next:;
+	}
+	if (!head || !maxp || !hhea || !cmap || !f->glyf || !f->loca || !f->hmtx)
+		return FALSE;
+	f->upm		 = GrfU16(buf + head + 18);
+	f->loca_long = GrfS16(buf + head + 50);
+	f->nglyph	 = GrfU16(buf + maxp + 4);
+	f->ascent	 = GrfS16(buf + hhea + 4);
+	f->descent	 = GrfS16(buf + hhea + 6);
+	f->line_gap	 = GrfS16(buf + hhea + 8);
+	f->nhmetrics = GrfU16(buf + hhea + 34);
+	if (f->upm < 16)
+		f->upm = 1000;
+	//cmap: prefer a Unicode BMP format-4 subtable.
+	n = GrfU16(buf + cmap + 2);
+	for (i = 0; i < n; i++)
+	{
+		o	= cmap + 4 + i * 8;
+		pid = GrfU16(buf + o);
+		eid = GrfU16(buf + o + 2);
+		sub = cmap + GrfU32(buf + o + 4);
+		if (sub + 4 > size)
+			goto grf_cmap_next;
+		fmt = GrfU16(buf + sub);
+		if (fmt == 4)
+		{
+			if (!best)
+				best = sub;
+			if (pid == 3 && (eid == 1 || eid == 0))
+				best = sub;
+			if (pid == 0)
+				best = sub;
+		}
+grf_cmap_next:;
+	}
+	if (!best)
+		return FALSE;
+	f->cmap4 = buf + best;
+	f->ok = TRUE;
+
+	return TRUE;
+}
+
+I64 GrFontGI(CGrFont *f, I64 cp)
+{//Character code -> glyph index via the format-4 cmap. 0 (.notdef) if absent.
+	U8	*s = f->cmap4;
+	I64	 segx2, segc, endo, starto, deltao, rangeo, i;
+	I64	 endc, start, delta, roff, g;
+
+	if (!s)
+		return 0;
+	segx2  = GrfU16(s + 6);
+	segc   = segx2 / 2;
+	endo   = 14;
+	starto = endo + segx2 + 2;
+	deltao = starto + segx2;
+	rangeo = deltao + segx2;
+	for (i = 0; i < segc; i++)
+	{
+		endc = GrfU16(s + endo + i * 2);
+		if (cp > endc)
+			goto grf_gi_next;
+		start = GrfU16(s + starto + i * 2);
+		if (cp < start)
+			return 0;
+		delta = GrfU16(s + deltao + i * 2);
+		roff  = GrfU16(s + rangeo + i * 2);
+		if (!roff)
+			return (cp + delta) & 0xFFFF;
+		g = GrfU16(s + rangeo + i * 2 + roff + (cp - start) * 2);
+		if (!g)
+			return 0;
+		return (g + delta) & 0xFFFF;
+grf_gi_next:;
+	}
+
+	return 0;
+}
+
+U0 GrFontLoca(CGrFont *f, I64 gi, I64 *o0, I64 *o1)
+{
+	if (f->loca_long)
+	{
+		*o0 = GrfU32(f->loca + gi * 4);
+		*o1 = GrfU32(f->loca + (gi + 1) * 4);
+	}
+	else
+	{
+		*o0 = GrfU16(f->loca + gi * 2) * 2;
+		*o1 = GrfU16(f->loca + (gi + 1) * 2) * 2;
+	}
+}
+
+I64 GrFontAdv(CGrFont *f, I64 gi)
+{//Advance width in font units.
+	if (gi < f->nhmetrics)
+		return GrfU16(f->hmtx + gi * 4);
+
+	return GrfU16(f->hmtx + (f->nhmetrics - 1) * 4);
+}
+
+//--- outline -> edges --------------------------------------------------------
+U0 GrfEdge(F64 x0, F64 y0, F64 x1, F64 y1)
+{
+	if (grf_nedge >= GRF_MAXEDGE)
+		return;
+	grf_ex0[grf_nedge] = x0;
+	grf_ey0[grf_nedge] = y0;
+	grf_ex1[grf_nedge] = x1;
+	grf_ey1[grf_nedge] = y1;
+	grf_nedge++;
+}
+
+U0 GrfQuad(F64 x0, F64 y0, F64 cx, F64 cy, F64 x1, F64 y1, I64 segs)
+{//Flatten a quadratic bezier into line segments (edges).
+	F64 px = x0, py = y0, t, mt, qx, qy;
+	I64 i;
+
+	i = 1;
+	while (i <= segs)
+	{
+		t  = ToF64(i) / ToF64(segs);
+		mt = 1.0 - t;
+		qx = mt * mt * x0 + 2.0 * mt * t * cx + t * t * x1;
+		qy = mt * mt * y0 + 2.0 * mt * t * cy + t * t * y1;
+		GrfEdge(px, py, qx, qy);
+		px = qx;
+		py = qy;
+		i++;
+	}
+}
+
+//Forward decl: composite glyphs recurse into this.
+U0 GrFontGlyphEdges(CGrFont *f, I64 gi, F64 offx, F64 offy, I64 depth, I64 segs);
+
+U0 GrfContourEdges(I64 s, I64 e, F64 offx, F64 offy, I64 segs)
+{//Build edges for one contour (points s..e), expanding off-curve quadratics.
+//Mirrors the validated prototype EXACTLY: build a reordered point list whose
+//[0] is on-curve (rotate the last point to the front, or synthesize a midpoint
+//when the contour is all-off-curve), then walk it emitting lines/quads.
+	I64 npt = e - s + 1, N = 0, i, ii, ni;
+	F64 sx, sy, curx, cury, cxp, cyp, ex, ey;
+
+	if (npt < 2)
+		return;
+	if (!grf_on[s])
+	{
+		if (grf_on[e])
+		{//rotate the (on-curve) last point to the front
+			grf_lx[N] = ToF64(grf_px[e]) + offx;
+			grf_ly[N] = ToF64(grf_py[e]) + offy;
+			grf_lon[N] = 1;
+			N++;
+			for (i = s; i < e; i++)
+			{
+				grf_lx[N] = ToF64(grf_px[i]) + offx;
+				grf_ly[N] = ToF64(grf_py[i]) + offy;
+				grf_lon[N] = grf_on[i];
+				N++;
+			}
+		}
+		else
+		{//all-off-curve start: prepend the midpoint of last and first
+			grf_lx[N] = (ToF64(grf_px[s]) + ToF64(grf_px[e])) / 2.0 + offx;
+			grf_ly[N] = (ToF64(grf_py[s]) + ToF64(grf_py[e])) / 2.0 + offy;
+			grf_lon[N] = 1;
+			N++;
+			for (i = s; i <= e; i++)
+			{
+				grf_lx[N] = ToF64(grf_px[i]) + offx;
+				grf_ly[N] = ToF64(grf_py[i]) + offy;
+				grf_lon[N] = grf_on[i];
+				N++;
+			}
+		}
+	}
+	else
+	{//already starts on-curve
+		for (i = s; i <= e; i++)
+		{
+			grf_lx[N] = ToF64(grf_px[i]) + offx;
+			grf_ly[N] = ToF64(grf_py[i]) + offy;
+			grf_lon[N] = grf_on[i];
+			N++;
+		}
+	}
+	sx = grf_lx[0];
+	sy = grf_ly[0];
+	curx = sx;
+	cury = sy;
+	i = 1;
+	while (i <= N)
+	{
+		ii = i % N;
+		if (grf_lon[ii])
+		{
+			ex = grf_lx[ii];
+			ey = grf_ly[ii];
+			GrfEdge(curx, cury, ex, ey);
+			curx = ex;
+			cury = ey;
+			i++;
+		}
+		else
+		{//off-curve control; segment ends at next on-curve or implied midpoint
+			cxp = grf_lx[ii];
+			cyp = grf_ly[ii];
+			ni = (i + 1) % N;
+			if (grf_lon[ni])
+			{
+				ex = grf_lx[ni];
+				ey = grf_ly[ni];
+				i += 2;
+			}
+			else
+			{
+				ex = (cxp + grf_lx[ni]) / 2.0;
+				ey = (cyp + grf_ly[ni]) / 2.0;
+				i++;
+			}
+			GrfQuad(curx, cury, cxp, cyp, ex, ey, segs);
+			curx = ex;
+			cury = ey;
+		}
+	}
+}
+
+U0 GrFontGlyphEdges(CGrFont *f, I64 gi, F64 offx, F64 offy, I64 depth, I64 segs)
+{//Append this glyph's outline edges (font units, offset applied) to the list.
+	U8	*b = f->data, *g, *p;
+	I64	 o0, o1, nc, npts, ilen, i, flag, r, x, y, start;
+	I64	 cflags, cgi, a1, a2;
+	F64	 dx, dy;
+
+	if (gi < 0 || gi >= f->nglyph || depth > 5)
+		return;
+	GrFontLoca(f, gi, &o0, &o1);
+	if (o0 >= o1)
+		return;					//empty glyph (e.g. space)
+	g  = f->glyf + o0;
+	nc = GrfS16(g);
+	if (nc < 0)
+	{//composite glyph
+		p = g + 10;
+		while (TRUE)
+		{
+			cflags = GrfU16(p);
+			cgi	   = GrfU16(p + 2);
+			p += 4;
+			if (cflags & 1)
+			{//ARG_1_AND_2_ARE_WORDS
+				a1 = GrfS16(p);
+				a2 = GrfS16(p + 2);
+				p += 4;
+			}
+			else
+			{
+				a1 = p[0];			//signed bytes
+				a2 = p[1];
+				if (a1 >= 128)
+					a1 -= 256;
+				if (a2 >= 128)
+					a2 -= 256;
+				p += 2;
+			}
+			dx = 0;
+			dy = 0;
+			if (cflags & 2)
+			{//ARGS_ARE_XY_VALUES
+				dx = ToF64(a1);
+				dy = ToF64(a2);
+			}
+			//skip the transform fields we don't apply (scale/2x2)
+			if (cflags & 8)
+				p += 2;
+			else if (cflags & 0x40)
+				p += 4;
+			else if (cflags & 0x80)
+				p += 8;
+			GrFontGlyphEdges(f, cgi, offx + dx, offy + dy, depth + 1, segs);
+			if (!(cflags & 0x20))	//MORE_COMPONENTS
+				break;
+		}
+		return;
+	}
+	//simple glyph
+	if (nc > 256)
+		nc = 256;
+	p = g + 10;
+	for (i = 0; i < nc; i++)
+		grf_ends[i] = GrfU16(p + i * 2);
+	p += nc * 2;
+	npts = grf_ends[nc - 1] + 1;
+	if (npts > GRF_MAXPTS)
+		return;
+	ilen = GrfU16(p);
+	p += 2 + ilen;					//skip hinting instructions
+	//flags, with the REPEAT run-length (bit 3). TrueType flag bits:
+	//0x01 on-curve, 0x02 X_SHORT, 0x04 Y_SHORT, 0x08 repeat,
+	//0x10 X_SAME/positive, 0x20 Y_SAME/positive.
+	i = 0;
+	while (i < npts)
+	{
+		flag = *p++;
+		grf_flag[i] = flag;
+		grf_on[i]	= (flag & 1) != 0;
+		i++;
+		if (flag & 8)
+		{
+			r = *p++;
+			while (r-- > 0 && i < npts)
+			{
+				grf_flag[i] = flag;
+				grf_on[i]	= (flag & 1) != 0;
+				i++;
+			}
+		}
+	}
+	//x coordinates (delta encoded, per-point flag decides the encoding)
+	x = 0;
+	for (i = 0; i < npts; i++)
+	{
+		flag = grf_flag[i];
+		if (flag & 2)
+		{
+			r = *p++;
+			if (flag & 16)
+				x += r;
+			else
+				x -= r;
+		}
+		else if (!(flag & 16))
+		{
+			x += GrfS16(p);
+			p += 2;
+		}
+		grf_px[i] = x;
+	}
+	//y coordinates
+	y = 0;
+	for (i = 0; i < npts; i++)
+	{
+		flag = grf_flag[i];
+		if (flag & 4)
+		{
+			r = *p++;
+			if (flag & 32)
+				y += r;
+			else
+				y -= r;
+		}
+		else if (!(flag & 32))
+		{
+			y += GrfS16(p);
+			p += 2;
+		}
+		grf_py[i] = y;
+	}
+	start = 0;
+	for (i = 0; i < nc; i++)
+	{
+		GrfContourEdges(start, grf_ends[i], offx, offy, segs);
+		start = grf_ends[i] + 1;
+	}
+}
+
+//--- rasterizer --------------------------------------------------------------
+I64 GrfFloorDiv(I64 a, I64 b)
+{//Floor division (b > 0). ZealC '/' truncates toward zero; fix negatives.
+	I64 q = a / b;
+
+	if (a % b && a < 0)
+		q--;
+
+	return q;
+}
+
+U0 GrFontRaster(CGrFont *f, I64 gi, I64 size, CGrGlyph *out)
+{//Rasterize glyph gi at 'size' px into out->cov (coverage 0..255) + metrics.
+	F64	 sc, minx, miny, maxx, maxy, ax, ay, bx, by, yc, t, xint, tmpf;
+	I64	 segs, i, k, x0, y0, W, H, sy, nx, a, bb, xx, ow, oh, ox, oy;
+	I64	 s, s0, sum, tmpi, jj, ii;
+	U8	*ssb;
+
+	out->adv = GrFontAdv(f, gi) * size / f->upm;
+	out->cov = NULL;
+	out->w = 0;	out->h = 0;	out->ox = 0;	out->oy = 0;
+	segs = ClampI64(2 + size / 4, 3, 14);
+	grf_nedge = 0;
+	GrFontGlyphEdges(f, gi, 0.0, 0.0, 0, segs);
+	if (grf_nedge < 2)
+		return;						//no outline (space etc): advance only
+	//Scale edges to supersampled device space (y flips: font up -> screen down).
+	sc = ToF64(size) * ToF64(GRF_SS) / ToF64(f->upm);
+	minx = 100000000.0;	miny = 100000000.0;
+	maxx = -100000000.0;	maxy = -100000000.0;
+	for (i = 0; i < grf_nedge; i++)
+	{
+		grf_ex0[i] *= sc;
+		grf_ey0[i]  = -grf_ey0[i] * sc;
+		grf_ex1[i] *= sc;
+		grf_ey1[i]  = -grf_ey1[i] * sc;
+		if (grf_ex0[i] < minx) minx = grf_ex0[i];
+		if (grf_ex1[i] < minx) minx = grf_ex1[i];
+		if (grf_ex0[i] > maxx) maxx = grf_ex0[i];
+		if (grf_ex1[i] > maxx) maxx = grf_ex1[i];
+		if (grf_ey0[i] < miny) miny = grf_ey0[i];
+		if (grf_ey1[i] < miny) miny = grf_ey1[i];
+		if (grf_ey0[i] > maxy) maxy = grf_ey0[i];
+		if (grf_ey1[i] > maxy) maxy = grf_ey1[i];
+	}
+	x0 = GrfFloor(minx) - 1;
+	y0 = GrfFloor(miny) - 1;
+	W  = GrfFloor(maxx) - x0 + 2;
+	H  = GrfFloor(maxy) - y0 + 2;
+	if (W < 1 || H < 1 || W > 4096 || H > 4096)
+		return;
+	ssb = CAlloc(W * H, sys_task);		//1 byte per subpixel, zeroed
+	//Scanline fill, non-zero winding, at supersample resolution.
+	for (sy = 0; sy < H; sy++)
+	{
+		yc = ToF64(y0 + sy) + 0.5;
+		nx = 0;
+		for (i = 0; i < grf_nedge; i++)
+		{
+			ay = grf_ey0[i];
+			by = grf_ey1[i];
+			if (!((ay <= yc && yc < by) || (by <= yc && yc < ay)))
+				goto grf_edge_next;
+			ax = grf_ex0[i];
+			bx = grf_ex1[i];
+			t  = (yc - ay) / (by - ay);
+			xint = ax + t * (bx - ax);
+			if (nx < GRF_MAXCROSS)
+			{
+				grf_cx[nx] = xint;
+				if (by > ay)
+					grf_cw[nx] = 1;
+				else
+					grf_cw[nx] = -1;
+				nx++;
+			}
+grf_edge_next:;
+		}
+		//insertion sort crossings by x
+		for (i = 1; i < nx; i++)
+		{
+			tmpf = grf_cx[i];
+			tmpi = grf_cw[i];
+			k = i - 1;
+			while (k >= 0 && grf_cx[k] > tmpf)
+			{
+				grf_cx[k + 1] = grf_cx[k];
+				grf_cw[k + 1] = grf_cw[k];
+				k--;
+			}
+			grf_cx[k + 1] = tmpf;
+			grf_cw[k + 1] = tmpi;
+		}
+		//fill spans where winding != 0
+		s = 0;
+		for (i = 0; i < nx - 1; i++)
+		{
+			s += grf_cw[i];
+			if (!s)
+				goto grf_span_next;
+			a  = GrfRound(grf_cx[i]) - x0;
+			bb = GrfRound(grf_cx[i + 1]) - x0;
+			if (a < 0)
+				a = 0;
+			if (bb > W)
+				bb = W;
+			for (xx = a; xx < bb; xx++)
+				ssb[sy * W + xx] = 1;
+grf_span_next:;
+		}
+	}
+	//Downsample SSxSS -> coverage 0..255.
+	ow = (W + GRF_SS - 1) / GRF_SS;
+	oh = (H + GRF_SS - 1) / GRF_SS;
+	out->cov = CAlloc(ow * oh, sys_task);
+	for (oy = 0; oy < oh; oy++)
+		for (ox = 0; ox < ow; ox++)
+		{
+			sum = 0;
+			for (jj = 0; jj < GRF_SS; jj++)
+				for (ii = 0; ii < GRF_SS; ii++)
+				{
+					sy = oy * GRF_SS + jj;
+					s0 = ox * GRF_SS + ii;
+					if (sy < H && s0 < W && ssb[sy * W + s0])
+						sum++;
+				}
+			out->cov[oy * ow + ox] = sum * 255 / (GRF_SS * GRF_SS);
+		}
+	Free(ssb);
+	out->w  = ow;
+	out->h  = oh;
+	out->ox = GrfFloorDiv(x0, GRF_SS);
+	out->oy = GrfFloorDiv(y0, GRF_SS);
+}
+
+CGrGlyph *GrFontGlyph(CGrFont *f, I64 gi, I64 size)
+{//Direct-mapped glyph cache: hit or rasterize-then-cache (evicting collisions).
+	I64		 key = (gi << 9) | (size & 0x1FF);
+	I64		 slot = (key & 0x7FFFFFFF) % GRF_CACHE;
+	CGrGlyph *e = &grf_cache[slot];
+
+	if (e->key == key)
+		return e;
+	if (e->cov)
+		Free(e->cov);
+	GrFontRaster(f, gi, size, e);
+	e->key = key;
+
+	return e;
+}
+
+public I64 GrFontAscent(CGrFont *f, I64 size)
+{
+	if (!f->ok)
+		return size;
+	return f->ascent * size / f->upm;
+}
+public I64 GrFontLineH(CGrFont *f, I64 size)
+{
+	if (!f->ok)
+		return size + 2;
+	return (f->ascent - f->descent + f->line_gap) * size / f->upm;
+}
+
+public I64 GrFontAdvPx(CGrFont *f, I64 cp, I64 size)
+{//Advance width of one character in pixels (for proportional layout).
+	if (!f->ok)
+		return size;
+	return GrFontAdv(f, GrFontGI(f, cp)) * size / f->upm;
+}
+
+public I64 GrFontWidth(CGrFont *f, I64 size, U8 *str)
+{//Total advance width of str at size px.
+	I64 w = 0, gi;
+	U8 *p = str;
+
+	if (!f->ok || !str)
+		return 0;
+	while (*p)
+	{
+		gi = GrFontGI(f, *p);
+		w += GrFontAdv(f, gi) * size / f->upm;
+		p++;
+	}
+
+	return w;
+}
+
+U0 GrfBlitGlyph(CDC *dc, I64 gx, I64 gy, CGrGlyph *g, I64 color)
+{//Alpha-blend a glyph's coverage onto an OFF-SCREEN dc (no z-buffer/scroll:
+//that is GrBlot's job when this dc is later composited to screen).
+	I64	 j, i, xx, yy, a, ia, sr, sg, sb, dr, dg, db, stride = dc->width_internal;
+	U32	*body = dc->body, d;
+
+	if (!g->cov)
+		return;
+	sr = color >> 16 & 0xFF;
+	sg = color >> 8 & 0xFF;
+	sb = color & 0xFF;
+	for (j = 0; j < g->h; j++)
+	{
+		yy = gy + j;
+		if (yy < 0 || yy >= dc->height)
+			goto grf_blit_row;
+		for (i = 0; i < g->w; i++)
+		{
+			xx = gx + i;
+			if (xx < 0 || xx >= dc->width)
+				goto grf_blit_col;
+			a = g->cov[j * g->w + i];
+			if (!a)
+				goto grf_blit_col;
+			d = body[yy * stride + xx];
+			if (a >= 255)
+			{
+				body[yy * stride + xx] = color;
+				goto grf_blit_col;
+			}
+			ia = 255 - a;
+			dr = d >> 16 & 0xFF;
+			dg = d >> 8 & 0xFF;
+			db = d & 0xFF;
+			body[yy * stride + xx] =
+				((sr * a + dr * ia) / 255) << 16 |
+				((sg * a + dg * ia) / 255) << 8 |
+				((sb * a + db * ia) / 255);
+grf_blit_col:;
+		}
+grf_blit_row:;
+	}
+}
+
+public CDC *GrFontRenderDC(CGrFont *f, I64 size, I64 color, I64 bg, U8 *str)
+{//Render str into a fresh off-screen truecolor CDC (caller GrBlots + DCDels).
+//bg >= 0: fill that color and anti-alias against it (text on a solid panel);
+//bg < 0: transparent background (only the glyph pixels are opaque).
+	CDC		*dc;
+	CGrGlyph *g;
+	I64		 W, H, asc, penx, gi;
+	U8		*p = str;
+
+	if (!f->ok || !str || !*str)
+		return NULL;
+	W = GrFontWidth(f, size, str);
+	if (W < 1)
+		return NULL;
+	H	= GrFontLineH(f, size);
+	asc = GrFontAscent(f, size);
+	dc	= DCNew(W, H, sys_task);
+	if (!dc)
+		return NULL;
+	if (bg >= 0)
+	{
+		MemSetU32(dc->body, bg, dc->width_internal * dc->height);
+		dc->flags |= DCF_NO_TRANSPARENTS; //opaque panel stamp
+	}
+	else
+		MemSetU32(dc->body, PIXF_TRANSPARENT, dc->width_internal * dc->height);
+	penx = 0;
+	while (*p)
+	{
+		gi = GrFontGI(f, *p);
+		g  = GrFontGlyph(f, gi, size);
+		GrfBlitGlyph(dc, penx + g->ox, asc + g->oy, g, color);
+		penx += g->adv;
+		p++;
+	}
+
+	return dc;
+}
+
+public I64 GrFontText(CDC *dc, I64 x, I64 baseline_y, I64 size, I64 color,
+					  I64 bg, U8 *str)
+{//Convenience: draw str with its baseline at baseline_y. Returns advance width.
+//For repeated redraws prefer GrFontRenderDC once + cache the DC.
+	CDC *run = GrFontRenderDC(&grf_ui_font, size, color, bg, str);
+	I64	 w;
+
+	if (!run)
+		return 0;
+	w = run->width;
+	GrBlot(dc, x, baseline_y - GrFontAscent(&grf_ui_font, size), run);
+	DCDel(run);
+
+	return w;
+}
+
+public Bool GrFontInit(U8 *buf, I64 size)
+{//Install a .ttf (already read into 'buf') as the UI font grf_ui_font. The
+//buffer is copied onto the sys_task heap so the font outlives the caller.
+//FileRead lives in BlkDev (compiled AFTER Gr), so the CALLER reads the file
+//and hands us the bytes. Returns FALSE (and .ok stays FALSE) on any failure,
+//so callers cleanly fall back to the 8x8 bitmap font.
+	I64	 i;
+
+	if (grf_ui_font.ok && grf_ui_font.data)
+		return TRUE;					//already loaded
+	if (!buf || size < 12)
+		return FALSE;
+	grf_ui_font.data = MAlloc(size, sys_task);
+	MemCopy(grf_ui_font.data, buf, size);
+	if (!GrFontOpen(grf_ui_font.data, size, &grf_ui_font))
+	{
+		Free(grf_ui_font.data);
+		grf_ui_font.data = NULL;
+		grf_ui_font.ok = FALSE;
+		return FALSE;
+	}
+	for (i = 0; i < GRF_CACHE; i++)
+	{
+		grf_cache[i].key = -1;
+		grf_cache[i].cov = NULL;
+	}
+	grf_cache_n = 0;
+
+	return TRUE;
+}

@@ -354,7 +354,7 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	I64		 mt_eff, mb_eff, ml_eff, mr_eff, pt_eff, pb_eff, pl_eff, pr_eff;
 	I64		 box_op, op0, avail, bw, center_add, save_wrap, save_wrap2;
 	I64		 box_y0, dx, dy, mw, mh, x0, saved_y, saved_indent, saved_wrapa;
-	I64		 save_cbx, save_cby, save_cbw, save_cbh;
+	I64		 save_cbx, save_cby, save_cbw, save_cbh, save_curbg;
 	Bool	 boxed, is_body, is_abs, is_flex, is_posn;
 
 	is_body = L2IsBody(node->tag);
@@ -362,6 +362,7 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	is_abs	= author->pos == 2 || author->pos == 3;
 	is_posn	= author->pos >= 1; // relative/absolute/fixed establish a containing
 								// block for descendant abs elements
+	save_curbg = gx.cur_bg;
 	save_cbx = gx.cb_x;
 	save_cby = gx.cb_y;
 	save_cbw = gx.cb_w;
@@ -513,6 +514,8 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 		}
 		gx.line_start_op = gx.op_count;
 		kid.bg = -1; // the box already painted it
+		if (author->bg >= 0)
+			gx.cur_bg = author->bg; // children's text AA'es against this bg
 	}
 	gx.indent += pl_eff;
 	gx.y += pt_eff;
@@ -543,6 +546,7 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 		}
 	}
 
+	gx.cur_bg = save_curbg; // restore parent background
 	gx.cb_x = save_cbx; // restore the parent containing block
 	gx.cb_y = save_cby;
 	gx.cb_w = save_cbw;
