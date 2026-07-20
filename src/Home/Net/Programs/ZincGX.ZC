@@ -1661,6 +1661,14 @@ gx_sprite_skip:;
 	return dst;
 }
 
+public Bool zinc_gradients = TRUE; //Gradients(FALSE) disables CSS gradient rendering (debug/perf).
+
+public U0 Gradients(Bool on)
+{//Runtime toggle for CSS linear-gradient backgrounds. Reload the page to re-render.
+//Use Gradients(OFF); in a terminal to bisect a gradient-related hang/slowness.
+	zinc_gradients = on;
+}
+
 CDC *GxGradientDC(I64 gi, I64 bw, I64 bh)
 {//Render zcss_grad[gi] into a bw x bh DC (owned, sys_task): a linear gradient
 //along the CSS angle, colours interpolated between the stops.
@@ -1705,8 +1713,13 @@ CDC *GxGradientDC(I64 gi, I64 bw, I64 bh)
 		span = 1.0;
 
 	dst = DCNew(bw, bh, sys_task);
+	if (!dst)
+		return NULL;
+	dst->flags |= DCF_NO_TRANSPARENTS;
 	for (dy = 0; dy < bh; dy++)
 	{
+		if (!(dy & 63))
+			Yield; //Big gradients: yield so the layout core never starves the UI.
 		db = dst->body + dy * dst->width_internal;
 		for (dx = 0; dx < bw; dx++)
 		{
@@ -1777,7 +1790,7 @@ U0 GxBgImgAttach()
 					op->sc = DEDCScaleNew(ce->dc, bw, bh, sys_task);
 			}
 		}
-		else if (op->grad >= 0 && op->w > 2 && op->h > 2)
+		else if (zinc_gradients && op->grad >= 0 && op->grad < zcss_grad_count && op->w > 2 && op->h > 2)
 		{//CSS linear-gradient background.
 			bw = MinI64(op->w, 1024);
 			bh = MinI64(op->h, 1024);
@@ -2994,9 +3007,72 @@ U0 GxClick(I64 x, I64 y)
 		GxClickContent(x, y);
 }
 
+CZNode *GxMetaRefreshNode(CZNode *node, I64 depth)
+{//First <meta http-equiv=refresh> node in the subtree, or NULL. depth-capped.
+	CZNode	*n, *r;
+	U8		*equiv;
+	I64		 guard = 0;
+
+	if (!node || depth > 64)
+		return NULL;
+	if (!StrICompare(node->tag, "meta"))
+	{
+		equiv = ZNodeAttr(node, "http-equiv");
+		if (equiv && !StrICompare(equiv, "refresh"))
+			return node;
+	}
+	n = node->first_child;
+	while (n && guard++ < 100000)
+	{
+		r = GxMetaRefreshNode(n, depth + 1);
+		if (r)
+			return r;
+		n = n->next;
+	}
+
+	return NULL;
+}
+
+U8 *GxMetaRefresh(U8 *cur_url)
+{//If the loaded page carries <meta http-equiv=refresh content="N; url=X">,
+//return a StrNew'd absolute X to redirect to (else NULL). Pure self-refresh
+//(no url=) and same-URL targets are ignored so it can't loop. Delay ignored.
+	CZNode	*m;
+	U8		*content, *p, *url, *resolved;
+	I64		 n;
+
+	m = GxMetaRefreshNode(zinc_dom, 0);
+	if (!m)
+		return NULL;
+	content = ZNodeAttr(m, "content");
+	if (!content)
+		return NULL;
+	p = StrFind("url=", content);
+	if (!p)
+		p = StrFind("URL=", content);
+	if (!p)
+		return NULL;
+	p += 4;
+	while (*p == ' ' || *p == 0x27 || *p == 0x22)
+		p++;
+	url = StrNew(p);
+	n = StrLen(url);
+	while (n > 0 && (url[n - 1] == ' ' || url[n - 1] == 0x27 || url[n - 1] == 0x22 ||
+					 url[n - 1] == '\r' || url[n - 1] == '\n'))
+		url[--n] = 0;
+	resolved = ZincResolveLink(url);
+	Free(url);
+	if (resolved && cur_url && StrCompare(resolved, cur_url))
+		return resolved;
+	if (resolved)
+		Free(resolved);
+
+	return NULL;
+}
+
 public U0 ZincGX(U8 *start_url=NULL)
 {
-	U8	*current, *target, *sub;
+	U8	*current, *target, *sub, *meta_url;
 	I64	 msg, a1, a2, view_h, vi, nav_chain = 0, cancel_deadline = 0, ti, tn;
 	U8	 title[80];
 
@@ -3178,12 +3254,23 @@ public U0 ZincGX(U8 *start_url=NULL)
 				gx_fetch_body = NULL;
 			}
 			gx.fetch = FALSE;
+			meta_url = NULL;
+			if (nav_chain < 5)
+				meta_url = GxMetaRefresh(current); // <meta http-equiv=refresh url=..>
 			if (zinc_js && zinc_js->navigate && nav_chain < 5)
 			{
 				nav_chain++;
 				target = StrNew(zinc_js->navigate);
 				zinc_js->navigate = NULL;
+				if (meta_url)
+					Free(meta_url);
 				current = ZincNavPush(current, target);
+				gx.fetch = TRUE;
+			}
+			else if (meta_url)
+			{//HTML meta-refresh redirect.
+				nav_chain++;
+				current = ZincNavPush(current, meta_url);
 				gx.fetch = TRUE;
 			}
 			else
@@ -3213,10 +3300,15 @@ public U0 ZincGX(U8 *start_url=NULL)
 		{
 			if (gx.tab_new)
 			{
+				//New tab opens to the RIGHT of the rightmost tab (browser convention).
 				ti = -1;
-				for (tn = 0; tn < GX_TABS; tn++)
-					if (ti < 0 && !gx.tab[tn].used)
-						ti = tn;
+				for (tn = GX_TABS - 1; tn >= 0 && ti < 0; tn--)
+					if (gx.tab[tn].used && tn + 1 < GX_TABS && !gx.tab[tn + 1].used)
+						ti = tn + 1;
+				if (ti < 0)
+					for (tn = 0; tn < GX_TABS; tn++)
+						if (ti < 0 && !gx.tab[tn].used)
+							ti = tn;
 				if (ti >= 0)
 				{
 					GxTabSaveCur(current);

@@ -146,6 +146,8 @@
 #define JSN_OBJ_KEYS		109
 #define JSN_OBJ_ASSIGN		110
 #define JSN_ARR_ISARR		111
+#define JSN_LOC_ASSIGN		112	// location.assign() / location.replace()
+#define JSN_LOC_RELOAD		113	// location.reload()
 
 /* token types */
 #define JT_EOF		0
@@ -1898,6 +1900,10 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 		case JSO_LOCATION:
 			if (!StrCompare(name, "href"))
 				return JsStrV(ji, ji->url);
+			if (!StrCompare(name, "assign") || !StrCompare(name, "replace"))
+				return JsNativeV(ji, JSN_LOC_ASSIGN);
+			if (!StrCompare(name, "reload"))
+				return JsNativeV(ji, JSN_LOC_RELOAD);
 			return JsUndefV(ji);
 		case JSO_WINDOW:
 			if (!StrCompare(name, "location"))
@@ -3560,6 +3566,12 @@ CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 			if (node)
 				return JsElemV(ji, node);
 			return JsNullV(ji);
+		case JSN_LOC_ASSIGN: // location.assign(url) / location.replace(url)
+			ji->navigate = JsStrDup(ji, JsToStr(ji, JsArgOr(ji, args, argc, 0)));
+			return JsUndefV(ji);
+		case JSN_LOC_RELOAD: // location.reload()
+			ji->navigate = JsStrDup(ji, ji->url);
+			return JsUndefV(ji);
 		case JSN_PARSEINT:
 			s = JsToStr(ji, JsArgOr(ji, args, argc, 0));
 			while (*s == ' ' || *s == '\t')

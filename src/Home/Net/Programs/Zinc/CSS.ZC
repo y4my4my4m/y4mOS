@@ -226,6 +226,24 @@ public I64 zcss_rem_px = 16;
 public U8	zcss_bgimg[ZCSS_BGIMG_MAX][192];
 I64			zcss_bgimg_count = 0; // reset per page; JIT zeroes nothing
 
+/* ---- linear-gradient backgrounds (storage) ----
+   Interned per-page table; CZStyle stores an index. Declared HERE (before
+   ZCssReset) so the reset can zero the count - single-pass compiler. The parser
+   ZCssParseGradient lives below, after ZCssColor/ZCssPct. */
+#define ZCSS_GRAD_MAX	64
+#define ZCSS_GRAD_STOPS	6
+
+public class CZGrad
+{
+	I16	angle;					// deg, CSS convention: 0=to top, 90=right, 180=bottom
+	I16	nstops;
+	I32	col[ZCSS_GRAD_STOPS];	// 0xRRGGBB
+	I16	pos[ZCSS_GRAD_STOPS];	// 0..100 along the line; -1 = auto-distribute
+};
+
+public CZGrad	zcss_grad[ZCSS_GRAD_MAX];
+public I64		zcss_grad_count = 0; // reset per page; JIT zeroes nothing
+
 I64 ZCssBgImgAdd(U8 *url)
 { // intern a background-image URL; -1 if full/unusable
 	I64 i;
@@ -961,23 +979,6 @@ I64 ZCssGridCols(U8 *val)
 		count = 12;
 	return count;
 }
-
-/* ---- linear-gradient backgrounds ----
-   Parsed into a per-page interned table (CZStyle stores an index). radial-
-   gradient is approximated as a vertical linear so its colors still show. */
-#define ZCSS_GRAD_MAX	64
-#define ZCSS_GRAD_STOPS	6
-
-public class CZGrad
-{
-	I16	angle;					// deg, CSS convention: 0=to top, 90=right, 180=bottom
-	I16	nstops;
-	I32	col[ZCSS_GRAD_STOPS];	// 0xRRGGBB
-	I16	pos[ZCSS_GRAD_STOPS];	// 0..100 along the line; -1 = auto-distribute
-};
-
-public CZGrad	zcss_grad[ZCSS_GRAD_MAX];
-I64				zcss_grad_count = 0; // reset per page; JIT zeroes nothing
 
 I64 ZCssGradSide(U8 *tok)
 { // "to right" / "to bottom" etc -> CSS angle degrees; -1 if not a side
