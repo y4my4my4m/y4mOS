@@ -2728,8 +2728,9 @@ public U0 ZincGX(U8 *start_url=NULL)
 
 	Fs->draw_it = &GxDrawIt;
 	gx.img_task = Spawn(&GxImgTask, NULL, "ZincGX Images", 3);
-	http_pool_task2 = gx.img_task; //persistent for the session: may keep-alive,
-								   //so image batches share one TLS session.
+	//The image task does NOT keep-alive: its sockets would be freed cross-task
+	//by the main task's HttpConnsClose on navigation -> RX-interrupt reboot.
+	//It sends Connection: close and closes each socket itself.
 
 	while (!gx.quit)
 	{
@@ -3276,11 +3277,8 @@ gx_next:
 	Fs->draw_it = NULL;
 	http_pool_task = NULL;	// stop pooling before this task dies; ZincPageFree
 							// below closes any sockets it parked
-	http_pool_task2 = NULL;
-	while (gx.img_busy)		// let an in-flight image fetch finish cleanly
-		Sleep(5);
-	HttpConnsClose;			// close img-task-parked sockets while its heap is
-							// still alive - THEN it may die
+	while (gx.img_busy)		// let an in-flight image fetch finish before we
+		Sleep(5);			// kill the task under it
 	if (TaskValidate(gx.img_task))
 		Kill(gx.img_task);
 	if (TaskValidate(gx.load_task))

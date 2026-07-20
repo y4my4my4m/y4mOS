@@ -536,17 +536,15 @@ Bool	  http_conn_init = FALSE;
 // task sets it at startup). Every spawned/cancellable fetch task closes its
 // connections as before - it never parks one.
 public CTask *http_pool_task = NULL;
-//Second slot: the browser's persistent image-fetch task. Batch image loads
-//reuse one TLS session instead of a multi-second handshake per picture. Only
-//killed at browser exit, AFTER HttpConnsClose + clearing this pointer.
-public CTask *http_pool_task2 = NULL;
-
+//A SECOND pooling task (the browser's image fetcher) was tried and reverted:
+//it parks keep-alive sockets on its own heap, but HttpConnsClose runs from the
+//MAIN task on every navigation. A keep-alive socket stays registered with the
+//TCP RX interrupt; the main task freeing an image-task socket cross-task lets
+//the interrupt walk freed memory -> triple-fault reboot (seen navigating away
+//from an image page). Pool ONLY from the single task that also closes the pool.
 Bool HttpMayPool()
 {
-	if (http_pool_task && Fs == http_pool_task)
-		return TRUE;
-
-	return http_pool_task2 && Fs == http_pool_task2;
+	return http_pool_task && Fs == http_pool_task;
 }
 
 U0 HttpConnLockAcq()
