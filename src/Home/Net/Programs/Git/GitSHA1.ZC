@@ -1,7 +1,10 @@
 // SHA-1 (RFC 3174) for y4mOS. Git names objects by SHA-1; ZealOS ships only
 // SHA-256, so the git client carries its own. Not for security use.
 
-#define GIT_ROTL32(x, n)	(((x) << (n) | ((x) & 0xFFFFFFFF) >> (32 - (n))) & 0xFFFFFFFF)
+U32 GitRotl32(U32 x, I64 n)
+{ // HolyC has no parameterized macros -- rotate is a function, like SHA256Rotr
+	return ((x << n) | ((x & 0xFFFFFFFF) >> (32 - n))) & 0xFFFFFFFF;
+}
 
 class CSHA1
 {
@@ -20,7 +23,7 @@ U0 SHA1Block(CSHA1 *ctx, U8 *p)
 	for (t = 0; t < 16; t++)
 		w[t] = p[t*4] << 24 | p[t*4+1] << 16 | p[t*4+2] << 8 | p[t*4+3];
 	for (t = 16; t < 80; t++)
-		w[t] = GIT_ROTL32(w[t-3] ^ w[t-8] ^ w[t-14] ^ w[t-16], 1);
+		w[t] = GitRotl32(w[t-3] ^ w[t-8] ^ w[t-14] ^ w[t-16], 1);
 
 	a = ctx->state[0]; b = ctx->state[1]; c = ctx->state[2];
 	d = ctx->state[3]; e = ctx->state[4];
@@ -32,10 +35,10 @@ U0 SHA1Block(CSHA1 *ctx, U8 *p)
 		else if (t < 60)	{ f = (b & c) | (b & d) | (c & d);	k = 0x8F1BBCDC; }
 		else				{ f = b ^ c ^ d;					k = 0xCA62C1D6; }
 
-		tmp = (GIT_ROTL32(a, 5) + f + e + k + w[t]) & 0xFFFFFFFF;
+		tmp = (GitRotl32(a, 5) + f + e + k + w[t]) & 0xFFFFFFFF;
 		e = d;
 		d = c;
-		c = GIT_ROTL32(b, 30);
+		c = GitRotl32(b, 30);
 		b = a;
 		a = tmp;
 	}
@@ -103,14 +106,20 @@ U0 SHA1(U8 *data, I64 len, U8 *out)
 	SHA1Final(&ctx, out);
 }
 
+U8 GitHexDigit(I64 v)
+{ // HolyC has no ternary
+	if (v < 10)
+		return '0' + v;
+	return 'a' + v - 10;
+}
+
 U0 SHA1HexStr(U8 *hash20, U8 *out41)
 { // 20-byte digest -> 40 lowercase hex chars + NUL
 	I64 i;
 	for (i = 0; i < 20; i++)
 	{
-		U8 hi = hash20[i] >> 4, lo = hash20[i] & 0xF;
-		out41[i*2]	   = hi < 10 ? '0' + hi : 'a' + hi - 10;
-		out41[i*2 + 1] = lo < 10 ? '0' + lo : 'a' + lo - 10;
+		out41[i*2]	   = GitHexDigit(hash20[i] >> 4);
+		out41[i*2 + 1] = GitHexDigit(hash20[i] & 0xF);
 	}
 	out41[40] = 0;
 }

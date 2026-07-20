@@ -10,4 +10,4 @@ Cd(__DIR__);;
 
 #include "GitSHA1"
 #include "GitProto"
-// next: #include "GitPack"   // inflate + delta resolution + checkout
+#include "GitPack"    // inflate + delta resolution + working-tree checkout

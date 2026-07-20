@@ -1,0 +1,432 @@
+// Git packfile unpack + working-tree checkout for y4mOS.
+// Needs GitSHA1 + the shared Inflate.ZC (uz_inflate with *consumed).
+//
+// Parses a packfile into objects, inflates each (zlib), resolves ofs/ref
+// deltas, SHA1-names them, then walks the wanted commit -> tree -> blobs and
+// writes the working tree. No loose .git objects are written (the OS has no
+// DEFLATE encoder); the checkout is the deliverable.
+
+#define GIT_OBJ_COMMIT		1
+#define GIT_OBJ_TREE		2
+#define GIT_OBJ_BLOB		3
+#define GIT_OBJ_TAG			4
+#define GIT_OBJ_OFS_DELTA	6
+#define GIT_OBJ_REF_DELTA	7
+
+class CGitObj
+{
+	I64		type;			// final type 1..4 (after delta resolve), or raw 6/7 until then
+	U8		*data;			// uncompressed content (or delta instructions until resolved)
+	I64		size;			// content length
+	I64		pack_offset;	// byte offset of this object in the pack (ofs-delta base lookup)
+	U8		sha[20];		// SHA1 name (valid once resolved)
+	Bool	resolved;
+	I64		base_offset;	// ofs-delta: base object's pack offset
+	U8		base_sha[20];	// ref-delta: base object's SHA1
+};
+
+U8 *GitTypeName(I64 type)
+{
+	switch (type)
+	{
+		case GIT_OBJ_COMMIT:	return "commit";
+		case GIT_OBJ_TREE:		return "tree";
+		case GIT_OBJ_BLOB:		return "blob";
+		case GIT_OBJ_TAG:		return "tag";
+	}
+	return "?";
+}
+
+U0 GitHashObject(I64 type, U8 *data, I64 size, U8 *sha_out)
+{ // git object id = SHA1("<type> <size>\0" + content)
+	CSHA1	c;
+	U8		hdr[48];
+	I64		hlen;
+
+	StrPrint(hdr, "%s %d", GitTypeName(type), size);
+	hlen = StrLen(hdr) + 1;			// include the NUL separator
+	SHA1Init(&c);
+	SHA1Update(&c, hdr, hlen);
+	SHA1Update(&c, data, size);
+	SHA1Final(&c, sha_out);
+}
+
+U0 GitHexToBin(U8 *hex, U8 *bin, I64 nbytes)
+{
+	I64 i;
+	for (i = 0; i < nbytes; i++)
+		bin[i] = GitHexVal(hex[i*2]) << 4 | GitHexVal(hex[i*2 + 1]);
+}
+
+// --- varints ---------------------------------------------------------------
+
+I64 GitObjHeader(U8 *p, I64 *type_out, I64 *size_out)
+{ // pack object header: type (3 bits) + size (little-endian base-128). Returns bytes used.
+	I64 c = p[0], n = 1, size, shift = 4;
+	*type_out = (c >> 4) & 7;
+	size = c & 0xF;
+	while (c & 0x80)
+	{
+		c = p[n++];
+		size |= (c & 0x7F) << shift;
+		shift += 7;
+	}
+	*size_out = size;
+	return n;
+}
+
+I64 GitOfsVarint(U8 *p, I64 *val_out)
+{ // ofs-delta base distance (git's offset encoding). Returns bytes used.
+	I64 c = p[0], n = 1, val = c & 0x7F;
+	while (c & 0x80)
+	{
+		c = p[n++];
+		val = ((val + 1) << 7) | (c & 0x7F);
+	}
+	*val_out = val;
+	return n;
+}
+
+I64 GitDeltaVarint(U8 *p, I64 *val_out)
+{ // little-endian base-128 (delta source/target size). Returns bytes used.
+	I64 c = p[0], n = 1, val = c & 0x7F, shift = 7;
+	while (c & 0x80)
+	{
+		c = p[n++];
+		val |= (c & 0x7F) << shift;
+		shift += 7;
+	}
+	*val_out = val;
+	return n;
+}
+
+U32 GitU32BE(U8 *p)
+{
+	return p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3];
+}
+
+// --- lookups (return an index into objs[], or -1) --------------------------
+
+I64 GitFindByOffset(CGitObj *objs, I64 nobj, I64 offset)
+{
+	I64 i;
+	for (i = 0; i < nobj; i++)
+		if (objs[i].pack_offset == offset)
+			return i;
+	return -1;
+}
+
+I64 GitFindBySha(CGitObj *objs, I64 nobj, U8 *sha)
+{
+	I64 i;
+	for (i = 0; i < nobj; i++)
+		if (objs[i].resolved && !MemCompare(objs[i].sha, sha, 20))
+			return i;
+	return -1;
+}
+
+// --- delta application -----------------------------------------------------
+
+I64 GitApplyDelta(U8 *base, I64 base_len, U8 *delta, I64 delta_len,
+				  U8 **out, I64 *out_len)
+{
+	I64	 p = 0, oo = 0, src_size, dst_size, off, sz;
+	U8	*o;
+	U8	 c;
+
+	p += GitDeltaVarint(delta + p, &src_size);
+	p += GitDeltaVarint(delta + p, &dst_size);
+	if (src_size != base_len)
+	{
+		NetErr("git: delta base size %d != %d.", src_size, base_len);
+		return -1;
+	}
+
+	o = MAlloc(dst_size);
+	while (p < delta_len)
+	{
+		c = delta[p++];
+		if (c & 0x80)
+		{ // copy from base: offset (up to 4 bytes) + size (up to 3 bytes)
+			off = 0;
+			sz	= 0;
+			if (c & 0x01) off |= delta[p++];
+			if (c & 0x02) off |= delta[p++] << 8;
+			if (c & 0x04) off |= delta[p++] << 16;
+			if (c & 0x08) off |= delta[p++] << 24;
+			if (c & 0x10) sz  |= delta[p++];
+			if (c & 0x20) sz  |= delta[p++] << 8;
+			if (c & 0x40) sz  |= delta[p++] << 16;
+			if (sz == 0) sz = 0x10000;
+			MemCopy(o + oo, base + off, sz);
+			oo += sz;
+		}
+		else if (c)
+		{ // insert c literal bytes from the delta stream
+			MemCopy(o + oo, delta + p, c);
+			oo += c;
+			p  += c;
+		}
+	}
+
+	*out	 = o;
+	*out_len = oo;
+	return 0;
+}
+
+// --- resolve + parse -------------------------------------------------------
+
+I64 GitResolve(CGitObj *objs, I64 nobj, I64 idx)
+{ // resolve object idx (recursively resolving its delta base first). 0 on ok.
+	CGitObj	*obj = &objs[idx];
+	CGitObj	*base;
+	U8		*newdata;
+	I64		 newlen, bidx;
+
+	if (obj->resolved)
+		return 0;
+
+	if (obj->base_offset >= 0)
+		bidx = GitFindByOffset(objs, nobj, obj->base_offset);
+	else
+		bidx = GitFindBySha(objs, nobj, obj->base_sha);
+
+	if (bidx < 0)
+	{
+		NetErr("git: delta base not found (thin pack?).");
+		return -1;
+	}
+	if (!objs[bidx].resolved && GitResolve(objs, nobj, bidx) < 0)
+		return -1;
+	base = &objs[bidx];
+
+	if (GitApplyDelta(base->data, base->size, obj->data, obj->size,
+					  &newdata, &newlen) < 0)
+		return -1;
+
+	Free(obj->data);
+	obj->data = newdata;
+	obj->size = newlen;
+	obj->type = base->type;
+	GitHashObject(obj->type, obj->data, obj->size, obj->sha);
+	obj->resolved = TRUE;
+	return 0;
+}
+
+I64 GitUnpack(U8 *pack, I64 pack_len, CGitObj **objs_out, I64 *nobj_out)
+{ // parse + inflate + delta-resolve every object. Fills objs_out/nobj_out.
+	I64			 pos, nobj, i, hlen, type, size;
+	U32			 ver;
+	CGitObj		*objs;
+	CInflate	 zi;
+	U64			 consumed;
+
+	if (pack_len < 12 || pack[0] != 'P' || pack[1] != 'A' ||
+		pack[2] != 'C' || pack[3] != 'K')
+	{
+		NetErr("git: bad pack magic.");
+		return -1;
+	}
+	ver	 = GitU32BE(pack + 4);
+	nobj = GitU32BE(pack + 8);
+	if (ver != 2)
+		NetErr("git: pack version %d (expected 2), trying anyway.", ver);
+
+	objs = MAlloc(sizeof(CGitObj) * (nobj + 1));
+	MemSet(objs, 0, sizeof(CGitObj) * (nobj + 1));
+	pos = 12;
+
+	for (i = 0; i < nobj; i++)
+	{
+		objs[i].pack_offset = pos;
+		objs[i].base_offset = -1;
+
+		hlen = GitObjHeader(pack + pos, &type, &size);
+		pos += hlen;
+
+		if (type == GIT_OBJ_OFS_DELTA)
+		{
+			I64 dist;
+			pos += GitOfsVarint(pack + pos, &dist);
+			objs[i].base_offset = objs[i].pack_offset - dist;
+		}
+		else if (type == GIT_OBJ_REF_DELTA)
+		{
+			MemCopy(objs[i].base_sha, pack + pos, 20);
+			pos += 20;
+		}
+
+		// inflate this object's zlib stream (uncompressed length = size)
+		objs[i].data = MAlloc(size + 1);
+		objs[i].size = size;
+		zi.error = ZINFL_OK;
+		zi.error_line = 0;
+		consumed = 0;
+		uz_inflate(&zi, objs[i].data, size, pack + pos, pack_len - pos, &consumed);
+		if (zi.error != ZINFL_OK)
+		{
+			NetErr("git: inflate failed on object %d (err %d line %d).",
+				   i, zi.error, zi.error_line);
+			*objs_out = objs;
+			*nobj_out = i;
+			return -1;
+		}
+		pos += consumed;
+
+		if (type >= GIT_OBJ_COMMIT && type <= GIT_OBJ_TAG)
+		{ // plain object: name it now
+			objs[i].type = type;
+			GitHashObject(type, objs[i].data, size, objs[i].sha);
+			objs[i].resolved = TRUE;
+		}
+		else
+			objs[i].type = type;	// delta: left for the resolve pass
+	}
+
+	// resolve deltas (recursive; bases may themselves be deltas)
+	for (i = 0; i < nobj; i++)
+		if (!objs[i].resolved && GitResolve(objs, nobj, i) < 0)
+		{
+			*objs_out = objs;
+			*nobj_out = nobj;
+			return -1;
+		}
+
+	*objs_out = objs;
+	*nobj_out = nobj;
+	return 0;
+}
+
+// --- checkout --------------------------------------------------------------
+
+I64 GitWriteTree(CGitObj *objs, I64 nobj, U8 *tree_sha, U8 *dir)
+{ // walk a tree object, writing blobs as files and recursing into subtrees.
+	I64		 ti = GitFindBySha(objs, nobj, tree_sha);
+	CGitObj	*tree;
+	I64		 p, i, ei, nfiles = 0;
+	U8		 mode[16], name[256];
+	U8		*child;
+
+	if (ti < 0)
+	{
+		NetErr("git: tree object missing from pack.");
+		return -1;
+	}
+	tree = &objs[ti];
+	if (tree->type != GIT_OBJ_TREE)
+	{
+		NetErr("git: expected tree, got type %d.", tree->type);
+		return -1;
+	}
+
+	p = 0;
+	while (p < tree->size)
+	{
+		// entry = "<mode> <name>\0<20-byte sha>"
+		i = 0;
+		while (p < tree->size && tree->data[p] != ' ' && i < 15)
+			mode[i++] = tree->data[p++];
+		mode[i] = 0;
+		p++;							// skip space
+		i = 0;
+		while (p < tree->size && tree->data[p] != 0 && i < 255)
+			name[i++] = tree->data[p++];
+		name[i] = 0;
+		p++;							// skip NUL
+		ei = GitFindBySha(objs, nobj, tree->data + p);
+		p += 20;
+
+		child = MStrPrint("%s/%s", dir, name);
+
+		if (!StrCmp(mode, "40000"))
+		{ // subdirectory
+			DirMake(child);
+			if (ei >= 0)
+				GitWriteTree(objs, nobj, objs[ei].sha, child);
+		}
+		else if (!StrCmp(mode, "160000"))
+			; // gitlink (submodule): no content in this pack, skip
+		else if (ei >= 0)
+		{ // blob (regular file, executable, or symlink) -> write bytes
+			FileWrite(child, objs[ei].data, objs[ei].size);
+			nfiles++;
+		}
+		Free(child);
+	}
+	return nfiles;
+}
+
+I64 GitCheckout(CGitObj *objs, I64 nobj, U8 *commit_sha_bin, U8 *dir)
+{ // commit -> tree -> working tree under dir. Returns file count or -1.
+	I64		 ci = GitFindBySha(objs, nobj, commit_sha_bin);
+	CGitObj	*commit;
+	U8		 tree_hex[41], tree_bin[20];
+	I64		 i;
+
+	if (ci < 0 || objs[ci].type != GIT_OBJ_COMMIT)
+	{
+		NetErr("git: HEAD commit not found in pack.");
+		return -1;
+	}
+	commit = &objs[ci];
+	// commit content begins "tree <40 hex>\n"
+	if (commit->size < 46 || MemCompare(commit->data, "tree ", 5))
+	{
+		NetErr("git: malformed commit object.");
+		return -1;
+	}
+	for (i = 0; i < 40; i++)
+		tree_hex[i] = commit->data[5 + i];
+	tree_hex[40] = 0;
+	GitHexToBin(tree_hex, tree_bin, 20);
+
+	DirMake(dir);
+	return GitWriteTree(objs, nobj, tree_bin, dir);
+}
+
+U0 GitFreeObjs(CGitObj *objs, I64 nobj)
+{
+	I64 i;
+	for (i = 0; i < nobj; i++)
+		if (objs[i].data)
+			Free(objs[i].data);
+	Free(objs);
+}
+
+public U0 GitClone(U8 *base, U8 *dir="::/Tmp/GitClone")
+{ /* Full clone over HTTPS: fetch pack, unpack, check out the working tree.
+	  GitClone("https://github.com/user/repo");
+	  GitClone("https://host/user/repo", "::/Home/repo"); */
+	CGitRef	*refs = MAlloc(sizeof(CGitRef) * 512);
+	CGitObj	*objs = NULL;
+	U8		*head, *pack;
+	U8		 head_bin[20];
+	I64		 n, pack_len, nobj, nfiles;
+
+	"$$LTBLUE$$--- git clone %s -> %s ---$$FG$$\n", base, dir;
+
+	n = GitLsRemoteInto(base, refs, 512);
+	if (n < 0)			{ "$$RED$$ref discovery failed.$$FG$$\n"; Free(refs); return; }
+	head = GitPickHead(refs, n);
+	if (!head)			{ "$$RED$$no refs.$$FG$$\n"; Free(refs); return; }
+	"HEAD = %s\nFetching pack...\n", head;
+
+	if (GitFetchPack(base, head, &pack, &pack_len) < 0)
+	{ "$$RED$$pack fetch failed.$$FG$$\n"; Free(refs); return; }
+	"Got %d-byte pack. Unpacking...\n", pack_len;
+
+	if (GitUnpack(pack, pack_len, &objs, &nobj) < 0)
+	{ "$$RED$$unpack failed.$$FG$$\n"; if (objs) GitFreeObjs(objs, nobj); Free(pack); Free(refs); return; }
+	"Unpacked %d objects. Writing working tree...\n", nobj;
+
+	GitHexToBin(head, head_bin, 20);
+	nfiles = GitCheckout(objs, nobj, head_bin, dir);
+	if (nfiles < 0)
+		"$$RED$$checkout failed.$$FG$$\n";
+	else
+		"$$GREEN$$Clone complete: %d files under %s$$FG$$\n", nfiles, dir;
+
+	GitFreeObjs(objs, nobj);
+	Free(pack);
+	Free(refs);
+}

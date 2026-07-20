@@ -1,0 +1,195 @@
+// Git-over-SSH clone for y4mOS. Bridges the SSH client and the git packfile
+// code, so BOTH must be loaded first:
+//   #include "C:/Home/Net/Programs/SSH/SSH"
+//   #include "C:/Home/Net/Programs/Git/Git"
+//   #include "C:/Home/Net/Programs/Git/GitSSH"
+//   GitCloneSSH("host",22,"user","pw","/srv/repo.git","::/Tmp/repo");
+//
+// Runs `git-upload-pack '<repo>'` on the server and speaks the v0 pack
+// protocol over the exec channel (ref advertisement -> want/done -> packfile),
+// then reuses GitUnpack + GitCheckout. No side-band: the pack follows NAK raw.
+
+class CGitSSHStream
+{ // buffered reader over an SSH channel's stdout
+	CSSHChan	*chan;
+	U8			*buf;
+	I64			 cap;
+	I64			 len;
+	I64			 pos;
+	Bool		 eof;
+};
+
+U0 GitSSHStreamInit(CGitSSHStream *s, CSSHChan *chan)
+{
+	s->chan = chan;
+	s->cap	= 0x20000;
+	s->buf	= MAlloc(s->cap);
+	s->len	= 0;
+	s->pos	= 0;
+	s->eof	= FALSE;
+}
+
+Bool GitSSHFill(CGitSSHStream *s)
+{ // pump the channel until one data chunk arrives (append it) or EOF. FALSE = EOF.
+	U8	*tmp = MAlloc(SSH_MAX_PACKET);
+	I64	 n, type;
+	Bool got = FALSE;
+
+	while (!got)
+	{
+		type = SSHChannelPump(s->chan, tmp, &n);
+		if (type == SSHCH_DATA && n > 0)
+		{
+			if (s->len + n > s->cap)
+			{ // grow, keeping the unread window intact
+				I64	 ncap = s->cap * 2;
+				U8	*nb;
+				while (ncap < s->len + n)
+					ncap *= 2;
+				nb = MAlloc(ncap);
+				MemCopy(nb, s->buf, s->len);
+				Free(s->buf);
+				s->buf = nb;
+				s->cap = ncap;
+			}
+			MemCopy(s->buf + s->len, tmp, n);
+			s->len += n;
+			got = TRUE;
+		}
+		else if (type == SSHCH_EOF || type == SSHCH_CLOSE || type == SSHCH_ERR)
+		{
+			s->eof = TRUE;
+			break;
+		}
+		// WADJ / REQ / OTHER: keep pumping
+	}
+	Free(tmp);
+	return got;
+}
+
+Bool GitSSHEnsure(CGitSSHStream *s, I64 n)
+{ // ensure at least n unread bytes are buffered
+	while (s->len - s->pos < n && !s->eof)
+		GitSSHFill(s);
+	return (s->len - s->pos) >= n;
+}
+
+I64 GitSSHReadPkt(CGitSSHStream *s, I64 *payload_off)
+{ // read one pkt-line. Returns payload length (0 = flush-pkt) or -1 at end.
+  // *payload_off is the offset into s->buf of the payload (valid until next read).
+	I64 plen;
+
+	if (!GitSSHEnsure(s, 4))
+		return -1;
+	plen = GitPktLen(s->buf + s->pos);
+	if (plen == 0)
+	{
+		s->pos += 4;
+		*payload_off = s->pos;
+		return 0;
+	}
+	if (plen < 4 || !GitSSHEnsure(s, plen))
+		return -1;
+	*payload_off = s->pos + 4;
+	s->pos += plen;
+	return plen - 4;
+}
+
+I64 GitCloneSSH(U8 *host, U16 port, U8 *user, U8 *password,
+				U8 *repo, U8 *dir="::/Tmp/GitClone")
+{ // returns file count, or -1.
+	CSSH			*ssh;
+	CSSHChan		*chan;
+	CGitSSHStream	 s;
+	CGitRef			*refs = MAlloc(sizeof(CGitRef) * 512);
+	CGitObj			*objs = NULL;
+	U8				*cmd, *req, *head, *pack;
+	U8				 head_bin[20];
+	I64				 nref = 0, dlen, off, i, j, reqlen, nobj, nfiles = -1;
+
+	s.buf = NULL;	// so cleanup can tell whether the stream was initialised
+
+	"$$LTBLUE$$--- git clone (ssh) %s@%s:%s ---$$FG$$\n", user, host, repo;
+
+	ssh = SSHTransportConnect(host, port);
+	if (!ssh)								{ "$$RED$$SSH handshake failed.$$FG$$\n"; Free(refs); return -1; }
+	if (SSHServiceRequest(ssh, "ssh-userauth") < 0 ||
+		!SSHAuthPassword(ssh, user, password))
+	{ "$$RED$$SSH auth failed.$$FG$$\n"; SSHTransportClose(ssh); Free(refs); return -1; }
+
+	chan = SSHChannelOpen(ssh);
+	if (!chan)								{ "$$RED$$channel open failed.$$FG$$\n"; SSHTransportClose(ssh); Free(refs); return -1; }
+
+	cmd = MStrPrint("git-upload-pack '%s'", repo);
+	ssh_interactive = TRUE;					// block for server data, no stall deadline
+	if (SSHChannelExec(chan, cmd) < 0)
+	{ "$$RED$$exec git-upload-pack failed.$$FG$$\n"; Free(cmd); goto cleanup; }
+	Free(cmd);
+
+	// --- read the ref advertisement (pkt-lines up to the flush) -----------
+	GitSSHStreamInit(&s, chan);
+	while (TRUE)
+	{
+		dlen = GitSSHReadPkt(&s, &off);
+		if (dlen <= 0)
+			break;							// flush (0) or end (-1)
+		if (dlen >= 40 && s.buf[off] != '#' && nref < 512)
+		{ // "<40 hex> <name>[\0caps][\n]"
+			for (i = 0; i < 40; i++)
+				refs[nref].sha[i] = s.buf[off + i];
+			refs[nref].sha[40] = 0;
+			j = 41;
+			i = 0;
+			while (j < dlen && s.buf[off + j] != 0 && s.buf[off + j] != '\n' && i < 255)
+				refs[nref].name[i++] = s.buf[off + j++];
+			refs[nref].name[i] = 0;
+			nref++;
+		}
+	}
+	if (nref == 0)							{ "$$RED$$no refs advertised.$$FG$$\n"; goto cleanup; }
+	head = GitPickHead(refs, nref);
+	"HEAD = %s\n", head;
+
+	// --- send want + done -------------------------------------------------
+	req	   = MAlloc(128);
+	reqlen = 0;
+	{
+		U8 line[80];
+		StrPrint(line, "want %s\n", head);
+		reqlen = GitPktPut(req, reqlen, line);
+	}
+	MemCopy(req + reqlen, "0000", 4);	reqlen += 4;
+	reqlen = GitPktPut(req, reqlen, "done\n");
+	SSHChannelSend(chan, req, reqlen);
+	Free(req);
+
+	// --- read NAK then the raw packfile (to channel EOF) ------------------
+	dlen = GitSSHReadPkt(&s, &off);			// "NAK\n"
+	while (!s.eof)							// pull the rest of the pack
+		GitSSHFill(&s);
+	pack = s.buf + s.pos;
+	dlen = s.len - s.pos;
+	"Got %d-byte pack. Unpacking...\n", dlen;
+
+	if (GitUnpack(pack, dlen, &objs, &nobj) < 0)
+	{ "$$RED$$unpack failed.$$FG$$\n"; goto cleanup; }
+	"Unpacked %d objects. Writing tree...\n", nobj;
+
+	GitHexToBin(head, head_bin, 20);
+	DirMake(dir);
+	nfiles = GitCheckout(objs, nobj, head_bin, dir);
+	if (nfiles < 0)
+		"$$RED$$checkout failed.$$FG$$\n";
+	else
+		"$$GREEN$$Clone complete: %d files under %s$$FG$$\n", nfiles, dir;
+
+cleanup:
+	if (objs)	GitFreeObjs(objs, nobj);
+	if (s.buf)	Free(s.buf);
+	SSHChannelClose(chan);
+	Free(chan);
+	ssh_interactive = FALSE;
+	SSHTransportClose(ssh);
+	Free(refs);
+	return nfiles;
+}
