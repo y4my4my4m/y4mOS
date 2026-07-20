@@ -1,4 +1,4 @@
-// Git smart-HTTP client (protocol v0) for y4mOS. Needs the HTTP stack.
+// Git smart-HTTP client (protocol v0) for YKD. Needs the HTTP stack.
 //
 // Implemented: pkt-line framing, ref discovery (GET info/refs), and packfile
 // fetch (POST git-upload-pack, want/done, no side-band). This is the network

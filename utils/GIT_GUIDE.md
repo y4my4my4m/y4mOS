@@ -1,6 +1,6 @@
-# y4mOS Git Client — User Guide
+# YKD Git Client — User Guide
 
-A git client for ZealOS/y4mOS. Clones repositories two ways:
+A git client for ZealOS/YKD. Clones repositories two ways:
 
 - **over HTTPS** (`GitClone`) — uses the TLS/HTTP stack, no auth needed for
   public repos.
@@ -134,12 +134,12 @@ Public-key auth is shared with the SSH client. Full details are in
 SSHKeyGen;          // generates the key, prints the authorized_keys line
 ```
 
-Copy the printed `ssh-ed25519 AAAA... y4mos@zealos` line onto the git server:
+Copy the printed `ssh-ed25519 AAAA... YKD@zealos` line onto the git server:
 
 ```bash
 # on the server, for the account you clone as (e.g. 'git' or 'root')
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
-echo 'ssh-ed25519 AAAA... y4mos@zealos' >> ~/.ssh/authorized_keys
+echo 'ssh-ed25519 AAAA... YKD@zealos' >> ~/.ssh/authorized_keys
 chmod 600 ~/.ssh/authorized_keys
 ```
 

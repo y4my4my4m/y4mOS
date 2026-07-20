@@ -1,4 +1,4 @@
-// SHA-1 (RFC 3174) for y4mOS. Git names objects by SHA-1; ZealOS ships only
+// SHA-1 (RFC 3174) for YKD. Git names objects by SHA-1; ZealOS ships only
 // SHA-256, so the git client carries its own. Not for security use.
 
 U32 GitRotl32(U32 x, I64 n)

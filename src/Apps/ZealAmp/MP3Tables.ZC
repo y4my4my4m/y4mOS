@@ -1,4 +1,4 @@
-//y4mOS MP3 decoder tables - mechanically extracted from PDMP3 (public domain,
+//YKD MP3 decoder tables - mechanically extracted from PDMP3 (public domain,
 //Krister Lagerstrom / Erik Hofman / technosaurus). Do not hand-edit.
 
 #define MP3_HUFF_SIZE 2804

@@ -1,4 +1,4 @@
-//y4mOS DE widget toolkit - truecolor widgets inside NORMAL ZealOS task
+//YKD DE widget toolkit - truecolor widgets inside NORMAL ZealOS task
 //windows (erythros Widget.HC design, rewritten native; no ELF, no FFI).
 //
 //How it works: the app task hangs DEWidgetsDrawIt() on Fs->draw_it - it

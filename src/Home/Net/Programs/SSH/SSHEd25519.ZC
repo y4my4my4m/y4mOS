@@ -1,4 +1,4 @@
-// Ed25519 (RFC 8032) sign + keygen for y4mOS. Ported from TweetNaCl, reusing
+// Ed25519 (RFC 8032) sign + keygen for YKD. Ported from TweetNaCl, reusing
 // the field arithmetic already in Crypto/X25519.ZC (X25519Add/Sub/Mul/Sq/Inv/
 // Car/Sel/Pack == TweetNaCl A/Z/M/S/inv25519/car25519/sel25519/pack25519).
 // Needs SHA512 (SSHSHA512.ZC). Verify is not needed for client pubkey auth, so

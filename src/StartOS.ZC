@@ -101,7 +101,7 @@ LBts(&sys_run_level, RLf_HOME);
 
 //After the warning Options are OFF, like MakeHome below.
 if (FileFind("::/DE/MakeDE.ZC"))
-	ExeFile("::/DE/MakeDE"); //y4mOS desktop environment (wallpaper + taskbar), auto-starts.
+	ExeFile("::/DE/MakeDE"); //YKD desktop environment (wallpaper + taskbar), auto-starts.
 
 #help_index ""
 #include "~/MakeHome"

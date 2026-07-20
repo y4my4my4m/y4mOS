@@ -37,7 +37,7 @@ public class CGrGlobals
 
 	U16			*win_z_buf;
 
-	//Rows at screen bottom reserved for the y4mOS DE taskbar. When non-zero,
+	//Rows at screen bottom reserved for the YKD DE taskbar. When non-zero,
 	//$LK,"WinVert",A="MN:WinVert"$() keeps bordered windows above them. 0 = stock behavior.
 	I64			 reserved_bottom_rows;
 

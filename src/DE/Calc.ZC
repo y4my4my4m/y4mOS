@@ -1,5 +1,5 @@
-//y4mOS Calculator - DE-native widget app (erythros Calculator.app, reborn
-//in pure ZealC on the y4mOS widget toolkit). Run with DECalc; <ESC> exits.
+//YKD Calculator - DE-native widget app (erythros Calculator.app, reborn
+//in pure ZealC on the YKD widget toolkit). Run with DECalc; <ESC> exits.
 
 class CDECalcState
 {

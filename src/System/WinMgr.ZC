@@ -796,7 +796,7 @@ wmt_start:
 						}
 						DocUnlock(doc);
 						old_mouse.lb = TRUE;
-						//y4mOS: a click that FOCUSES a window used to be
+						//YKD: a click that FOCUSES a window used to be
 						//swallowed here (edge consumed, no message queued).
 						//Forward it so click-to-focus also delivers the click.
 						if (!was_focused && task == sys_focus_task)

@@ -1,4 +1,4 @@
-//y4mOS scalable TrueType text renderer. Pure ZealC - no ELF, no FFI.
+//YKD scalable TrueType text renderer. Pure ZealC - no ELF, no FFI.
 //A System/Gr FACILITY: truecolor GUI apps (the web browser, YDE widgets) draw
 //proportional, any-size text through it. The 8x8 DolDoc cell font is untouched;
 //this does not replace it, it sits beside it for apps that opt in.

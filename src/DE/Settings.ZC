@@ -1,4 +1,4 @@
-//y4mOS Settings - first DE-native widget app. Run with DESettings;
+//YKD Settings - first DE-native widget app. Run with DESettings;
 //(the launcher menu does it via a terminal task). <ESC> exits.
 
 Bool de_settings_done;

@@ -1,4 +1,4 @@
-// SSH key generation + storage + a minimal in-memory "agent" for y4mOS.
+// SSH key generation + storage + a minimal in-memory "agent" for YKD.
 // Needs SSHEd25519. Keys live in a VISIBLE directory (no Unix dotfolders --
 // ZealOS is flat/KISS): C:/Home/Config/SSH/.
 
@@ -54,7 +54,7 @@ U0 SSHAuthKeyLine(U8 *pk32, U8 *out)
 	bl = SSHPutStringZ(blob, bl, "ssh-ed25519");
 	bl = SSHPutString(blob, bl, pk32, 32);
 	SSHB64(blob, bl, b64);
-	StrPrint(out, "ssh-ed25519 %s y4mos@zealos", b64);
+	StrPrint(out, "ssh-ed25519 %s YKD@zealos", b64);
 }
 
 public U0 SSHKeyGen()

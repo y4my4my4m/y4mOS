@@ -1,5 +1,5 @@
-//ZealAmp for y4mOS - Winamp-style audio player.
-//Port of y4my4m's ZealAmp Player32.ZC, rewritten for the y4mOS truecolor
+//ZealAmp for YKD - Winamp-style audio player.
+//Port of y4my4m's ZealAmp Player32.ZC, rewritten for the YKD truecolor
 //graphics pipeline: the skin renders with plain GrBlot() into the window's
 //z-clipped draw_it DC - no more raw text.fb_alias framebuffer pokes, so the
 //window drags, overlaps and stacks like any other.
@@ -732,7 +732,7 @@ U0 ZAToneLoad()
 		pcm[i].i16[0] = ToI64(v);
 		pcm[i].i16[1] = ToI64(v);
 	}
-	ZAMediaSet(pcm, frames, 2, 48, "y4mOS TEST TONE");
+	ZAMediaSet(pcm, frames, 2, 48, "YKD TEST TONE");
 	zamp.media.bitrate_kbps = 1536;
 }
 
@@ -771,7 +771,7 @@ public U0 ZealAmp()
 	}
 	ZADrawControlsIdle(ZA_IMG_MAIN, 19, 90);
 
-	ZAMarqueeSet("ZealAmp on y4mOS - truecolor, native MP3+WAV, no ELF *** EJECT loads a song, T = test tone *** ");
+	ZAMarqueeSet("ZealAmp on YKD - truecolor, native MP3+WAV, no ELF *** EJECT loads a song, T = test tone *** ");
 	zamp.media.stopped = TRUE;
 	zamp.stream_id = AudioAvailableOutputStreamGet;
 	if (zamp.stream_id < 0)

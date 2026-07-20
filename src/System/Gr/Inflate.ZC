@@ -1,4 +1,4 @@
-// DEFLATE / zlib inflate for y4mOS. Extracted from GrPNG so PNG, HTTP gzip,
+// DEFLATE / zlib inflate for YKD. Extracted from GrPNG so PNG, HTTP gzip,
 // and the git packfile reader share one inflater instead of each carrying a
 // copy. Decoupled from upng_t: errors go through CInflate. Loaded before
 // GrPNG in MakeGr.

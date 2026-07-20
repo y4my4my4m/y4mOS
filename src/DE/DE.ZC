@@ -1,4 +1,4 @@
-//y4mOS Desktop Environment - phase 4.
+//YKD Desktop Environment - phase 4.
 //
 //Wallpaper: truecolor DC blotted behind all windows by hanging a draw_it on
 //sys_winmgr_task. GrBlot() honors gr.win_z_buf, so the image only lands on

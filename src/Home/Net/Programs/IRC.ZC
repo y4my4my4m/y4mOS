@@ -388,7 +388,7 @@ U0 IrcInputLine(U8 *msg)
 		if (*arg)
 			IrcSendF("QUIT :%s", arg);
 		else
-			IrcSendF("QUIT :YIRC on y4mOS");
+			IrcSendF("QUIT :YIRC on YKD");
 		irc_quit = TRUE;
 	}
 	else
@@ -486,7 +486,7 @@ U0 IRC(U8 *host=NULL, U16 port=IRC_PORT, U8 *nick=NULL, U8 *autojoin=NULL)
 	}
 
 	IrcSendF("NICK %s", irc_nick);
-	IrcSendF("USER %s 0 * :YIRC on y4mOS", irc_nick);
+	IrcSendF("USER %s 0 * :YIRC on YKD", irc_nick);
 
 	IrcWindowsInit;
 

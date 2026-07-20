@@ -1,4 +1,4 @@
-// SSH-2 client for y4mOS, by y4my4m. Public Domain.
+// SSH-2 client for YKD, by y4my4m. Public Domain.
 //
 //   #include "C:/Home/Net/Programs/SSH/SSH"
 //   SSH("host", 22, "user");        // interactive shell (Shift+Esc quits)

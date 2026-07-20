@@ -1,4 +1,4 @@
-/*	ZincGX: the y4mOS GUI frontend for the Zinc browser engine.
+/*	ZincGX: the YKD GUI frontend for the Zinc browser engine.
 
 	Zinc's engine (Zinc/HTML CSS JS + WebBrowser.ZC fetch/history/forms) is
 	UI-agnostic; only ZincShow renders DolDoc. ZincGX replaces that with a

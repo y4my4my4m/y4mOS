@@ -1,4 +1,4 @@
-// Network clipboard for y4mOS (QEMU guest <-> host). ZealOS has no SPICE guest
+// Network clipboard for YKD (QEMU guest <-> host). ZealOS has no SPICE guest
 // agent, so no native clipboard -- instead we bridge over HTTP. Run the host
 // daemon (clipd.py, same folder) on your Manjaro box; the guest reaches it at
 // 10.0.2.2 (QEMU user-net gateway). Needs the Net stack loaded.

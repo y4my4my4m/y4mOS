@@ -1138,4 +1138,4 @@ zinc_next:;
 	DocPrint(Fs->display_doc, "Zinc closed.\n");
 }
 
-//Zinc; //y4mOS: launched from the DE menu instead (compiled system-wide via Sys).
+//Zinc; //YKD: launched from the DE menu instead (compiled system-wide via Sys).

@@ -1,4 +1,4 @@
-//y4mOS native PNG decoder + truecolor DC loader.
+//YKD native PNG decoder + truecolor DC loader.
 //No ELF, no FFI -- pure ZealC. See PNGRead(), PNGReadRGBA(), PNGDims().
 
 /*

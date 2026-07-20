@@ -1,4 +1,4 @@
-// Git packfile unpack + working-tree checkout for y4mOS.
+// Git packfile unpack + working-tree checkout for YKD.
 // Needs GitSHA1 + the shared Inflate.ZC (uz_inflate with *consumed).
 //
 // Parses a packfile into objects, inflates each (zlib), resolves ofs/ref

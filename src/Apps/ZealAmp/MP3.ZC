@@ -1,4 +1,4 @@
-//y4mOS native MP3 decoder - MPEG-1 Layer III, pure ZealC. No ELF, no FFI.
+//YKD native MP3 decoder - MPEG-1 Layer III, pure ZealC. No ELF, no FFI.
 //Hand-ported from PDMP3 (public domain, Krister Lagerstrom / Erik Hofman /
 //technosaurus); tables in MP3Tables.ZC are machine-extracted from the same.
 //F64 math throughout; trig/window tables computed at first use.

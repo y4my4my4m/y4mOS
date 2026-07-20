@@ -1,4 +1,4 @@
-// SSH-2 transport for y4mOS, by y4my4m. Public Domain.
+// SSH-2 transport for YKD, by y4my4m. Public Domain.
 //
 // Version exchange, binary packets, curve25519-sha256 KEX, exchange hash H,
 // RFC 4253 key derivation, chacha20-poly1305@openssh AEAD. After
@@ -17,7 +17,7 @@
 #define SSH_MSG_KEX_ECDH_REPLY		31
 
 #define SSH_MAX_PACKET				35000	// sanity cap on an inbound packet
-#define SSH_VERSION_STRING			"SSH-2.0-y4mOS_0.1"
+#define SSH_VERSION_STRING			"SSH-2.0-YKD_0.1"
 
 class CSSH
 {

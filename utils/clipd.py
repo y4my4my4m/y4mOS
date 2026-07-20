@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Host-side clipboard bridge for the y4mOS network clipboard (Clip.ZC).
+# Host-side clipboard bridge for the YKD network clipboard (Clip.ZC).
 # Run on the QEMU HOST (Manjaro). The guest reaches it at 10.0.2.2:9999 via
 # QEMU user-mode networking.
 #
@@ -58,5 +58,5 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 9999
-    print(f"y4mOS clipboard bridge on 0.0.0.0:{port} (guest -> http://10.0.2.2:{port})")
+    print(f"YKD clipboard bridge on 0.0.0.0:{port} (guest -> http://10.0.2.2:{port})")
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()

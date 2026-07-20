@@ -1,4 +1,4 @@
-// Git-over-SSH clone for y4mOS. Bridges the SSH client and the git packfile
+// Git-over-SSH clone for YKD. Bridges the SSH client and the git packfile
 // code, so BOTH must be loaded first:
 //   #include "C:/Home/Net/Programs/SSH/SSH"
 //   #include "C:/Home/Net/Programs/Git/Git"

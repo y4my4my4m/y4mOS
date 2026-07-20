@@ -1,4 +1,4 @@
-//y4mOS native AC'97 audio driver + software mixer.
+//YKD native AC'97 audio driver + software mixer.
 //Ported from ZealAmp/erythros (Alec Murphy / y4my4m), adapted to the ZealOS
 //kernel PCI API. Pure ZealC - no ELF, no FFI. Polling driven (no IRQs).
 //

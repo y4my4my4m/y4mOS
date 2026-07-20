@@ -1,4 +1,4 @@
-// SHA-512 (FIPS 180-4) for y4mOS. Needed by Ed25519 (SSH pubkey auth).
+// SHA-512 (FIPS 180-4) for YKD. Needed by Ed25519 (SSH pubkey auth).
 // ZealOS ships SHA-256 only. U64 is native 64-bit so rotates need no masking.
 
 U64 sha512_k[80] = {

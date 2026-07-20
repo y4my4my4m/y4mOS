@@ -1,6 +1,6 @@
-# y4mOS SSH Client — User Guide
+# YKD SSH Client — User Guide
 
-An SSH-2 client for ZealOS/y4mOS: interactive shells, one-off commands, and
+An SSH-2 client for ZealOS/YKD: interactive shells, one-off commands, and
 Ed25519 public-key authentication. Password and public-key auth are supported.
 
 > **Security note (read once).** This client does **not** verify the server's
@@ -83,7 +83,7 @@ Prints the command's stdout/stderr, then the exit status.
 
 ## 5. Public-key authentication (Ed25519)
 
-Public-key auth means the server recognizes your y4mOS key and lets you in with
+Public-key auth means the server recognizes your YKD key and lets you in with
 no password. Do this once per machine.
 
 ### 5.1 Generate a key
@@ -100,7 +100,7 @@ This:
 - prints the line to install on the server, e.g.:
 
 ```
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... y4mos@zealos
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... YKD@zealos
 ```
 
 > Keys live in a **visible** directory (`C:/Home/Config/SSH/`) — no hidden
@@ -113,7 +113,7 @@ Copy the printed `ssh-ed25519 ...` line and append it to the server account's
 
 ```bash
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
-echo 'ssh-ed25519 AAAA... y4mos@zealos' >> ~/.ssh/authorized_keys
+echo 'ssh-ed25519 AAAA... YKD@zealos' >> ~/.ssh/authorized_keys
 chmod 600 ~/.ssh/authorized_keys
 ```
 
