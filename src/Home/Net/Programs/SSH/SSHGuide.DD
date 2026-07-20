@@ -1,0 +1,108 @@
+$WW,1$$FG,5$$TX+CX,"YKD SSH Client Guide"$$FG$
+
+An SSH-2 client for ZealOS: interactive shells, one-off commands, and Ed25519 public-key authentication.  Password and public-key auth are both supported.  This guide only $FG,2$shows$FG$ commands -- nothing here runs on its own; type the commands yourself.
+
+$FG,4$Security note.$FG$  This client does $UL,1$not$UL,0$ verify the server's host key (accept-any), the same posture as the TLS stack.  It stops passive eavesdropping but $UL,1$not$UL,0$ an active man-in-the-middle.  Password prompts are shown in the clear.
+
+$FG,5$--- 1. Load the client ---$FG$
+
+The network stack must be up first (you should see an IP such as 10.0.2.15 in the Network Report).  Then load:
+
+$FG,2$#include "C:/Home/Net/Programs/SSH/SSH"$FG$
+
+That pulls in the transport, crypto (SHA-512, Ed25519), auth, channel, keygen and terminal modules.  Source: $LK,"SSH.ZC",A="FI:::/Home/Net/Programs/SSH/SSH.ZC"$.
+
+$FG,5$--- 2. Smoke tests (run these first) ---$FG$
+
+$FG,2$SSHCryptoTest;$FG$              SHA-512 + Ed25519 known-answer tests.  BOTH must be green.
+$FG,2$SSHTransportTest("HOST", 22);$FG$   Full handshake + cipher against a real server.
+
+$ID,2$SSHTransportTest prints each stage inline:
+  [ssh] TCP connected.
+  [ssh] server version: SSH-2.0-OpenSSH_...
+  [ssh] KEXINIT exchanged.
+  [ssh] ECDH reply received.
+  [ssh] NEWKEYS done, keys derived. Channel encrypted.
+  SERVICE_ACCEPT received -- transport + cipher VERIFIED.
+If it stops early, the last [ssh] line names the failed stage.$ID,-2$
+
+$FG,5$--- 3. Interactive shell ---$FG$
+
+$FG,2$SSH;$FG$                          Prompts for host, user, (password).
+$FG,2$SSH("192.168.1.10");$FG$          Prompts for user, (password).
+$FG,2$SSH("192.168.1.10", 22, "root");$FG$   Prompts only for a password (if no key loaded).
+
+$ID,2$If a key is loaded (section 5) it tries public-key auth first, no password.
+$FG,4$Shift+Esc$FG$ quits the session.
+The terminal is a scrolling DolDoc view (a "dumb" pty), good for shells, ls, cat, git -- full-screen apps (vim, htop) will look rough.$ID,-2$
+
+$FG,5$--- 4. Run one command ---$FG$
+
+$FG,2$SSHRun("192.168.1.10", 22, "root", "PASSWORD", "uname -a");$FG$
+
+Prints the command output, then its exit status.  (SSHRun uses password auth.)
+
+$FG,5$--- 5. Public-key authentication (Ed25519) ---$FG$
+
+Log in with your YKD key instead of a password.  Do this once per machine.
+
+$FG,3$5.1 Generate a key$FG$
+
+$FG,2$SSHKeyGen;$FG$
+
+This makes an Ed25519 keypair, saves it, loads it into the in-memory agent, and prints the line to install on the server, e.g.:
+
+$ID,2$ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... y4mos@zealos$ID,-2$
+
+Keys are stored in a $UL,1$visible$UL,0$ directory (no hidden dotfolders -- ZealOS is flat):
+$ID,2$C:/Home/Config/SSH/Ed25519.key    (private: seed + public)
+C:/Home/Config/SSH/Ed25519.pub    (the authorized_keys line)$ID,-2$
+
+$FG,3$5.2 Install the public key on the server$FG$
+
+Copy the printed ssh-ed25519 line into the server account's ~/.ssh/authorized_keys (one line).  On the server:
+
+$ID,2$mkdir -p ~/.ssh && chmod 700 ~/.ssh
+echo 'ssh-ed25519 AAAA... y4mos@zealos' >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys$ID,-2$
+
+To get the key text out of the VM, use the network clipboard: run $FG,2$SSHKeyShow;$FG$ then $FG,2$ClipCopy(...)$FG$ (see $LK,"Clip.ZC",A="FI:::/Home/Net/Programs/Clip/Clip.ZC"$).
+
+$FG,3$5.3 Use it$FG$
+
+$FG,2$SSH("192.168.1.10", 22, "root");$FG$   Logs in with the key, no password.
+
+$FG,3$5.4 After a reboot$FG$
+
+The private key persists on disk; the in-memory agent does not.  Reload it:
+
+$FG,2$#include "C:/Home/Net/Programs/SSH/SSH"$FG$
+$FG,2$SSHKeyLoad;$FG$
+
+$FG,5$--- 6. Command reference ---$FG$
+
+$ID,2$SSH(host, port=22, user=NULL)      Interactive shell; key auth if loaded, else password.  Shift+Esc quits.
+SSHRun(host, port, user, pw, cmd) Run one command over password auth; print output.
+SSHTransportTest(host, port=22)   Handshake + cipher smoke test, inline stages.
+SSHCryptoTest                     SHA-512 + Ed25519 self-test.
+SSHKeyGen                         Generate + save + load a key; print authorized_keys line.
+SSHKeyLoad                        Load the saved key into the agent (after a reboot).
+SSHKeyShow                        Print the public authorized_keys line.$ID,-2$
+
+$FG,5$--- 7. Troubleshooting ---$FG$
+
+$ID,2$$FG,4$Handshake failed / stops at ECDH$FG$ -- usually an algorithm mismatch.  The client offers curve25519-sha256 + chacha20-poly1305 only; very old servers that disable these will drop you.  Read the inline [ssh] stage and the Network Log.
+
+$FG,4$Authentication failed$FG$ -- wrong password, key not in the server's authorized_keys, or the user is disallowed (e.g. root login disabled).
+
+$FG,4$Freezes for a while$FG$ -- the network handshake blocks the terminal; give it a few seconds.  From a QEMU guest, a LAN host is only reachable if the host itself can reach it.
+
+$FG,4$SSHCryptoTest is red$FG$ -- do NOT use public-key auth; the crypto build is wrong.$ID,-2$
+
+$FG,5$--- 8. Supported / not ---$FG$
+
+$FG,2$Supported:$FG$ SSH-2 transport (curve25519-sha256, chacha20-poly1305), password auth, Ed25519 public-key auth, session channels, pty + shell, exec, in-memory key agent.
+
+$FG,2$Not yet:$FG$ host-key verification (known_hosts), key passphrases, RSA/ECDSA keys, agent forwarding, port forwarding, full ANSI terminal.
+
+See also: $LK,"Git client guide",A="FI:::/Home/Net/Programs/Git/GitGuide.DD"$.
