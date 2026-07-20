@@ -95,9 +95,14 @@ I64 GitSSHReadPkt(CGitSSHStream *s, I64 *payload_off)
 	return plen - 4;
 }
 
-I64 GitCloneSSH(U8 *host, U16 port, U8 *user, U8 *password,
-				U8 *repo, U8 *dir=NULL)
-{ // clone over SSH into <cwd>/<repo> (or dir). Esc cancels once unpacking.
+I64 GitCloneSSH(U8 *host, U16 port, U8 *user, U8 *repo,
+				U8 *dir=NULL, U8 *password=NULL)
+{ /* Clone over SSH into <cwd>/<repo> (or dir). Like real git-over-ssh, it uses
+	the loaded key (SSHKeyGen/SSHKeyLoad) -- no password needed. Pass a password
+	as the last arg only if you have no key on the server.
+	  GitCloneSSH("host", 22, "git", "user/repo.git");            // key auth
+	  GitCloneSSH("host", 22, "root", "r.git", NULL, "pw");       // password
+	Esc cancels once unpacking starts. */
 	CSSH			*ssh;
 	CSSHChan		*chan;
 	CGitSSHStream	 s;
@@ -107,6 +112,7 @@ I64 GitCloneSSH(U8 *host, U16 port, U8 *user, U8 *password,
 	U8				 head_bin[20];
 	U8				 reponame[128], target[512];
 	I64				 nref = 0, dlen, off, i, j, reqlen, nobj, nfiles = -1;
+	Bool			 authed = FALSE;
 
 	s.buf = NULL;	// so cleanup can tell whether the stream was initialised
 
@@ -133,9 +139,14 @@ I64 GitCloneSSH(U8 *host, U16 port, U8 *user, U8 *password,
 
 	ssh = SSHTransportConnect(host, port);
 	if (!ssh)								{ "$$RED$$SSH handshake failed.$$FG$$\n"; Free(refs); return -1; }
-	if (SSHServiceRequest(ssh, "ssh-userauth") < 0 ||
-		!SSHAuthPassword(ssh, user, password))
-	{ "$$RED$$SSH auth failed.$$FG$$\n"; SSHTransportClose(ssh); Free(refs); return -1; }
+	if (SSHServiceRequest(ssh, "ssh-userauth") < 0)
+	{ "$$RED$$service request failed.$$FG$$\n"; SSHTransportClose(ssh); Free(refs); return -1; }
+	if (ssh_agent_loaded)					// prefer the loaded key, git-style
+		authed = SSHAuthPubkey(ssh, user, ssh_agent_sk, ssh_agent_pk);
+	if (!authed && password && *password)	// optional password fallback
+		authed = SSHAuthPassword(ssh, user, password);
+	if (!authed)
+	{ "$$RED$$SSH auth failed (load a key with SSHKeyGen/SSHKeyLoad, or pass a password).$$FG$$\n"; SSHTransportClose(ssh); Free(refs); return -1; }
 
 	chan = SSHChannelOpen(ssh);
 	if (!chan)								{ "$$RED$$channel open failed.$$FG$$\n"; SSHTransportClose(ssh); Free(refs); return -1; }

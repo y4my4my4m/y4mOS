@@ -1,0 +1,44 @@
+// Network clipboard for y4mOS (QEMU guest <-> host). ZealOS has no SPICE guest
+// agent, so no native clipboard -- instead we bridge over HTTP. Run the host
+// daemon (clipd.py, same folder) on your Manjaro box; the guest reaches it at
+// 10.0.2.2 (QEMU user-net gateway). Needs the Net stack loaded.
+//
+//   #include "C:/Home/Net/Programs/Clip/Clip"
+//   ClipPaste;                  // host clipboard -> typed into this window
+//   ClipCopy("some text");      // text -> host clipboard
+
+#define CLIP_URL "http://10.0.2.2:9999"
+
+public U0 ClipCopy(U8 *text)
+{ // push text to the host clipboard
+	CHttpResponse *r = HttpPost(CLIP_URL, text, "text/plain");
+	if (r && r->status == 200)
+		"$$GREEN$$Copied %d bytes to the host clipboard.$$FG$$\n", StrLen(text);
+	else
+		"$$RED$$ClipCopy failed -- is clipd.py running on the host?$$FG$$\n";
+	if (r)
+		HttpResponseFree(r);
+}
+
+public U0 ClipPaste()
+{ // fetch the host clipboard and inject it as keystrokes into THIS window,
+  // so it lands wherever the cursor is (command line, editor, etc.)
+	CHttpResponse *r = HttpGet(CLIP_URL);
+	I64	i;
+	U8	c;
+
+	if (!r || r->status != 200)
+	{
+		"$$RED$$ClipPaste failed -- is clipd.py running on the host?$$FG$$\n";
+		if (r) HttpResponseFree(r);
+		return;
+	}
+	for (i = 0; i < r->body_length; i++)
+	{
+		c = r->body[i];
+		if (c != '\r')				// drop CR; keep LF (acts as Enter)
+			MessagePost(Fs, MESSAGE_KEY_DOWN, c, 0);
+	}
+	"$$GREEN$$Pasted %d bytes from the host clipboard.$$FG$$\n", r->body_length;
+	HttpResponseFree(r);
+}
