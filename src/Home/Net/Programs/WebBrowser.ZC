@@ -299,7 +299,7 @@ U0 ZincCollectCss(CZNode *node, I64 *external_left)
 					(*external_left)--;
 					sheet = HttpGet(abs);
 					if (sheet && sheet->status == 200 &&
-						sheet->body_length < 131072)
+						sheet->body_length < 524288)
 						ZCssParseSheet(sheet->body);
 					HttpResponseFree(sheet);
 					Free(abs);
@@ -403,7 +403,7 @@ U0 ZincPageFree()
 
 U0 ZincSetPage(U8 *url, U8 *html)
 { // build DOM + CSS + forms + JS for fetched html
-	I64 external_css = 4;
+	I64 external_css = 8;
 
 	zinc_ext_js_left = ZINC_EXT_JS_MAX;
 	ZincPageFree;

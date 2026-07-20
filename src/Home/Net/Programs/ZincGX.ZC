@@ -1001,6 +1001,8 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 				op->fg = GxPenBg(author.bg, de_theme.win_bg);
 				op->ul = author.border >= 0;
 				op->bg = GxPenBg(author.border, de_theme.panel_edge);
+				if (author.radius > 0)
+					op->wkind = author.radius; //wkind = corner radius for GXO_BOX
 			}
 			gx.line_start_op = gx.op_count; //The box never shifts with its line.
 		}
@@ -1151,6 +1153,10 @@ U0 GxPageStyle()
 		gx.text_pen = de_theme.text;
 }
 
+//Layout v2: box-model engine (flex, position, 4-side box) built on the v1
+//inline flow above. Provides L2Node + the zinc_layout2/Layout2() toggle.
+#include "Zinc/Layout"
+
 U0 GxLayout()
 {
 	CZStyle root;
@@ -1169,11 +1175,18 @@ U0 GxLayout()
 	gx.run_len = 0;
 	gx.line_start_op = 0;
 	gx.line_align = 0;
+	l2_root_wrap = gx.wrap_w;
+	l2_meas_depth = 0;
 	ZStyleReset(&root);
 	root.fg = gx.page_fg; //-1: theme text over the theme background.
 	root.fsize = 16;
 	if (zinc_dom)
-		GxNode(zinc_dom, &root);
+	{
+		if (zinc_layout2)
+			L2Node(zinc_dom, &root);
+		else
+			GxNode(zinc_dom, &root);
+	}
 	GxRunFlush;
 	GxLineAlign;
 	gx.doc_h = gx.y + gx.line_h + 16;
@@ -1319,6 +1332,23 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 				GrRect(dc, op->x, oy, op->w, op->h);
 				break;
 			case GXO_BOX:
+				if (op->wkind > 0)
+				{//Rounded box (wkind carries the border-radius for GXO_BOX).
+					if (gx.page_has_bg)
+						dc->color = GxPenBg(gx.page_bg, de_theme.win_bg);
+					else
+						dc->color = de_theme.win_bg;
+					wr = dc->color; //fill for border-only rounded boxes
+					if (op->has_bg && op->ul)
+						GxRoundRect(dc, op->x, oy, op->w, op->h, op->wkind,
+									op->fg, op->bg);
+					else if (op->has_bg)
+						GxRoundFill(dc, op->x, oy, op->w, op->h, op->wkind, op->fg);
+					else if (op->ul)
+						GxRoundRect(dc, op->x, oy, op->w, op->h, op->wkind,
+									wr, op->bg);
+					break;
+				}
 				if (op->has_bg)
 				{
 					dc->color = op->fg;
@@ -2244,7 +2274,7 @@ public U0 ZincGX(U8 *start_url=NULL)
 		//completed async XMLHttpRequest results. Only touch it once any timer
 		//has ever been scheduled. A callback may mutate the DOM (relayout) or
 		//assign location.href (navigate), same as a click handler.
-		if (zinc_js && zinc_js->timers)
+		if (zinc_js && (zinc_js->timers || zinc_js->micro_head))
 		{
 			zinc_js->dom_dirty = FALSE;
 			JsEventLoopPump(zinc_js);

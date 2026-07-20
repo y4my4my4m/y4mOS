@@ -30,7 +30,15 @@ class CZNode
 	I64		 type;
 	Bool	 checked;	// checkbox/radio live state
 	U8		 tag[16];	// lowercased; "#root" for the root
+	U8		*style_cache;	// CSS.ZC: memoized computed CZStyle (MAlloc'ed)
+	I64		 style_gen;		// generation the cache was computed at
 };
+
+// Bumped whenever the DOM or the stylesheet set changes, so memoized computed
+// styles (node->style_cache) invalidate. Layout runs many times per page
+// (images arriving, scripts, measure passes) - without this cache every pass
+// re-walks every rule for every node, which crawls on big pages.
+I64 zh_dom_gen = 1; // JIT does not zero globals; statically initialized
 
 I64 zh_node_budget = ZH_MAX_NODES;
 
@@ -91,6 +99,7 @@ U0 ZNodeFree(CZNode *node)
 
 	Free(node->text);
 	Free(node->value);
+	Free(node->style_cache);
 	Free(node);
 }
 
@@ -98,6 +107,7 @@ U0 ZNodeFreeChildren(CZNode *node)
 { // empty an element in place (innerHTML assignment)
 	CZNode *child, *next_child;
 
+	zh_dom_gen++; // subtree replaced: computed styles may be stale
 	child = node->first_child;
 	while (child)
 	{
@@ -131,6 +141,7 @@ U0 ZNodeAttrSet(CZNode *node, U8 *name, U8 *val)
 	CZAttr *attr = node->attrs;
 	I64		i;
 
+	zh_dom_gen++; // class/id/style may have changed: computed styles are stale
 	while (attr)
 	{
 		if (!StrICompare(attr->name, name))

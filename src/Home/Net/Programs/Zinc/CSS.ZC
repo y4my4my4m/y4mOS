@@ -28,14 +28,23 @@
 #define ZCSS_DISP_INLINE	2
 #define ZCSS_DISP_FLEX		3	// flex/grid: lay children in a row (approx)
 
-#define ZCSS_MAX_RULES		1024
+#define ZCSS_OFF_UNSET		-9999	// position offset sentinel
+
+#define ZCSS_MAX_RULES		4096	// big framework bundles bring thousands
 
 class CZStyle
 {
 	I32 fg, bg, border;			// -1 unset, else 0x00RRGGBB
 	I16 fsize;					// font-size in px; -1 unset
 	I16 mt, mb, ml, pt, pb, pl;	// block margins/padding in px; -1 unset
+	I16 mr, pr;					// right-side margin/padding; -1 unset
 	I16 width;					// block width: 0 unset, >0 px, -1..-99 percent
+	I16 height;					// block min height px; 0 unset
+	I16 gap;					// flex/grid gap px; -1 unset
+	I16 off_t, off_l, off_r;	// position offsets px; ZCSS_OFF_UNSET unset
+	I16 radius;					// border-radius px; -1 unset
+	I8	grow;					// flex-grow 0..8; -1 unset
+	I8	pos;					// -1 unset, 0 static, 1 rel, 2 abs, 3 fixed
 	I8	ml_auto;				// margin-left/right auto (center when width set)
 	I8	bold;					// -1 unset / 0 / 1
 	I8	underline;
@@ -86,6 +95,16 @@ U0 ZStyleReset(CZStyle *s)
 	s->align = -1;
 	s->list_none = -1;
 	s->flex_col = -1;
+	s->mr = -1;
+	s->pr = -1;
+	s->height = 0;
+	s->gap = -1;
+	s->off_t = ZCSS_OFF_UNSET;
+	s->off_l = ZCSS_OFF_UNSET;
+	s->off_r = ZCSS_OFF_UNSET;
+	s->radius = -1;
+	s->grow = -1;
+	s->pos = -1;
 }
 
 U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
@@ -110,6 +129,16 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	if (src->align	   >= 0) dst->align		= src->align;
 	if (src->list_none >= 0) dst->list_none = src->list_none;
 	if (src->flex_col  >= 0) dst->flex_col	= src->flex_col;
+	if (src->mr		   >= 0) dst->mr		= src->mr;
+	if (src->pr		   >= 0) dst->pr		= src->pr;
+	if (src->height	   >  0) dst->height	= src->height;
+	if (src->gap	   >= 0) dst->gap		= src->gap;
+	if (src->off_t > ZCSS_OFF_UNSET) dst->off_t = src->off_t;
+	if (src->off_l > ZCSS_OFF_UNSET) dst->off_l = src->off_l;
+	if (src->off_r > ZCSS_OFF_UNSET) dst->off_r = src->off_r;
+	if (src->radius   >= 0) dst->radius	= src->radius;
+	if (src->grow	   >= 0) dst->grow		= src->grow;
+	if (src->pos	   >= 0) dst->pos		= src->pos;
 }
 
 U0 ZStyleStripBox(CZStyle *s)
@@ -125,11 +154,162 @@ U0 ZStyleStripBox(CZStyle *s)
 	s->width = 0;
 	s->ml_auto = -1;
 	s->flex_col = -1;
+	s->mr = -1;
+	s->pr = -1;
+	s->height = 0;
+	s->gap = -1;
+	s->off_t = ZCSS_OFF_UNSET;
+	s->off_l = ZCSS_OFF_UNSET;
+	s->off_r = ZCSS_OFF_UNSET;
+	s->radius = -1;
+	s->grow = -1;
+	s->pos = -1;
+}
+
+/* ---- CSS custom properties (variables) ----
+   Modern sites define nearly all their colors as --vars on :root and use
+   var(--x) everywhere; without expansion every such declaration fails to
+   parse and the page loses its colors. One global last-wins table per page
+   (no per-element scoping - an accepted approximation). */
+
+#define ZCSS_VAR_MAX	512	// modern theme palettes define hundreds
+
+U8	zcss_var_name[ZCSS_VAR_MAX][40];
+U8	zcss_var_val[ZCSS_VAR_MAX][144];
+I64 zcss_var_count = 0; // reset per page; JIT does not zero plain globals
+
+U8 *ZCssVarGet(U8 *name)
+{
+	I64 i;
+
+	for (i = 0; i < zcss_var_count; i++)
+		if (!StrICompare(zcss_var_name[i], name))
+			return zcss_var_val[i];
+	return NULL;
+}
+
+U0 ZCssVarCopyVal(U8 *dst, U8 *val)
+{ // bounded copy into a zcss_var_val slot
+	I64 n = 0;
+
+	while (val[n] && n < 143)
+	{
+		dst[n] = val[n];
+		n++;
+	}
+	dst[n] = 0;
+}
+
+U0 ZCssVarSet(U8 *name, U8 *val)
+{
+	I64 i, n;
+
+	while (*val == ' ' || *val == '\t')
+		val++;
+	for (i = 0; i < zcss_var_count; i++)
+	{
+		if (!StrICompare(zcss_var_name[i], name))
+		{
+			ZCssVarCopyVal(zcss_var_val[i], val);
+			return;
+		}
+	}
+	if (zcss_var_count >= ZCSS_VAR_MAX)
+		return;
+	i = zcss_var_count++;
+	n = 0;
+	while (name[n] && n < 39)
+	{
+		zcss_var_name[i][n] = name[n];
+		n++;
+	}
+	zcss_var_name[i][n] = 0;
+	ZCssVarCopyVal(zcss_var_val[i], val);
+}
+
+Bool ZCssVarOnePass(U8 *src, U8 *dst, I64 max)
+{ // copy src to dst expanding each var(--name[, fallback]) once
+	U8	*p = src, *rep, *fb_start, *fb_end;
+	U8	 nm[40];
+	I64	 n = 0, k, depth;
+	Bool did = FALSE;
+
+	while (*p && n < max - 1)
+	{
+		if (!StrNICompare(p, "var(", 4))
+		{
+			p += 4;
+			while (*p == ' ')
+				p++;
+			if (p[0] == '-' && p[1] == '-')
+				p += 2;
+			k = 0;
+			while (*p && *p != ')' && *p != ',' && *p != ' ' && k < 39)
+				nm[k++] = *p++;
+			nm[k] = 0;
+			fb_start = NULL;
+			if (*p == ',')
+			{
+				p++;
+				while (*p == ' ')
+					p++;
+				fb_start = p;
+			}
+			depth = 1;
+			while (*p && depth)
+			{ // skip to the matching ')' (fallback may contain rgb(...))
+				if (*p == '(')
+					depth++;
+				else if (*p == ')')
+				{
+					depth--;
+					if (!depth)
+						break;
+				}
+				p++;
+			}
+			fb_end = p;
+			if (*p == ')')
+				p++;
+			rep = ZCssVarGet(nm);
+			if (rep)
+			{
+				while (*rep && n < max - 1)
+					dst[n++] = *rep++;
+			}
+			else if (fb_start)
+			{
+				while (fb_start < fb_end && n < max - 1)
+					dst[n++] = *fb_start++;
+			}
+			did = TRUE;
+		}
+		else
+			dst[n++] = *p++;
+	}
+	dst[n] = 0;
+	return did;
+}
+
+U0 ZCssVarSubst(U8 *val, U8 *out, I64 max)
+{ // expand var() references, up to 4 nested levels
+	U8	tmp[512];
+	I64 pass = 0;
+
+	ZCssVarOnePass(val, out, max);
+	while (pass < 3 && StrFind("var(", out))
+	{
+		StrCopy(tmp, out);
+		ZCssVarOnePass(tmp, out, max);
+		pass++;
+	}
 }
 
 U0 ZCssReset()
 {
 	zcss_rule_count = 0;
+	zcss_var_count = 0;
+	zh_dom_gen++; // stylesheet set changed: invalidate memoized styles
 }
 
 /* ---- color parsing ---- */
@@ -209,12 +389,49 @@ I64 ZHexNibble(I64 ch)
 	return -1;
 }
 
+F64 ZCssAbsF(F64 v)
+{
+	if (v < 0.0)
+		return -v;
+	return v;
+}
+
+I64 ZCssAlphaAfter(U8 *p)
+{ // scan for a trailing alpha number ("0.4", ".08", "1"); 255 if none.
+  // Returns alpha scaled 0-255; values given as 0-100% handled too.
+	U8	abuf[16];
+	I64 ai;
+	F64 a;
+
+	while (*p && !('0' <= *p <= '9') && *p != '.')
+		p++;
+	if (!*p)
+		return 255;
+	ai = 0;
+	while ((('0' <= *p <= '9') || *p == '.') && ai < 15)
+		abuf[ai++] = *p++;
+	abuf[ai] = 0;
+	a = Str2F64(abuf);
+	if (*p == '%')
+		a = a / 100.0;
+	if (a > 1.0)
+		a = a / 255.0; // e.g. "128" style
+	if (a < 0.0)
+		a = 0.0;
+	if (a > 1.0)
+		a = 1.0;
+	return ToI64(a * 255.0);
+}
+
 I64 ZCssColor(U8 *val)
 { // parse a CSS color to 0x00RRGGBB; -1 if unparsable/transparent
-	I64 i, n, h[8], num[3], num_count, cur;
+	I64 i, n, h[8], num[3], num_count, cur, sector;
 	Bool in_num;
 	U8	*p;
 	U8	 name[24];
+	F64 fnum[4], hf, sf, lf, cc, xx, mm, rr, gg, bb, t;
+	I64 fcount;
+	U8	fbuf[16];
 
 	while (*val == ' ' || *val == '\t')
 		val++;
@@ -227,7 +444,9 @@ I64 ZCssColor(U8 *val)
 			h[n] = ZHexNibble(val[1 + n]);
 			n++;
 		}
-		if (n >= 6)		// #RRGGBB / #RRGGBBAA (alpha ignored)
+		if (n >= 8 && !h[6] && !h[7])
+			return -1;	// #RRGGBB00: fully transparent
+		if (n >= 6)		// #RRGGBB / #RRGGBBAA (partial alpha ignored)
 			return h[0] << 20 | h[1] << 16 | h[2] << 12 |
 				   h[3] << 8  | h[4] << 4  | h[5];
 		if (n >= 3)		// #RGB / #RGBA
@@ -236,7 +455,7 @@ I64 ZCssColor(U8 *val)
 	}
 
 	if (!StrNICompare(val, "rgb", 3))
-	{ // rgb(r,g,b) / rgba(...): first three integers
+	{ // rgb(r,g,b) / rgba(r,g,b,a): near-zero alpha counts as transparent
 		p = val;
 		num_count = 0;
 		cur = 0;
@@ -259,8 +478,63 @@ I64 ZCssColor(U8 *val)
 		if (in_num && num_count < 3)
 			num[num_count++] = cur;
 		if (num_count == 3)
+		{
+			if (ZCssAlphaAfter(p) < 12)
+				return -1;
 			return (num[0] & 0xFF) << 16 | (num[1] & 0xFF) << 8 | (num[2] & 0xFF);
+		}
 		return -1;
+	}
+
+	if (!StrNICompare(val, "hsl", 3))
+	{ // hsl(h, s%, l%) / hsla(...) - convert to RGB
+		p = val;
+		fcount = 0;
+		while (*p && fcount < 4)
+		{
+			while (*p && !('0' <= *p <= '9') && *p != '.' && *p != '-')
+				p++;
+			if (!*p)
+				break;
+			i = 0;
+			while ((('0' <= *p <= '9') || *p == '.' || *p == '-') && i < 15)
+				fbuf[i++] = *p++;
+			fbuf[i] = 0;
+			fnum[fcount++] = Str2F64(fbuf);
+			if (*p == '%')
+				p++;
+		}
+		if (fcount < 3)
+			return -1;
+		if (fcount > 3 && fnum[3] < 0.05)
+			return -1; // hsla with ~zero alpha
+		hf = fnum[0];
+		sf = fnum[1] / 100.0;
+		lf = fnum[2] / 100.0;
+		while (hf < 0.0)
+			hf += 360.0;
+		while (hf >= 360.0)
+			hf -= 360.0;
+		if (sf < 0.0) sf = 0.0;
+		if (sf > 1.0) sf = 1.0;
+		if (lf < 0.0) lf = 0.0;
+		if (lf > 1.0) lf = 1.0;
+		cc = (1.0 - ZCssAbsF(2.0 * lf - 1.0)) * sf;
+		t = hf / 60.0;
+		t = t - 2.0 * ToI64(t / 2.0); // fmod(h/60, 2)
+		xx = cc * (1.0 - ZCssAbsF(t - 1.0));
+		mm = lf - cc / 2.0;
+		sector = ToI64(hf / 60.0);
+		rr = 0.0; gg = 0.0; bb = 0.0;
+		if (sector == 0)		{ rr = cc; gg = xx; }
+		else if (sector == 1)	{ rr = xx; gg = cc; }
+		else if (sector == 2)	{ gg = cc; bb = xx; }
+		else if (sector == 3)	{ gg = xx; bb = cc; }
+		else if (sector == 4)	{ rr = xx; bb = cc; }
+		else					{ rr = cc; bb = xx; }
+		return (ToI64((rr + mm) * 255.0) & 0xFF) << 16 |
+			   (ToI64((gg + mm) * 255.0) & 0xFF) << 8 |
+			   (ToI64((bb + mm) * 255.0) & 0xFF);
 	}
 
 	i = 0;
@@ -374,27 +648,28 @@ Bool ZCssHasAuto(U8 *val)
 	return FALSE;
 }
 
-U0 ZCssMarginSet(U8 *val, I16 *t, I16 *b, I16 *l)
+U0 ZCssMarginSet(U8 *val, I16 *t, I16 *r, I16 *b, I16 *l)
 { // CSS shorthand order: top right bottom left
-	I64 v[4], count = ZCssBoxVals(val, v), vt = -1, vb = -1, vl = -1;
+	I64 v[4], count = ZCssBoxVals(val, v), vt = -1, vr = -1, vb = -1, vl = -1;
 
 	if (count == 1)
 	{
-		vt = v[0];	vb = v[0];	vl = v[0];
+		vt = v[0];	vr = v[0];	vb = v[0];	vl = v[0];
 	}
 	else if (count == 2)
 	{
-		vt = v[0];	vb = v[0];	vl = v[1];
+		vt = v[0];	vb = v[0];	vr = v[1];	vl = v[1];
 	}
 	else if (count == 3)
 	{
-		vt = v[0];	vl = v[1];	vb = v[2];
+		vt = v[0];	vr = v[1];	vl = v[1];	vb = v[2];
 	}
 	else if (count == 4)
 	{
-		vt = v[0];	vb = v[2];	vl = v[3];
+		vt = v[0];	vr = v[1];	vb = v[2];	vl = v[3];
 	}
 	if (vt >= 0) *t = MinI64(vt, ZCSS_SPACE_MAX);
+	if (vr >= 0) *r = MinI64(vr, ZCSS_SPACE_MAX);
 	if (vb >= 0) *b = MinI64(vb, ZCSS_SPACE_MAX);
 	if (vl >= 0) *l = MinI64(vl, ZCSS_SPACE_MAX);
 }
@@ -469,8 +744,20 @@ U0 ZCssFontSizeSet(U8 *val, CZStyle *out)
 
 U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 {
-	I64	 color, n;
-	U8	*p, tok[40];
+	I64	 color, n, depth;
+	U8	*p, tok[64];
+	U8	 vbuf[512];
+
+	if (name[0] == '-' && name[1] == '-')
+	{ // custom property definition: store, no direct style effect
+		ZCssVarSet(name + 2, val);
+		return;
+	}
+	if (StrFind("var(", val))
+	{ // expand variable references before parsing the value
+		ZCssVarSubst(val, vbuf, 512);
+		val = vbuf;
+	}
 
 	if (!StrICompare(name, "color"))
 	{
@@ -482,6 +769,33 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 			 !StrICompare(name, "background-color"))
 	{
 		color = ZCssColor(val);
+		if (color < 0)
+		{ // shorthand: "url(x) #202124 no-repeat" - first color-like token wins
+			p = val;
+			while (*p && color < 0)
+			{
+				while (*p == ' ' || *p == '\t')
+					p++;
+				n = 0;
+				depth = 0;
+				while (*p && (*p != ' ' || depth) && *p != '\t')
+				{ // token; keep spaces inside rgb(...) together
+					if (*p == '(')
+						depth++;
+					else if (*p == ')' && depth)
+						depth--;
+					if (n < 63)
+						tok[n++] = *p;
+					p++;
+				}
+				tok[n] = 0;
+				if (!n)
+					break;
+				if (tok[0] == '#' || !StrNICompare(tok, "rgb", 3) ||
+					!StrNICompare(tok, "hsl", 3))
+					color = ZCssColor(tok);
+			}
+		}
 		if (color >= 0)
 			out->bg = color;
 	}
@@ -545,7 +859,7 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 	}
 	else if (!StrICompare(name, "margin"))
 	{
-		ZCssMarginSet(val, &out->mt, &out->mb, &out->ml);
+		ZCssMarginSet(val, &out->mt, &out->mr, &out->mb, &out->ml);
 		if (ZCssHasAuto(val))
 			out->ml_auto = 1; // "margin: X auto" centers a sized block
 	}
@@ -566,11 +880,13 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 	{
 		if (ZCssHasAuto(val))
 			out->ml_auto = 1;
-		if (name[7] == 'l')
+		n = ZCssPx(val);
+		if (n >= 0)
 		{
-			n = ZCssPx(val);
-			if (n >= 0)
+			if (name[7] == 'l')
 				out->ml = MinI64(n, ZCSS_SPACE_MAX);
+			else
+				out->mr = MinI64(n, ZCSS_SPACE_MAX);
 		}
 	}
 	else if (!StrICompare(name, "width") || !StrICompare(name, "max-width"))
@@ -600,7 +916,87 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 		}
 	}
 	else if (!StrICompare(name, "padding"))
-		ZCssMarginSet(val, &out->pt, &out->pb, &out->pl);
+		ZCssMarginSet(val, &out->pt, &out->pr, &out->pb, &out->pl);
+	else if (!StrICompare(name, "padding-right"))
+	{
+		n = ZCssPx(val);
+		if (n >= 0)
+			out->pr = MinI64(n, ZCSS_SPACE_MAX);
+	}
+	else if (!StrICompare(name, "height") || !StrICompare(name, "min-height"))
+	{ // px only (a % height needs a sized ancestor chain we don't track)
+		n = ZCssPx(val);
+		if (15 < n <= 2000 && n > out->height)
+			out->height = n;
+	}
+	else if (!StrICompare(name, "gap") || !StrICompare(name, "column-gap") ||
+			 !StrICompare(name, "grid-gap"))
+	{
+		n = ZCssPx(val);
+		if (0 <= n <= 200)
+			out->gap = n;
+	}
+	else if (!StrICompare(name, "flex-grow"))
+	{
+		n = Str2I64(val);
+		if (0 <= n <= 8)
+			out->grow = n;
+	}
+	else if (!StrICompare(name, "flex"))
+	{ // shorthand: "1", "1 1 auto", "none", "auto" - first number = grow
+		if (!StrNICompare(val, "none", 4))
+			out->grow = 0;
+		else if (!StrNICompare(val, "auto", 4))
+			out->grow = 1;
+		else if ('0' <= val[0] <= '9')
+		{
+			n = Str2I64(val);
+			out->grow = ClampI64(n, 0, 8);
+		}
+	}
+	else if (!StrICompare(name, "flex-basis"))
+	{
+		n = ZCssPx(val);
+		if (n > 15 && !out->width)
+			out->width = MinI64(n, 4000);
+	}
+	else if (!StrICompare(name, "border-radius"))
+	{
+		n = ZCssPx(val);
+		if (0 <= n <= 48)
+			out->radius = n;
+		else if (StrFind("%", val) || n > 48)
+			out->radius = 48; // 50% pills etc: cap, draw clamps to h/2
+	}
+	else if (!StrICompare(name, "position"))
+	{
+		if (!StrNICompare(val, "relative", 8))
+			out->pos = 1;
+		else if (!StrNICompare(val, "absolute", 8))
+			out->pos = 2;
+		else if (!StrNICompare(val, "fixed", 5))
+			out->pos = 3;
+		else
+			out->pos = 0; // static / sticky flow normally
+	}
+	else if (!StrICompare(name, "top"))
+	{
+		n = ZCssPx(val);
+		if (0 <= n <= 4000)
+			out->off_t = n;
+	}
+	else if (!StrICompare(name, "left"))
+	{
+		n = ZCssPx(val);
+		if (0 <= n <= 4000)
+			out->off_l = n;
+	}
+	else if (!StrICompare(name, "right"))
+	{
+		n = ZCssPx(val);
+		if (0 <= n <= 4000)
+			out->off_r = n;
+	}
 	else if (!StrICompare(name, "padding-top"))
 	{
 		n = ZCssPx(val);
@@ -910,6 +1306,7 @@ U0 ZCssRuleAdd(U8 *sel, U8 *sel_end, CZStyle *style)
 
 	MemCopy(&rule->style, style, sizeof(CZStyle));
 	zcss_rule_count++;
+	zh_dom_gen++; // new rule: memoized computed styles are stale
 }
 
 U0 ZCssParseRegion(U8 *p, U8 *end)
@@ -952,6 +1349,11 @@ U0 ZCssParseRegion(U8 *p, U8 *end)
 				{
 					if (!StrNICompare(scan, "print", 5))
 						is_print = TRUE;
+					if (!StrNICompare(scan, "light", 5))
+						is_print = TRUE; // prefers-color-scheme: light (or any
+										 // light-media query): we render dark,
+										 // so skip - entering both schemes'
+										 // blocks makes last-wins color soup
 					scan++;
 				}
 				body = p + 1;
@@ -1080,10 +1482,18 @@ Bool ZCssRuleMatch(CZCssRule *rule, CZNode *node)
 #define ZCSS_MAX_MATCH 96
 
 U0 ZCssApply(CZNode *node, CZStyle *out)
-{ // author rules by ascending (specificity, source order), then inline style
+{ // author rules by ascending (specificity, source order), then inline style.
+  // Memoized per node against zh_dom_gen: layout runs many times per page
+  // (measure passes, image arrivals, scripts) and the rule walk dominates.
 	I64	 i, j, m = 0;
 	I64	 m_idx[ZCSS_MAX_MATCH], m_spec[ZCSS_MAX_MATCH];
 	U8	*inline_style;
+
+	if (node->style_cache && node->style_gen == zh_dom_gen)
+	{
+		MemCopy(out, node->style_cache, sizeof(CZStyle));
+		return;
+	}
 
 	ZStyleReset(out);
 
@@ -1109,4 +1519,9 @@ U0 ZCssApply(CZNode *node, CZStyle *out)
 	inline_style = ZNodeAttr(node, "style");
 	if (inline_style)
 		ZCssParseDecls(inline_style, inline_style + StrLen(inline_style), out);
+
+	if (!node->style_cache)
+		node->style_cache = MAlloc(sizeof(CZStyle));
+	MemCopy(node->style_cache, out, sizeof(CZStyle));
+	node->style_gen = zh_dom_gen;
 }

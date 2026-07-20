@@ -1,0 +1,584 @@
+/*	Zinc Layout v2: a box-model layout engine for ZincGX. Public Domain.
+
+	Two-pass layout over the DOM: MEASURE (dry-run a subtree into the display
+	list at a candidate width, record its extent, roll the ops back) and
+	ARRANGE (final layout emitting CGxOp records). This replaces the v1
+	single-pass flow for block-level structure while reusing the proven v1
+	inline machinery (GxText runs, images, widgets, links) inside each box.
+
+	v2 owns:  block boxes with 4-side margins/padding, width/max-width/%,
+	          margin:auto centering, min-height, backgrounds/borders,
+	          real flex rows (basis/grow/shrink/wrap/gap/justify) with
+	          content-measured items, flex columns, and
+	          position:relative/absolute/fixed (offsets, out-of-flow).
+	v1 keeps: text runs/wrapping/scaling, lists, tables, <pre>, images,
+	          SVG, form widgets, links - delegated per subtree.
+
+	Runtime toggle: Layout2(FALSE) falls back to the v1 engine entirely
+	(then reload or resize the window to relayout).
+
+	Included from ZincGX.ZC after the v1 engine (needs gx, GxNode, GxText,
+	GxOpAdd, GxRunFlush, GxNewline, GxLineAlign, GxDefSpace, GxPenBg).
+	No literal dollar signs allowed in this file (DolDoc source rule). */
+
+public Bool zinc_layout2 = TRUE;	// v2 on by default; Layout2(OFF) reverts
+I64  l2_meas_depth = 0;				// dry-run nesting guard (JIT: explicit init)
+I64  l2_root_wrap  = 0;				// page right edge, set by GxLayout
+
+#define L2_FLEX_MAX		24			// flex items laid per container
+#define L2_MEAS_MAX		4			// measurement recursion cap
+
+extern U0 L2Node(CZNode *node, CZStyle *inh);
+
+public U0 Layout2(Bool on)
+{ // switch engines at runtime; takes effect on the next relayout
+	zinc_layout2 = on;
+	gx.relayout = TRUE;
+}
+
+/* ---- dry-run state save/rollback ---- */
+
+class CL2State
+{
+	I64 op_count, x, y, indent, wrap_w, line_h, line_start_op, line_align;
+};
+
+U0 L2StateSave(CL2State *s)
+{
+	s->op_count		 = gx.op_count;
+	s->x			 = gx.x;
+	s->y			 = gx.y;
+	s->indent		 = gx.indent;
+	s->wrap_w		 = gx.wrap_w;
+	s->line_h		 = gx.line_h;
+	s->line_start_op = gx.line_start_op;
+	s->line_align	 = gx.line_align;
+}
+
+U0 L2StateRestore(CL2State *s)
+{ // roll back ops emitted since the save, freeing what each op owns
+	I64 i;
+
+	for (i = s->op_count; i < gx.op_count; i++)
+	{
+		Free(gx.ops[i].text);
+		Free(gx.ops[i].img_url);
+		if (gx.ops[i].sc && gx.ops[i].type != GXO_IMG)
+			DCDel(gx.ops[i].sc); // scaled text run DC; GXO_IMG sc is cache-owned
+	}
+	gx.op_count		 = s->op_count;
+	gx.x			 = s->x;
+	gx.y			 = s->y;
+	gx.indent		 = s->indent;
+	gx.wrap_w		 = s->wrap_w;
+	gx.line_h		 = s->line_h;
+	gx.line_start_op = s->line_start_op;
+	gx.line_align	 = s->line_align;
+	gx.run_len		 = 0;
+}
+
+/* ---- classification ---- */
+
+Bool L2Delegated(U8 *tag)
+{ // subtrees the v1 engine must lay: lists, tables, raw text blocks, AND every
+  // tag v1 renders specially (images, svg, widgets, links, rules). CSS resets
+  // like img{display:block} would otherwise pull these into the generic block
+  // path, which has no drawing for them - they'd vanish.
+	return !StrCompare(tag, "ul") || !StrCompare(tag, "ol") ||
+		   !StrCompare(tag, "li") || !StrCompare(tag, "table") ||
+		   !StrCompare(tag, "tr") || !StrCompare(tag, "td") ||
+		   !StrCompare(tag, "th") || !StrCompare(tag, "pre") ||
+		   !StrCompare(tag, "dl") || !StrCompare(tag, "dt") ||
+		   !StrCompare(tag, "dd") || !StrCompare(tag, "select") ||
+		   !StrCompare(tag, "textarea") ||
+		   !StrCompare(tag, "img") || !StrCompare(tag, "svg") ||
+		   !StrCompare(tag, "input") || !StrCompare(tag, "button") ||
+		   !StrCompare(tag, "a") || !StrCompare(tag, "br") ||
+		   !StrCompare(tag, "hr") || !StrCompare(tag, "picture") ||
+		   !StrCompare(tag, "label") || !StrCompare(tag, "option") ||
+		   !StrCompare(tag, "canvas") || !StrCompare(tag, "video") ||
+		   !StrCompare(tag, "iframe");
+}
+
+Bool L2IsBody(U8 *tag)
+{
+	return !StrCompare(tag, "body") || !StrCompare(tag, "html") ||
+		   !StrCompare(tag, "#root");
+}
+
+Bool L2Handles(CZNode *node, CZStyle *author)
+{ // TRUE: v2 lays this element itself; FALSE: hand the subtree to v1
+	if (!node || node->type != ZH_ELEM)
+		return FALSE;
+	if (L2Delegated(node->tag))
+		return FALSE;
+	if (author->display == ZCSS_DISP_FLEX)
+		return TRUE;
+	if (author->pos == 2 || author->pos == 3)
+		return TRUE; // absolute/fixed need the v2 out-of-flow path
+	if (author->display == ZCSS_DISP_BLOCK)
+		return TRUE;
+	if (author->display == ZCSS_DISP_INLINE)
+		return FALSE;
+	if (L2IsBody(node->tag))
+		return TRUE;
+	if (ZHtmlTagBlock(node->tag) || !StrCompare(node->tag, "center") ||
+		!StrCompare(node->tag, "main") || !StrCompare(node->tag, "aside") ||
+		!StrCompare(node->tag, "figure"))
+		return TRUE;
+	return FALSE;
+}
+
+/* ---- measurement (dry run) ---- */
+
+U0 L2Measure(CZNode *node, CZStyle *inh, I64 avail, I64 *w_out, I64 *h_out)
+{ // lay node into a scratch window avail wide; report content w/h; roll back
+	CL2State sv;
+	I64		 i, x0, y0, maxx;
+
+	*w_out = 0;
+	*h_out = FONT_HEIGHT + GX_LINE_LEAD;
+	if (!node)
+		return;
+	if (avail < 24)
+		avail = 24;
+	if (l2_meas_depth >= L2_MEAS_MAX || gx.op_count >= GX_OPS_MAX - 64)
+	{ // too deep: fall back to a rough guess rather than exploding
+		*w_out = avail / 2;
+		return;
+	}
+	l2_meas_depth++;
+	L2StateSave(&sv);
+
+	gx.x = GX_MARGIN + gx.indent;
+	gx.line_start_op = gx.op_count;
+	gx.line_align = 0;
+	x0 = gx.x;
+	y0 = gx.y;
+	gx.wrap_w = x0 + avail;
+
+	L2Node(node, inh);
+	GxRunFlush;
+
+	maxx = x0;
+	for (i = sv.op_count; i < gx.op_count; i++)
+		if (gx.ops[i].x + gx.ops[i].w > maxx)
+			maxx = gx.ops[i].x + gx.ops[i].w;
+	*w_out = maxx - x0;
+	*h_out = gx.y - y0;
+	if (gx.x > x0)
+		*h_out += gx.line_h; // trailing unterminated line
+	if (*h_out < FONT_HEIGHT)
+		*h_out = FONT_HEIGHT;
+
+	L2StateRestore(&sv);
+	l2_meas_depth--;
+}
+
+/* ---- flex row ---- */
+
+U0 L2FlexRow(CZNode *node, CZStyle *style, CZStyle *author)
+{ // arrange direct element children with the flex row algorithm:
+  // basis = explicit width or measured content width; grow distributes extra;
+  // overflow shrinks proportionally; wide content wraps to new rows.
+	CZNode	*items[L2_FLEX_MAX];
+	I64		 basis[L2_FLEX_MAX], grow[L2_FLEX_MAX], want[L2_FLEX_MAX];
+	CZStyle	 kid, ca;
+	CZNode	*child, *rest;
+	I64		 n, i, k, m, row_start, base, avail, gapv, total, extra, gsum;
+	I64		 mw, mh, bw, x, xoff, y0, ymax, save_indent, save_wrap, room;
+
+	MemCopy(&kid, style, sizeof(CZStyle));
+	ZStyleStripBox(&kid);
+
+	n = 0;
+	child = node->first_child;
+	while (child && n < L2_FLEX_MAX)
+	{
+		if (child->type == ZH_ELEM && !ZnTagSkipped(child->tag))
+		{
+			ZCssApply(child, &ca);
+			if (ca.display != ZCSS_DISP_NONE)
+			{
+				items[n] = child;
+				grow[n] = 0;
+				if (ca.grow > 0)
+					grow[n] = ca.grow;
+				n++;
+			}
+		}
+		child = child->next;
+	}
+	rest = child; // children past the item cap flow as stacked blocks below
+	if (!n)
+		return;
+
+	base  = GX_MARGIN + gx.indent;
+	avail = gx.wrap_w - base;
+	if (avail < 60)
+		avail = 60;
+	gapv = author->gap;
+	if (gapv < 0)
+		gapv = 8;
+
+	for (i = 0; i < n; i++)
+	{ // basis: explicit width beats measured content width
+		ZCssApply(items[i], &ca);
+		bw = 0;
+		if (ca.width > 0)
+			bw = MinI64(ca.width, avail);
+		else if (ca.width < 0)
+			bw = avail * -ca.width / 100;
+		else
+		{
+			L2Measure(items[i], &kid, avail, &mw, &mh);
+			bw = MinI64(mw + 8, avail);
+		}
+		if (bw < 24)
+			bw = 24;
+		basis[i] = bw;
+	}
+
+	i = 0;
+	while (i < n)
+	{ // greedy row packing
+		row_start = i;
+		total = 0;
+		k = 0;
+		while (i < n)
+		{
+			bw = basis[i];
+			if (k)
+				bw += gapv;
+			if (k && total + bw > avail)
+				break;
+			total += bw;
+			k++;
+			i++;
+		}
+
+		extra = avail - total;
+		gsum = 0;
+		for (m = row_start; m < i; m++)
+			gsum += grow[m];
+		for (m = row_start; m < i; m++)
+			want[m] = basis[m];
+		if (extra > 0 && gsum > 0)
+		{ // distribute free space to growers
+			for (m = row_start; m < i; m++)
+				want[m] += extra * grow[m] / gsum;
+			extra = 0;
+		}
+		else if (extra < 0)
+		{ // overflow (single oversize item): shrink proportionally
+			room = avail - gapv * (k - 1);
+			total -= gapv * (k - 1);
+			if (total > 0)
+				for (m = row_start; m < i; m++)
+					want[m] = MaxI64(24, basis[m] * room / total);
+			extra = 0;
+		}
+
+		xoff = 0;
+		if (extra > 0)
+		{ // leftover with no growers: justify-content via the align mapping
+			if (author->align == 1)
+				xoff = extra / 2;
+			else if (author->align == 2)
+				xoff = extra;
+		}
+
+		save_indent = gx.indent;
+		save_wrap	= gx.wrap_w;
+		x	 = base + xoff;
+		y0	 = gx.y;
+		ymax = y0;
+		for (m = row_start; m < i; m++)
+		{
+			gx.y	  = y0;
+			gx.indent = x - GX_MARGIN;
+			gx.wrap_w = x + want[m];
+			gx.x	  = GX_MARGIN + gx.indent;
+			gx.line_start_op = gx.op_count;
+			L2Node(items[m], &kid);
+			GxRunFlush;
+			GxLineAlign;
+			if (gx.x > GX_MARGIN + gx.indent)
+				gx.y += gx.line_h; // inline item: close its open line
+			ymax = MaxI64(ymax, gx.y);
+			x += want[m] + gapv;
+		}
+		gx.indent = save_indent;
+		gx.wrap_w = save_wrap;
+		gx.y	  = ymax;
+		gx.x	  = GX_MARGIN + gx.indent;
+		gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+	}
+
+	while (rest)
+	{ // overflow children beyond the flex item cap: normal stacked flow
+		L2Node(rest, &kid);
+		rest = rest->next;
+	}
+}
+
+/* ---- block box ---- */
+
+U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
+{
+	CZStyle	 kid;
+	CZNode	*child;
+	CGxOp	*op;
+	I64		 mt_eff, mb_eff, ml_eff, mr_eff, pt_eff, pb_eff, pl_eff, pr_eff;
+	I64		 box_op, op0, avail, bw, center_add, save_wrap, save_wrap2;
+	I64		 box_y0, dx, dy, mw, mh, x0, saved_y, saved_indent, saved_wrapa;
+	Bool	 boxed, is_body, is_abs, is_flex;
+
+	is_body = L2IsBody(node->tag);
+	is_flex = author->display == ZCSS_DISP_FLEX && author->flex_col != 1;
+	is_abs	= author->pos == 2 || author->pos == 3;
+	if (is_abs && author->off_l <= 0 && author->off_t <= 0 &&
+		author->off_r == ZCSS_OFF_UNSET)
+		is_abs = FALSE; // absolute/fixed with inset:0-style or no offsets is
+						// the standard SPA full-page wrapper: flow it normally,
+						// or the whole app paints overlapped at one y
+
+	GxRunFlush;
+	if (gx.x > GX_MARGIN + gx.indent)
+		GxNewline(0);
+
+	MemCopy(&kid, style, sizeof(CZStyle));
+	ZStyleStripBox(&kid);
+
+	if (is_body)
+	{ // page root: no box of its own, just flow the children
+		kid.bg = -1;
+		child = node->first_child;
+		while (child)
+		{
+			L2Node(child, &kid);
+			child = child->next;
+		}
+		GxRunFlush;
+		if (gx.x > GX_MARGIN + gx.indent)
+			GxNewline(0);
+		return;
+	}
+
+	mt_eff = author->mt;
+	mb_eff = author->mb;
+	if (mt_eff < 0)
+		mt_eff = GxDefSpace(node->tag);
+	if (mb_eff < 0)
+		mb_eff = GxDefSpace(node->tag);
+	ml_eff = MaxI64(0, style->ml);
+	mr_eff = MaxI64(0, style->mr);
+	pl_eff = MaxI64(0, style->pl);
+	pr_eff = MaxI64(0, style->pr);
+	if (!StrCompare(node->tag, "blockquote") && style->ml < 0)
+		ml_eff = 24;
+	boxed = author->bg >= 0 || author->border >= 0;
+	pt_eff = author->pt;
+	pb_eff = author->pb;
+	if (pt_eff < 0)
+	{
+		if (boxed)
+			pt_eff = 4;
+		else
+			pt_eff = 0;
+	}
+	if (pb_eff < 0)
+	{
+		if (boxed)
+			pb_eff = 4;
+		else
+			pb_eff = 0;
+	}
+
+	saved_y = 0;
+	saved_indent = 0;
+	saved_wrapa = 0;
+	if (is_abs)
+	{ // out of flow: position against the page, consume no flow height
+		saved_y		 = gx.y;
+		saved_indent = gx.indent;
+		saved_wrapa	 = gx.wrap_w;
+		avail = l2_root_wrap - GX_MARGIN;
+		if (avail < 60)
+			avail = 60;
+		bw = 0;
+		if (author->width > 0)
+			bw = MinI64(author->width, avail);
+		else if (author->width < 0)
+			bw = avail * -author->width / 100;
+		else
+		{ // shrink-to-fit
+			L2Measure(node, &kid, avail, &mw, &mh);
+			bw = MinI64(mw + pl_eff + pr_eff + 12, avail);
+		}
+		if (bw < 40)
+			bw = 40;
+		if (author->off_l > ZCSS_OFF_UNSET)
+			x0 = GX_MARGIN + author->off_l;
+		else if (author->off_r > ZCSS_OFF_UNSET)
+			x0 = l2_root_wrap - author->off_r - bw;
+		else
+			x0 = GX_MARGIN;
+		if (x0 < 0)
+			x0 = 0;
+		gx.indent = x0 - GX_MARGIN;
+		gx.wrap_w = x0 + bw;
+		if (author->off_t > ZCSS_OFF_UNSET)
+			gx.y = 8 + author->off_t; // document top anchored (fixed ~ absolute)
+		gx.x = GX_MARGIN + gx.indent;
+	}
+	else
+	{
+		gx.y += mt_eff;
+		gx.indent += ml_eff;
+		save_wrap2 = gx.wrap_w;
+		if (mr_eff + pr_eff > 0 &&
+			gx.wrap_w - (mr_eff + pr_eff) > GX_MARGIN + gx.indent + 40)
+			gx.wrap_w -= mr_eff + pr_eff;
+		save_wrap = 0;
+		center_add = 0;
+		if (style->width)
+		{ // width / max-width: narrow the wrap; margin:auto centers the box
+			avail = gx.wrap_w - (GX_MARGIN + gx.indent);
+			if (style->width > 0)
+				bw = MinI64(style->width, avail);
+			else
+				bw = avail * -style->width / 100;
+			if (bw >= 60 && bw < avail)
+			{
+				if (style->ml_auto == 1)
+					center_add = (avail - bw) / 2;
+				gx.indent += center_add;
+				if (!save_wrap)
+					save_wrap = gx.wrap_w;
+				gx.wrap_w = GX_MARGIN + gx.indent + bw;
+			}
+		}
+	}
+
+	op0 = gx.op_count;
+	box_op = -1;
+	box_y0 = gx.y;
+	if (boxed)
+	{
+		op = GxOpAdd(GXO_BOX, GX_MARGIN + gx.indent - 3, gx.y - 2,
+					 gx.wrap_w - (GX_MARGIN + gx.indent - 3), 8);
+		if (op)
+		{
+			box_op = gx.op_count - 1;
+			op->has_bg = author->bg >= 0;
+			op->fg = GxPenBg(author->bg, de_theme.win_bg);
+			op->ul = author->border >= 0;
+			op->bg = GxPenBg(author->border, de_theme.panel_edge);
+			if (author->radius > 0)
+				op->wkind = author->radius; //wkind = corner radius for GXO_BOX
+		}
+		gx.line_start_op = gx.op_count;
+		kid.bg = -1; // the box already painted it
+	}
+	gx.indent += pl_eff;
+	gx.y += pt_eff;
+	gx.x = GX_MARGIN + gx.indent;
+
+	if (is_flex)
+		L2FlexRow(node, style, author);
+	else
+	{
+		child = node->first_child;
+		while (child)
+		{
+			L2Node(child, &kid);
+			child = child->next;
+		}
+	}
+
+	GxRunFlush;
+	if (gx.x > GX_MARGIN + gx.indent)
+		GxNewline(0);
+	gx.y += pb_eff;
+	if (author->height > 0 && gx.y < box_y0 + author->height)
+		gx.y = box_y0 + author->height; // min-height floor
+	if (box_op >= 0)
+	{
+		gx.ops[box_op].h = MaxI64(8, gx.y + 2 - gx.ops[box_op].y);
+		gx.line_start_op = gx.op_count;
+	}
+
+	if (is_abs)
+	{ // restore the flow as if we were never here
+		gx.indent = saved_indent;
+		gx.wrap_w = saved_wrapa;
+		gx.y	  = saved_y;
+		gx.x	  = GX_MARGIN + gx.indent;
+	}
+	else
+	{
+		gx.y += mb_eff;
+		if (save_wrap)
+		{
+			gx.wrap_w = save_wrap;
+			gx.indent -= center_add;
+		}
+		gx.wrap_w = save_wrap2;
+		gx.indent -= ml_eff + pl_eff;
+		gx.x = GX_MARGIN + gx.indent;
+
+		if (author->pos == 1)
+		{ // position:relative - shift everything the subtree emitted
+			dx = 0;
+			dy = 0;
+			if (author->off_l > ZCSS_OFF_UNSET)
+				dx = author->off_l;
+			else if (author->off_r > ZCSS_OFF_UNSET)
+				dx = -author->off_r;
+			if (author->off_t > ZCSS_OFF_UNSET)
+				dy = author->off_t;
+			if (dx || dy)
+			{
+				for (bw = op0; bw < gx.op_count; bw++)
+				{
+					gx.ops[bw].x += dx;
+					gx.ops[bw].y += dy;
+				}
+			}
+		}
+	}
+}
+
+/* ---- dispatch ---- */
+
+U0 L2Node(CZNode *node, CZStyle *inh)
+{
+	CZStyle style, author;
+
+	if (!node || gx.op_count >= GX_OPS_MAX - 8)
+		return;
+	if (node->type == ZH_TEXT)
+	{
+		GxText(node->text, inh, GxScaleOf(inh), inh->pre == 1);
+		return;
+	}
+	if (ZnTagSkipped(node->tag))
+		return;
+
+	MemCopy(&style, inh, sizeof(CZStyle));
+	ZnUaStyle(node->tag, &style);
+	ZCssApply(node, &author);
+	if (author.display == ZCSS_DISP_NONE)
+		return;
+
+	if (!L2Handles(node, &author))
+	{ // v1 engine lays this subtree (inline runs, lists, tables, widgets...)
+		GxNode(node, inh);
+		return;
+	}
+
+	ZStyleMerge(&style, &author);
+	style.display = -1;
+	L2Block(node, &style, &author);
+}

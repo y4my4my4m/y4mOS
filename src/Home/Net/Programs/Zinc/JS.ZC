@@ -16,9 +16,14 @@
 	  addEventListener/removeEventListener, el.onclick = function, and
 	  XMLHttpRequest (open/send/responseText/status/onload/onreadystatechange;
 	  the fetch is synchronous under the hood, callbacks fire on the next pump).
-	Not supported (script just errors out harmlessly): closures over nested
-	scopes, regex literals, for-in/of, arrow functions, classes, try/catch,
-	bitwise ops, prototypes, fetch()/Promise.
+	Language v2 (Phase B): closures (functions capture their defining env),
+	arrow functions, template literals (lexer-desugared to concatenation),
+	for-of / for-in, try/catch/finally + throw, class declarations
+	(constructor + methods via a real prototype chain), new-expressions with
+	prototype linking, this binding, numeric/method object-literal keys.
+	Not supported (script just errors out harmlessly): regex literals,
+	do/switch, destructuring, spread, getters/setters, async/await,
+	fetch()/Promise (queued for Phase B part 2), bitwise ops.
 
 	All interpreter memory comes from a per-page arena freed in one shot by
 	JsInterpFree. Execution has step and call-depth budgets, so hostile or
@@ -51,6 +56,8 @@
 #define JSO_ELEMENT		4
 #define JSO_STYLE		5
 #define JSO_XHR			6
+#define JSO_PROMISE		7
+#define JSO_CLASSLIST	8
 
 /* native function ids */
 #define JSN_ALERT			1
@@ -96,6 +103,49 @@
 #define JSN_XHR_GETALLHDR	66
 #define JSN_XHR_GETHDR		67
 #define JSN_EVT_NOOP		68	// preventDefault / stopPropagation
+/* Phase B-2: promises, fetch, JSON, DOM API, method pack */
+#define JSN_PROMISE_CTOR	70
+#define JSN_PROMISE_RESOLVE	71	// the resolve fn handed to an executor
+#define JSN_PROMISE_REJECT	72
+#define JSN_PROMISE_THEN	73
+#define JSN_PROMISE_CATCH	74
+#define JSN_PROMISE_FINALLY	75
+#define JSN_PROMISE_SRESOLVE 76	// Promise.resolve(v)
+#define JSN_FETCH			77
+#define JSN_RESP_TEXT		78
+#define JSN_RESP_JSON		79
+#define JSN_JSON_PARSE		80
+#define JSN_JSON_STR		81
+#define JSN_DOC_CREATE_EL	82
+#define JSN_DOC_CREATE_TX	83
+#define JSN_EL_APPEND		84
+#define JSN_EL_REMOVE_CH	85
+#define JSN_EL_REMOVE		86
+#define JSN_QSEL			87	// querySelector (document or element scoped)
+#define JSN_QSELALL			88
+#define JSN_CL_ADD			89
+#define JSN_CL_REMOVE		90
+#define JSN_CL_CONTAINS		91
+#define JSN_CL_TOGGLE		92
+#define JSN_STR_SPLIT		93
+#define JSN_STR_REPLACE		94
+#define JSN_STR_TRIM		95
+#define JSN_STR_INCLUDES	96
+#define JSN_STR_STARTS		97
+#define JSN_STR_ENDS		98
+#define JSN_STR_CHARCODE	99
+#define JSN_ARR_MAP			100
+#define JSN_ARR_FILTER		101
+#define JSN_ARR_FOREACH		102
+#define JSN_ARR_SLICE		103
+#define JSN_ARR_CONCAT		104
+#define JSN_ARR_INCLUDES	105
+#define JSN_ARR_POP			106
+#define JSN_ARR_SHIFT		107
+#define JSN_ARR_FIND		108
+#define JSN_OBJ_KEYS		109
+#define JSN_OBJ_ASSIGN		110
+#define JSN_ARR_ISARR		111
 
 /* token types */
 #define JT_EOF		0
@@ -150,11 +200,17 @@
 #define JN_EXPR		25
 #define JN_NULLLIT	26
 #define JN_UNDEFLIT	27
+#define JN_FOROF	28	// for (x of/in it) body; op: 0 = of, 1 = in
+#define JN_TRY		29	// a = try, b = catch (str = var), c = finally
+#define JN_THROW	30
+#define JN_NEW		31	// new-expression marker wrapping the constructor ref
+#define JN_CLASS	32	// str = name, a = JN_PROP method chain
 
 /* control flow states */
 #define JF_NORMAL	0
 #define JF_RETURN	1
 #define JF_BREAK	2
+#define JF_THROW	3
 
 class CJsAllocHdr
 {
@@ -179,6 +235,9 @@ class CJsVal
 	I64		 native_id;	// JSN_* for JV_NATIVE, JSO_* for JV_OBJ
 	CJsVal	**items;	// JV_ARR
 	I64		 count, cap;
+	U64		 fenv;		// CJsEnv*: env captured at definition (closures);
+						// U64 because CJsEnv is declared later in this file
+	CJsVal	*proto;		// prototype-chain link for property lookup
 };
 
 class CJsTimer
@@ -201,6 +260,14 @@ class CJsListener
 	CJsVal		*fn;
 	Bool		 active;
 	Bool		 is_prop; // set via el.onX= (replaces prior); FALSE = addEventListener
+};
+
+class CJsMicro
+{ // one queued microtask (promise reaction); drained before timers each pump
+	CJsMicro *next;
+	CJsVal	 *fn;
+	CJsVal	 *arg;
+	Bool	  has_arg;
 };
 
 class CJsNode
@@ -246,6 +313,8 @@ class CJsInterp
 	CJsTimer	*timers;		// setTimeout/setInterval/async-XHR queue
 	CJsListener	*listeners;		// addEventListener + el.onX handlers
 	I64			 next_timer_id;
+	CJsVal		*exc;			// pending thrown value while flow == JF_THROW
+	CJsMicro	*micro_head, *micro_tail; // promise reaction queue
 };
 
 /* forward declarations for the recursive parser/evaluator */
@@ -258,6 +327,8 @@ extern CJsVal  *JsCall(CJsInterp *ji, CJsVal *fn, CJsVal *this_val,
 // JsMemberSet (el.onX = fn) registers a listener; the definition is far below.
 extern CJsListener *JsListenerAdd(CJsInterp *ji, CZNode *node, U8 *type,
 								  CJsVal *fn, Bool is_prop);
+// JsMemberSet (styleEl.textContent = css) ingests CSS-in-JS; defined below.
+extern U0 JsStyleIngest(CJsInterp *ji, CZNode *node);
 
 /* ---- arena ---- */
 
@@ -382,14 +453,21 @@ U0 JsArrPush(CJsInterp *ji, CJsVal *arr, CJsVal *item)
 }
 
 CJsVal *JsPropGet(CJsVal *obj, U8 *name)
-{
-	CJsProp *p = obj->props;
+{ // own properties first, then the prototype chain (depth-capped)
+	CJsProp *p;
+	I64		 depth = 0;
 
-	while (p)
+	while (obj && depth < 8)
 	{
-		if (!StrCompare(p->name, name))
-			return p->val(CJsVal *);
-		p = p->next;
+		p = obj->props;
+		while (p)
+		{
+			if (!StrCompare(p->name, name))
+				return p->val(CJsVal *);
+			p = p->next;
+		}
+		obj = obj->proto;
+		depth++;
 	}
 
 	return NULL;
@@ -512,9 +590,19 @@ Bool JsIdentCh(I64 ch, Bool first)
 Bool JsLex(CJsInterp *ji, U8 *src)
 {
 	U8	*p = src;
-	I64	 cap = StrLen(src) + 2, n = 0, punct, len, quote;
+	I64	 cap = StrLen(src) + 16, n = 0, punct, len, quote;
 	U8	 sbuf[1024];
 	CJsTok *t;
+	I64	 tpl_brace[8], tpl_sp = 0;	// template-literal nesting state
+
+	// template literals desugar into extra tokens ( str + ( expr ) ... )
+	while (*p)
+	{
+		if (*p == 0x60)
+			cap += 8;
+		p++;
+	}
+	p = src;
 
 	ji->toks = JsAlloc(ji, cap * sizeof(CJsTok))(CJsTok *);
 
@@ -573,8 +661,35 @@ Bool JsLex(CJsInterp *ji, U8 *src)
 				}
 			}
 		}
-		else if (*p == '"' || *p == '\'' || *p == 0x60)
-		{ // string literal (backtick treated as a plain quote)
+		else if (*p == 0x60)
+		{ // template literal: desugar to tokens ( "" + "part" + ( expr ) ... )
+		  // The leading "" forces string concatenation semantics.
+			if (tpl_sp >= 8)
+			{
+				JsErr(ji, "templates nested too deep");
+				return FALSE;
+			}
+			tpl_brace[tpl_sp] = 0;
+			tpl_sp++;
+			t = &ji->toks[n++];
+			t->type = JT_PUNCT;
+			t->punct = '(';
+			t = &ji->toks[n++];
+			t->type = JT_STR;
+			t->str = JsStrDup(ji, "");
+			p++;
+			goto js_tpl_part;
+		}
+		else if (*p == '}' && tpl_sp && !tpl_brace[tpl_sp - 1])
+		{ // end of a template interpolation expression
+			t = &ji->toks[n++];
+			t->type = JT_PUNCT;
+			t->punct = ')';
+			p++;
+			goto js_tpl_part;
+		}
+		else if (*p == '"' || *p == '\'')
+		{ // string literal
 			quote = *p++;
 			len = 0;
 			while (*p && *p != quote && len < 1020)
@@ -636,7 +751,74 @@ Bool JsLex(CJsInterp *ji, U8 *src)
 			t = &ji->toks[n++];
 			t->type	 = JT_PUNCT;
 			t->punct = punct;
+			if (tpl_sp)
+			{ // track nested braces inside a template interpolation
+				if (punct == '{')
+					tpl_brace[tpl_sp - 1]++;
+				else if (punct == '}')
+					tpl_brace[tpl_sp - 1]--;
+			}
 		}
+		goto js_lex_next; // normal path: skip the template-part scanner
+
+js_tpl_part:
+		// literal template text up to a backtick or an interpolation start
+		len = 0;
+		while (*p && *p != 0x60 && !(*p == 0x24 && p[1] == '{') && len < 1020)
+		{
+			if (*p == '\\' && p[1])
+			{
+				p++;
+				if (*p == 'n')
+					sbuf[len++] = '\n';
+				else if (*p == 't')
+					sbuf[len++] = '\t';
+				else
+					sbuf[len++] = *p;
+				p++;
+			}
+			else
+				sbuf[len++] = *p++;
+		}
+		sbuf[len] = 0;
+		if (n >= cap - 8)
+		{
+			JsErr(ji, "too many tokens");
+			return FALSE;
+		}
+		if (len)
+		{
+			t = &ji->toks[n++];
+			t->type	 = JT_PUNCT;
+			t->punct = '+';
+			t = &ji->toks[n++];
+			t->type = JT_STR;
+			t->str = JsStrDup(ji, sbuf);
+		}
+		if (*p == 0x60)
+		{ // template ends
+			t = &ji->toks[n++];
+			t->type	 = JT_PUNCT;
+			t->punct = ')';
+			tpl_sp--;
+			p++;
+		}
+		else if (*p)
+		{ // interpolation begins (0x24 '{')
+			t = &ji->toks[n++];
+			t->type	 = JT_PUNCT;
+			t->punct = '+';
+			t = &ji->toks[n++];
+			t->type	 = JT_PUNCT;
+			t->punct = '(';
+			p += 2;
+		}
+		else
+		{
+			JsErr(ji, "unterminated template literal");
+			return FALSE;
+		}
+js_lex_next:;
 	}
 
 	t = &ji->toks[n++];
@@ -727,6 +909,7 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 {
 	CJsTok	*t = JsTok(ji);
 	CJsNode *node, *item, *tail;
+	U8		 numkey[24];
 
 	if (t->type == JT_NUM)
 	{
@@ -750,7 +933,11 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 			return JsParseFunc(ji, FALSE);
 		}
 		if (JsEatKw(ji, "new"))
-			return JsParsePrimary(ji); // treat "new X(...)" as "X(...)"
+		{ // real construction: JN_CALL sees the JN_NEW wrapper and constructs
+			node = JsNode(ji, JN_NEW);
+			node->a = JsParsePrimary(ji);
+			return node;
+		}
 		if (JsEatKw(ji, "true"))
 		{
 			node = JsNode(ji, JN_NUM);
@@ -812,20 +999,32 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 			do
 			{
 				t = JsTok(ji);
-				if (t->type != JT_IDENT && t->type != JT_STR)
+				if (t->type == JT_NUM)
+				{ // numeric key: stringify
+					ji->pos++;
+					item = JsNode(ji, JN_PROP);
+					StrPrint(numkey, "%d", ToI64(t->num));
+					item->str = JsStrDup(ji, numkey);
+				}
+				else if (t->type == JT_IDENT || t->type == JT_STR)
+				{
+					ji->pos++;
+					item = JsNode(ji, JN_PROP);
+					item->str = t->str;
+				}
+				else
 				{
 					JsErr(ji, "bad object key");
 					return node;
 				}
-				ji->pos++;
-				item = JsNode(ji, JN_PROP);
-				item->str = t->str;
 				if (JsEatPunct(ji, ':'))
 					item->a = JsParseAssign(ji);
+				else if (JsIsPunct(ji, '('))
+					item->a = JsParseFunc(ji, FALSE); // method shorthand f(){}
 				else
 				{ // shorthand {x}
 					item->a = JsNode(ji, JN_IDENT);
-					item->a->str = t->str;
+					item->a->str = item->str;
 				}
 				if (tail)
 					tail->next = item;
@@ -1035,8 +1234,80 @@ CJsNode *JsParseCond(CJsInterp *ji)
 
 CJsNode *JsParseAssign(CJsInterp *ji)
 {
-	CJsNode *node, *wrap;
-	I64		 op = -1;
+	CJsNode *node, *wrap, *fn, *param, *ptail, *ret, *blk;
+	I64		 op = -1, k, j;
+	Bool	 arrow = FALSE, plist = FALSE;
+
+	// arrow functions: name => body  |  ( a, b ) => body
+	k = ji->pos;
+	if (k + 1 < ji->tok_count &&
+		ji->toks[k].type == JT_IDENT && ji->toks[k + 1].type == JT_PUNCT &&
+		ji->toks[k + 1].punct == JP_ARROW)
+		arrow = TRUE;
+	else if (ji->toks[k].type == JT_PUNCT && ji->toks[k].punct == '(')
+	{ // commit only when the shape between parens is exactly idents + commas
+		j = k + 1;
+		while (j + 1 < ji->tok_count && ji->toks[j].type == JT_IDENT &&
+			   ji->toks[j + 1].type == JT_PUNCT && ji->toks[j + 1].punct == ',')
+			j += 2;
+		if (j + 1 < ji->tok_count && ji->toks[j].type == JT_IDENT &&
+			ji->toks[j + 1].type == JT_PUNCT && ji->toks[j + 1].punct == ')')
+			j += 2;
+		else if (ji->toks[j].type == JT_PUNCT && ji->toks[j].punct == ')')
+			j++;
+		else
+			j = 0;
+		if (j > 0 && j < ji->tok_count && ji->toks[j].type == JT_PUNCT &&
+			ji->toks[j].punct == JP_ARROW)
+		{
+			arrow = TRUE;
+			plist = TRUE;
+		}
+	}
+	if (arrow)
+	{
+		fn = JsNode(ji, JN_FUNC);
+		ptail = NULL;
+		if (plist)
+		{
+			ji->pos = k + 1;
+			while (JsTok(ji)->type == JT_IDENT)
+			{
+				param = JsNode(ji, JN_IDENT);
+				param->str = JsTok(ji)->str;
+				ji->pos++;
+				if (ptail)
+					ptail->next = param;
+				else
+					fn->a = param;
+				ptail = param;
+				if (!JsEatPunct(ji, ','))
+					break;
+			}
+			JsEatPunct(ji, ')');
+		}
+		else
+		{
+			param = JsNode(ji, JN_IDENT);
+			param->str = ji->toks[k].str;
+			fn->a = param;
+			ji->pos = k + 1;
+		}
+		JsEatPunct(ji, JP_ARROW);
+		if (JsIsPunct(ji, '{'))
+			fn->b = JsParseStmt(ji); // consumes the block
+		else
+		{ // expression body: implicit return
+			ret = JsNode(ji, JN_RETURN);
+			ji->depth++;
+			ret->a = JsParseAssign(ji);
+			ji->depth--;
+			blk = JsNode(ji, JN_BLOCK);
+			blk->a = ret;
+			fn->b = blk;
+		}
+		return fn;
+	}
 
 	ji->depth++;
 	node = JsParseCond(ji);
@@ -1186,7 +1457,9 @@ CJsNode *JsParseVar(CJsInterp *ji)
 
 CJsNode *JsParseStmt(CJsInterp *ji)
 {
-	CJsNode *node;
+	CJsNode *node, *item, *mtail;
+	CJsTok	*t;
+	I64		 k;
 
 	if (JsEatPunct(ji, ';'))
 		return NULL;
@@ -1196,6 +1469,84 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 		return JsParseFunc(ji, TRUE);
 	if (JsEatKw(ji, "var") || JsEatKw(ji, "let") || JsEatKw(ji, "const"))
 		return JsParseVar(ji);
+	if (JsEatKw(ji, "throw"))
+	{
+		node = JsNode(ji, JN_THROW);
+		node->a = JsParseAssign(ji);
+		JsEatPunct(ji, ';');
+		return node;
+	}
+	if (JsEatKw(ji, "try"))
+	{
+		node = JsNode(ji, JN_TRY);
+		node->a = JsParseStmt(ji);
+		if (JsEatKw(ji, "catch"))
+		{
+			if (JsEatPunct(ji, '('))
+			{
+				t = JsTok(ji);
+				if (t->type == JT_IDENT)
+				{
+					node->str = t->str;
+					ji->pos++;
+				}
+				JsEatPunct(ji, ')');
+			}
+			node->b = JsParseStmt(ji);
+		}
+		if (JsEatKw(ji, "finally"))
+			node->c = JsParseStmt(ji);
+		return node;
+	}
+	if (JsEatKw(ji, "class"))
+	{ // class X { constructor(..){..} method(..){..} } - extends is parsed
+	  // but ignored (no super)
+		node = JsNode(ji, JN_CLASS);
+		t = JsTok(ji);
+		if (t->type == JT_IDENT)
+		{
+			node->str = t->str;
+			ji->pos++;
+		}
+		if (JsEatKw(ji, "extends"))
+			node->c = JsParseAssign(ji);
+		mtail = NULL;
+		if (JsEatPunct(ji, '{'))
+		{
+			while (!JsIsPunct(ji, '}') && JsTok(ji)->type != JT_EOF &&
+				   !ji->has_err)
+			{
+				if (JsEatPunct(ji, ';'))
+				{ /* stray semicolons between members */ }
+				else
+				{
+					t = JsTok(ji);
+					if (t->type != JT_IDENT)
+					{
+						JsErr(ji, "bad class member");
+						break;
+					}
+					ji->pos++;
+					if (!StrCompare(t->str, "static") &&
+						JsTok(ji)->type == JT_IDENT)
+					{ // treat static methods like instance ones
+						t = JsTok(ji);
+						ji->pos++;
+					}
+					item = JsNode(ji, JN_PROP);
+					item->str = t->str;
+					item->a = JsParseFunc(ji, FALSE); // (params) { body }
+					if (mtail)
+						mtail->next = item;
+					else
+						node->a = item;
+					mtail = item;
+				}
+			}
+			JsEatPunct(ji, '}');
+		}
+		return node;
+	}
 	if (JsEatKw(ji, "if"))
 	{
 		node = JsNode(ji, JN_IF);
@@ -1225,6 +1576,28 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 		node = JsNode(ji, JN_FOR);
 		if (!JsEatPunct(ji, '('))
 			JsErr(ji, "expected ( after for");
+		// for ( [var|let|const] name of|in iterable ) body
+		k = ji->pos;
+		if (ji->toks[k].type == JT_IDENT &&
+			(!StrCompare(ji->toks[k].str, "var") ||
+			 !StrCompare(ji->toks[k].str, "let") ||
+			 !StrCompare(ji->toks[k].str, "const")))
+			k++;
+		if (ji->toks[k].type == JT_IDENT && ji->toks[k + 1].type == JT_IDENT &&
+			(!StrCompare(ji->toks[k + 1].str, "of") ||
+			 !StrCompare(ji->toks[k + 1].str, "in")))
+		{
+			node->type = JN_FOROF;
+			node->str = ji->toks[k].str;
+			if (!StrCompare(ji->toks[k + 1].str, "in"))
+				node->op = 1;
+			ji->pos = k + 2;
+			node->a = JsParseAssign(ji);
+			if (!JsEatPunct(ji, ')'))
+				JsErr(ji, "expected ) after for-of");
+			node->d = JsParseStmt(ji);
+			return node;
+		}
 		if (!JsIsPunct(ji, ';'))
 		{
 			if (JsIsKw(ji, "var") || JsIsKw(ji, "let") || JsIsKw(ji, "const"))
@@ -1265,9 +1638,8 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 		JsEatPunct(ji, ';');
 		return JsNode(ji, JN_BREAK);
 	}
-	if (JsIsKw(ji, "continue") || JsIsKw(ji, "do") || JsIsKw(ji, "try") ||
-		JsIsKw(ji, "throw") || JsIsKw(ji, "switch") || JsIsKw(ji, "class"))
-	{
+	if (JsIsKw(ji, "continue") || JsIsKw(ji, "do") || JsIsKw(ji, "switch"))
+	{ // try/throw/class are handled above now
 		JsErr(ji, "unsupported statement");
 		return NULL;
 	}
@@ -1442,6 +1814,13 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 			if (!StrCompare(name, "slice"))			return JsNativeV(ji, JSN_STR_SLICE);
 			if (!StrCompare(name, "toUpperCase"))	return JsNativeV(ji, JSN_STR_TOUPPER);
 			if (!StrCompare(name, "toLowerCase"))	return JsNativeV(ji, JSN_STR_TOLOWER);
+			if (!StrCompare(name, "split"))			return JsNativeV(ji, JSN_STR_SPLIT);
+			if (!StrCompare(name, "replace"))		return JsNativeV(ji, JSN_STR_REPLACE);
+			if (!StrCompare(name, "trim"))			return JsNativeV(ji, JSN_STR_TRIM);
+			if (!StrCompare(name, "includes"))		return JsNativeV(ji, JSN_STR_INCLUDES);
+			if (!StrCompare(name, "startsWith"))	return JsNativeV(ji, JSN_STR_STARTS);
+			if (!StrCompare(name, "endsWith"))		return JsNativeV(ji, JSN_STR_ENDS);
+			if (!StrCompare(name, "charCodeAt"))	return JsNativeV(ji, JSN_STR_CHARCODE);
 			return JsUndefV(ji);
 		case JV_ARR:
 			if (!StrCompare(name, "length"))
@@ -1449,6 +1828,19 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 			if (!StrCompare(name, "push"))		return JsNativeV(ji, JSN_ARR_PUSH);
 			if (!StrCompare(name, "join"))		return JsNativeV(ji, JSN_ARR_JOIN);
 			if (!StrCompare(name, "indexOf"))	return JsNativeV(ji, JSN_ARR_INDEXOF);
+			if (!StrCompare(name, "map"))		return JsNativeV(ji, JSN_ARR_MAP);
+			if (!StrCompare(name, "filter"))	return JsNativeV(ji, JSN_ARR_FILTER);
+			if (!StrCompare(name, "forEach"))	return JsNativeV(ji, JSN_ARR_FOREACH);
+			if (!StrCompare(name, "find"))		return JsNativeV(ji, JSN_ARR_FIND);
+			if (!StrCompare(name, "slice"))		return JsNativeV(ji, JSN_ARR_SLICE);
+			if (!StrCompare(name, "concat"))	return JsNativeV(ji, JSN_ARR_CONCAT);
+			if (!StrCompare(name, "includes"))	return JsNativeV(ji, JSN_ARR_INCLUDES);
+			if (!StrCompare(name, "pop"))		return JsNativeV(ji, JSN_ARR_POP);
+			if (!StrCompare(name, "shift"))		return JsNativeV(ji, JSN_ARR_SHIFT);
+			return JsUndefV(ji);
+		case JV_NATIVE:
+			if (obj->native_id == JSN_PROMISE_CTOR && !StrCompare(name, "resolve"))
+				return JsNativeV(ji, JSN_PROMISE_SRESOLVE);
 			return JsUndefV(ji);
 		case JV_OBJ:
 			break;
@@ -1476,6 +1868,32 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				return JsNativeV(ji, JSN_DOC_WRITE);
 			if (!StrCompare(name, "getElementById"))
 				return JsNativeV(ji, JSN_DOC_GETBYID);
+			if (!StrCompare(name, "createElement"))
+				return JsNativeV(ji, JSN_DOC_CREATE_EL);
+			if (!StrCompare(name, "createTextNode"))
+				return JsNativeV(ji, JSN_DOC_CREATE_TX);
+			if (!StrCompare(name, "querySelector"))
+				return JsNativeV(ji, JSN_QSEL);
+			if (!StrCompare(name, "querySelectorAll"))
+				return JsNativeV(ji, JSN_QSELALL);
+			if (!StrCompare(name, "head"))
+			{
+				node = ZDomFindTag(ji->dom_root, "head");
+				if (node)
+					return JsElemV(ji, node);
+				return JsNullV(ji);
+			}
+			if (!StrCompare(name, "documentElement"))
+			{
+				node = ZDomFindTag(ji->dom_root, "html");
+				if (node)
+					return JsElemV(ji, node);
+				return JsElemV(ji, ji->dom_root);
+			}
+			if (!StrCompare(name, "addEventListener"))
+				return JsNativeV(ji, JSN_EL_ADDLISTEN); // binds to the DOM root
+			if (!StrCompare(name, "removeEventListener"))
+				return JsNativeV(ji, JSN_EL_REMLISTEN);
 			return JsUndefV(ji);
 		case JSO_LOCATION:
 			if (!StrCompare(name, "href"))
@@ -1486,6 +1904,10 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				return ji->loc_obj;
 			if (!StrCompare(name, "document"))
 				return ji->doc_obj;
+			if (!StrCompare(name, "addEventListener"))
+				return JsNativeV(ji, JSN_EL_ADDLISTEN); // binds to the DOM root
+			if (!StrCompare(name, "removeEventListener"))
+				return JsNativeV(ji, JSN_EL_REMLISTEN);
 			v = JsEnvGet(ji, name);
 			if (v)
 				return v;
@@ -1550,6 +1972,48 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				return JsNativeV(ji, JSN_EL_ADDLISTEN);
 			if (!StrCompare(name, "removeEventListener"))
 				return JsNativeV(ji, JSN_EL_REMLISTEN);
+			if (!StrCompare(name, "appendChild"))
+				return JsNativeV(ji, JSN_EL_APPEND);
+			if (!StrCompare(name, "removeChild"))
+				return JsNativeV(ji, JSN_EL_REMOVE_CH);
+			if (!StrCompare(name, "remove"))
+				return JsNativeV(ji, JSN_EL_REMOVE);
+			if (!StrCompare(name, "querySelector"))
+				return JsNativeV(ji, JSN_QSEL);
+			if (!StrCompare(name, "querySelectorAll"))
+				return JsNativeV(ji, JSN_QSELALL);
+			if (!StrCompare(name, "classList"))
+			{
+				v = JsValNew(ji, JV_OBJ);
+				v->native_id = JSO_CLASSLIST;
+				v->node = node;
+				return v;
+			}
+			if (!StrCompare(name, "parentNode") ||
+				!StrCompare(name, "parentElement"))
+			{
+				if (node->parent)
+					return JsElemV(ji, node->parent);
+				return JsNullV(ji);
+			}
+			if (!StrCompare(name, "firstChild"))
+			{
+				if (node->first_child)
+					return JsElemV(ji, node->first_child);
+				return JsNullV(ji);
+			}
+			if (!StrCompare(name, "children"))
+			{
+				v = JsArrV(ji);
+				node = node->first_child;
+				while (node)
+				{
+					if (node->type == ZH_ELEM)
+						JsArrPush(ji, v, JsElemV(ji, node));
+					node = node->next;
+				}
+				return v;
+			}
 			attr = ZNodeAttr(node, name);
 			if (attr)
 				return JsStrV(ji, attr);
@@ -1568,6 +2032,27 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 			v = JsPropGet(obj, name); // readyState/status/responseText/onload/...
 			if (v)
 				return v;
+			return JsUndefV(ji);
+		case JSO_PROMISE:
+			if (!StrCompare(name, "then"))
+				return JsNativeV(ji, JSN_PROMISE_THEN);
+			if (!StrCompare(name, "catch"))
+				return JsNativeV(ji, JSN_PROMISE_CATCH);
+			if (!StrCompare(name, "finally"))
+				return JsNativeV(ji, JSN_PROMISE_FINALLY);
+			v = JsPropGet(obj, name);
+			if (v)
+				return v;
+			return JsUndefV(ji);
+		case JSO_CLASSLIST:
+			if (!StrCompare(name, "add"))
+				return JsNativeV(ji, JSN_CL_ADD);
+			if (!StrCompare(name, "remove"))
+				return JsNativeV(ji, JSN_CL_REMOVE);
+			if (!StrCompare(name, "toggle"))
+				return JsNativeV(ji, JSN_CL_TOGGLE);
+			if (!StrCompare(name, "contains"))
+				return JsNativeV(ji, JSN_CL_CONTAINS);
 			return JsUndefV(ji);
 	}
 
@@ -1620,7 +2105,10 @@ U0 JsMemberSet(CJsInterp *ji, CJsVal *obj, U8 *name, CJsVal *val)
 				ji->dom_dirty = TRUE;
 			}
 			else if (!StrCompare(name, "textContent") || !StrCompare(name, "innerText"))
+			{
 				JsTextContentSet(ji, node, JsToStr(ji, val));
+				JsStyleIngest(ji, node); // CSS-in-JS: styleEl.textContent = css
+			}
 			else if (!StrCompare(name, "value"))
 			{
 				Free(node->value);
@@ -1814,11 +2302,31 @@ U0 JsAssignTo(CJsInterp *ji, CJsNode *target, CJsVal *val)
 	}
 }
 
+CJsVal *JsConstruct(CJsInterp *ji, CJsVal *fn, CJsVal **args, I64 argc)
+{ // new-expression: fresh object, prototype link, constructor call with this
+	CJsVal *obj, *pr, *r;
+
+	if (!fn || (fn->type != JV_FUNC && fn->type != JV_NATIVE))
+	{
+		JsErr(ji, "not a constructor");
+		return JsUndefV(ji);
+	}
+	obj = JsValNew(ji, JV_OBJ);
+	pr = JsPropGet(fn, "prototype");
+	if (pr && pr->type == JV_OBJ)
+		obj->proto = pr;
+	r = JsCall(ji, fn, obj, args, argc);
+	if (r && (r->type == JV_OBJ || r->type == JV_ARR))
+		return r; // natives (XMLHttpRequest) and explicit object returns
+	return obj;
+}
+
 CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 {
 	CJsVal	*v, *obj, *fn, *cur;
 	CJsVal	*argv[JS_MAX_ARGS];
 	CJsNode *child;
+	CJsProp *prp;
 	I64		 i, argc, op;
 	U8		 one[2];
 
@@ -1964,6 +2472,18 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 			JsAssignTo(ji, node->a, JsNumV(ji, v->num + node->op));
 			return v;
 		case JN_CALL:
+			if (node->a && node->a->type == JN_NEW)
+			{ // new X(args)
+				fn = JsEval(ji, node->a->a);
+				argc = 0;
+				child = node->b;
+				while (child && argc < JS_MAX_ARGS)
+				{
+					argv[argc++] = JsEval(ji, child);
+					child = child->next;
+				}
+				return JsConstruct(ji, fn, argv, argc);
+			}
 			if (node->a && node->a->type == JN_MEMBER)
 			{
 				obj = JsEval(ji, node->a->a);
@@ -2031,6 +2551,7 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 		case JN_FUNC:
 			v = JsValNew(ji, JV_FUNC);
 			v->func = node(U64);
+			v->fenv = ji->env; // capture the defining env: closures
 			if (node->str)
 				JsEnvDeclare(ji, ji->env, node->str, v);
 			return v;
@@ -2046,6 +2567,91 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 			return NULL;
 		case JN_EXPR:
 			return JsEval(ji, node->a);
+		case JN_NEW: // new X (no argument parens)
+			fn = JsEval(ji, node->a);
+			return JsConstruct(ji, fn, NULL, 0);
+		case JN_THROW:
+			ji->exc = JsEval(ji, node->a);
+			ji->flow = JF_THROW;
+			return NULL;
+		case JN_TRY:
+			JsEval(ji, node->a);
+			if (ji->flow == JF_THROW && node->b)
+			{
+				ji->flow = JF_NORMAL;
+				v = ji->exc;
+				if (!v)
+					v = JsUndefV(ji);
+				if (node->str)
+					JsEnvDeclare(ji, ji->env, node->str, v);
+				JsEval(ji, node->b);
+			}
+			if (node->c)
+			{ // finally always runs, then any pending flow resumes
+				op = ji->flow;
+				ji->flow = JF_NORMAL;
+				JsEval(ji, node->c);
+				if (ji->flow == JF_NORMAL)
+					ji->flow = op;
+			}
+			return NULL;
+		case JN_FOROF:
+			v = JsEval(ji, node->a);
+			if (v->type == JV_ARR)
+			{
+				for (argc = 0; argc < v->count && !ji->has_err &&
+					 ji->flow == JF_NORMAL; argc++)
+				{
+					if (node->op)
+						JsEnvDeclare(ji, ji->env, node->str, JsNumV(ji, argc));
+					else
+						JsEnvDeclare(ji, ji->env, node->str, v->items[argc]);
+					JsEval(ji, node->d);
+				}
+			}
+			else if (v->type == JV_STR && !node->op)
+			{
+				for (argc = 0; v->str[argc] && !ji->has_err &&
+					 ji->flow == JF_NORMAL; argc++)
+				{
+					one[0] = v->str[argc];
+					one[1] = 0;
+					JsEnvDeclare(ji, ji->env, node->str, JsStrV(ji, one));
+					JsEval(ji, node->d);
+				}
+			}
+			else if (v->type == JV_OBJ && node->op)
+			{
+				prp = v->props;
+				while (prp && !ji->has_err && ji->flow == JF_NORMAL)
+				{
+					JsEnvDeclare(ji, ji->env, node->str, JsStrV(ji, prp->name));
+					JsEval(ji, node->d);
+					prp = prp->next;
+				}
+			}
+			if (ji->flow == JF_BREAK)
+				ji->flow = JF_NORMAL;
+			return NULL;
+		case JN_CLASS:
+			obj = JsValNew(ji, JV_OBJ); // the prototype object
+			v = NULL;					// the constructor
+			child = node->a;
+			while (child)
+			{
+				fn = JsEval(ji, child->a); // JN_FUNC: closure value
+				if (!StrCompare(child->str, "constructor"))
+					v = fn;
+				else
+					JsPropSet(ji, obj, child->str, fn);
+				child = child->next;
+			}
+			if (!v)
+				v = JsNativeV(ji, JSN_EVT_NOOP); // default empty constructor
+			JsPropSet(ji, v, "prototype", obj);
+			if (node->str)
+				JsEnvDeclare(ji, ji->env, node->str, v);
+			return v;
 	}
 
 	return JsUndefV(ji);
@@ -2059,6 +2665,572 @@ CJsVal *JsArgOr(CJsInterp *ji, CJsVal **args, I64 argc, I64 i)
 		return args[i];
 
 	return JsUndefV(ji);
+}
+
+/* ---- microtasks + promises (Phase B-2) ---- */
+
+U0 JsMicroAdd(CJsInterp *ji, CJsVal *fn, CJsVal *arg, Bool has_arg)
+{
+	CJsMicro *m;
+
+	if (!fn || (fn->type != JV_FUNC && fn->type != JV_NATIVE))
+		return;
+	m = JsAlloc(ji, sizeof(CJsMicro))(CJsMicro *);
+	m->fn = fn;
+	m->arg = arg;
+	m->has_arg = has_arg;
+	m->next = NULL;
+	if (ji->micro_tail)
+		ji->micro_tail->next = m;
+	else
+		ji->micro_head = m;
+	ji->micro_tail = m;
+}
+
+U0 JsMicroDrain(CJsInterp *ji)
+{ // run queued promise reactions; bounded so a self-queuing loop can't wedge
+	CJsMicro *m;
+	CJsVal	 *a1;
+	I64		  ran = 0;
+
+	while (ji->micro_head && ran < 512)
+	{
+		m = ji->micro_head;
+		ji->micro_head = m->next;
+		if (!ji->micro_head)
+			ji->micro_tail = NULL;
+		ji->steps = 0;
+		ji->depth = 0;
+		ji->flow = JF_NORMAL;
+		ji->env = ji->genv;
+		if (m->has_arg)
+		{
+			a1 = m->arg;
+			JsCall(ji, m->fn, NULL, &a1, 1);
+		}
+		else
+			JsCall(ji, m->fn, NULL, NULL, 0);
+		if (ji->has_err)
+		{
+			NetLog("%s", ji->err);
+			ji->has_err = FALSE;
+		}
+		ji->flow = JF_NORMAL;
+		ran++;
+	}
+}
+
+CJsVal *JsPromiseNew(CJsInterp *ji)
+{
+	CJsVal *pr = JsValNew(ji, JV_OBJ);
+
+	pr->native_id = JSO_PROMISE;
+	JsPropSet(ji, pr, "_state", JsNumV(ji, 0)); // 0 pending 1 resolved 2 rejected
+	JsPropSet(ji, pr, "_onres", JsArrV(ji));
+	JsPropSet(ji, pr, "_onrej", JsArrV(ji));
+	return pr;
+}
+
+U0 JsPromiseSettle(CJsInterp *ji, CJsVal *pr, CJsVal *val, Bool rejected)
+{
+	CJsVal *st, *cbs;
+	I64		i;
+
+	if (!pr || pr->native_id != JSO_PROMISE)
+		return;
+	st = JsPropGet(pr, "_state");
+	if (st && JsToNum(st) != 0.0)
+		return; // already settled
+	if (!val)
+		val = JsUndefV(ji);
+	if (rejected)
+		JsPropSet(ji, pr, "_state", JsNumV(ji, 2));
+	else
+		JsPropSet(ji, pr, "_state", JsNumV(ji, 1));
+	JsPropSet(ji, pr, "_value", val);
+	if (rejected)
+		cbs = JsPropGet(pr, "_onrej");
+	else
+		cbs = JsPropGet(pr, "_onres");
+	if (cbs && cbs->type == JV_ARR)
+		for (i = 0; i < cbs->count; i++)
+			JsMicroAdd(ji, cbs->items[i], val, TRUE);
+}
+
+U0 JsPromiseReact(CJsInterp *ji, CJsVal *pr, CJsVal *cb, Bool on_rej)
+{ // then/catch registration (or immediate microtask when already settled)
+	CJsVal *st, *val, *cbs;
+	I64		state;
+
+	if (!pr || pr->native_id != JSO_PROMISE || !cb)
+		return;
+	st = JsPropGet(pr, "_state");
+	state = 0;
+	if (st)
+		state = JsToNum(st);
+	if (state == 0)
+	{
+		if (on_rej)
+			cbs = JsPropGet(pr, "_onrej");
+		else
+			cbs = JsPropGet(pr, "_onres");
+		if (cbs && cbs->type == JV_ARR)
+			JsArrPush(ji, cbs, cb);
+		return;
+	}
+	if ((state == 1 && !on_rej) || (state == 2 && on_rej))
+	{
+		val = JsPropGet(pr, "_value");
+		JsMicroAdd(ji, cb, val, TRUE);
+	}
+}
+
+CJsVal *JsFetch(CJsInterp *ji, CJsVal **args, I64 argc)
+{ // fetch(url[, {method, body}]) -> promise of a response object. The network
+  // request is synchronous underneath; then-callbacks fire on the next pump.
+	U8			  *url, *abs = NULL, *method = NULL, *body = NULL;
+	CJsVal		  *pr, *resp, *ov, *mv;
+	CHttpUrl	   base;
+	CHttpResponse *r;
+
+	pr = JsPromiseNew(ji);
+	if (!argc)
+	{
+		JsPromiseSettle(ji, pr, JsUndefV(ji), TRUE);
+		return pr;
+	}
+	url = JsToStr(ji, args[0]);
+	if (argc > 1 && args[1]->type == JV_OBJ)
+	{
+		ov = args[1];
+		mv = JsPropGet(ov, "method");
+		if (mv)
+			method = JsToStr(ji, mv);
+		mv = JsPropGet(ov, "body");
+		if (mv && mv->type != JV_UNDEF && mv->type != JV_NULL)
+			body = JsToStr(ji, mv);
+	}
+	if (HttpUrlParse(ji->url, &base) >= 0)
+		abs = HttpUrlResolve(&base, url);
+	if (!abs)
+		abs = StrNew(url);
+	if (method && !StrICompare(method, "POST") && body)
+		r = HttpPost(abs, body);
+	else
+		r = HttpGet(abs);
+	Free(abs);
+
+	resp = JsValNew(ji, JV_OBJ);
+	if (r)
+	{
+		JsPropSet(ji, resp, "status", JsNumV(ji, r->status));
+		JsPropSet(ji, resp, "ok", JsBoolV(ji, 200 <= r->status < 300));
+		JsPropSet(ji, resp, "_body", JsStrV(ji, r->body));
+		HttpResponseFree(r);
+		JsPropSet(ji, resp, "text", JsNativeV(ji, JSN_RESP_TEXT));
+		JsPropSet(ji, resp, "json", JsNativeV(ji, JSN_RESP_JSON));
+		JsPromiseSettle(ji, pr, resp, FALSE);
+	}
+	else
+	{
+		JsPropSet(ji, resp, "status", JsNumV(ji, 0));
+		JsPropSet(ji, resp, "ok", JsBoolV(ji, FALSE));
+		JsPromiseSettle(ji, pr, resp, TRUE);
+	}
+	return pr;
+}
+
+/* ---- JSON ---- */
+
+CJsVal *JsJsonParseVal(CJsInterp *ji, U8 **pp, I64 depth)
+{
+	U8	   *p = *pp, buf[1024];
+	I64		n;
+	CJsVal *v, *item;
+	Bool	neg;
+
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+		p++;
+	if (depth > 24 || !*p)
+	{
+		*pp = p;
+		return JsNullV(ji);
+	}
+	if (*p == '{')
+	{
+		p++;
+		v = JsValNew(ji, JV_OBJ);
+		while (*p)
+		{
+			while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')
+				p++;
+			if (*p == '}')
+			{ p++; break; }
+			if (*p != '"')
+				break;
+			p++;
+			n = 0;
+			while (*p && *p != '"' && n < 1020)
+			{
+				if (*p == '\\' && p[1])
+					p++;
+				buf[n++] = *p++;
+			}
+			buf[n] = 0;
+			if (*p == '"')
+				p++;
+			while (*p == ' ' || *p == '\t')
+				p++;
+			if (*p == ':')
+				p++;
+			*pp = p;
+			item = JsJsonParseVal(ji, pp, depth + 1);
+			p = *pp;
+			JsPropSet(ji, v, buf, item);
+		}
+		*pp = p;
+		return v;
+	}
+	if (*p == '[')
+	{
+		p++;
+		v = JsArrV(ji);
+		while (*p)
+		{
+			while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')
+				p++;
+			if (*p == ']')
+			{ p++; break; }
+			*pp = p;
+			item = JsJsonParseVal(ji, pp, depth + 1);
+			p = *pp;
+			JsArrPush(ji, v, item);
+		}
+		*pp = p;
+		return v;
+	}
+	if (*p == '"')
+	{
+		p++;
+		n = 0;
+		while (*p && *p != '"' && n < 1020)
+		{
+			if (*p == '\\' && p[1])
+			{
+				p++;
+				if (*p == 'n')
+				{ buf[n++] = '\n'; p++; }
+				else if (*p == 't')
+				{ buf[n++] = '\t'; p++; }
+				else
+					buf[n++] = *p++;
+			}
+			else
+				buf[n++] = *p++;
+		}
+		buf[n] = 0;
+		if (*p == '"')
+			p++;
+		*pp = p;
+		return JsStrV(ji, buf);
+	}
+	if (!StrNCompare(p, "true", 4))
+	{ *pp = p + 4; return JsBoolV(ji, TRUE); }
+	if (!StrNCompare(p, "false", 5))
+	{ *pp = p + 5; return JsBoolV(ji, FALSE); }
+	if (!StrNCompare(p, "null", 4))
+	{ *pp = p + 4; return JsNullV(ji); }
+	neg = FALSE;
+	if (*p == '-')
+	{ neg = TRUE; }
+	n = 0;
+	while ((('0' <= *p <= '9') || *p == '.' || *p == '-' || *p == '+' ||
+			*p == 'e' || *p == 'E') && n < 60)
+		buf[n++] = *p++;
+	buf[n] = 0;
+	*pp = p;
+	if (!n)
+	{ (*pp)++; return JsNullV(ji); }
+	no_warn neg;
+	return JsNumV(ji, Str2F64(buf));
+}
+
+U0 JsJsonAppend(U8 *out, I64 *n, I64 max, U8 *s)
+{
+	while (*s && *n < max - 1)
+		out[(*n)++] = *s++;
+	out[*n] = 0;
+}
+
+U0 JsJsonStringify(CJsInterp *ji, CJsVal *v, U8 *out, I64 *n, I64 max, I64 depth)
+{
+	CJsProp *prp;
+	I64		i;
+	Bool	first;
+
+	if (!v || depth > 12)
+	{ JsJsonAppend(out, n, max, "null"); return; }
+	switch (v->type)
+	{
+		case JV_NUM:
+		case JV_BOOL:
+			JsJsonAppend(out, n, max, JsToStr(ji, v));
+			break;
+		case JV_STR:
+			JsJsonAppend(out, n, max, "\"");
+			JsJsonAppend(out, n, max, v->str); // escaping: minimal
+			JsJsonAppend(out, n, max, "\"");
+			break;
+		case JV_ARR:
+			JsJsonAppend(out, n, max, "[");
+			for (i = 0; i < v->count; i++)
+			{
+				if (i)
+					JsJsonAppend(out, n, max, ",");
+				JsJsonStringify(ji, v->items[i], out, n, max, depth + 1);
+			}
+			JsJsonAppend(out, n, max, "]");
+			break;
+		case JV_OBJ:
+			JsJsonAppend(out, n, max, "{");
+			first = TRUE;
+			prp = v->props;
+			while (prp)
+			{
+				if (prp->name[0] != '_') // skip internal slots
+				{
+					if (!first)
+						JsJsonAppend(out, n, max, ",");
+					first = FALSE;
+					JsJsonAppend(out, n, max, "\"");
+					JsJsonAppend(out, n, max, prp->name);
+					JsJsonAppend(out, n, max, "\":");
+					JsJsonStringify(ji, prp->val(CJsVal *), out, n, max, depth + 1);
+				}
+				prp = prp->next;
+			}
+			JsJsonAppend(out, n, max, "}");
+			break;
+		default:
+			JsJsonAppend(out, n, max, "null");
+			break;
+	}
+}
+
+/* ---- DOM mutation + selectors + classList ---- */
+
+U0 JsNodeDetach(CZNode *c)
+{ // unlink c from its parent's child list (node stays allocated)
+	CZNode *p = c->parent, *s;
+
+	if (!p)
+		return;
+	if (p->first_child == c)
+	{
+		p->first_child = c->next;
+		if (p->last_child == c)
+			p->last_child = NULL;
+	}
+	else
+	{
+		s = p->first_child;
+		while (s && s->next != c)
+			s = s->next;
+		if (s)
+		{
+			s->next = c->next;
+			if (p->last_child == c)
+				p->last_child = s;
+		}
+	}
+	c->parent = NULL;
+	c->next = NULL;
+	zh_dom_gen++;
+}
+
+U0 JsStyleIngest(CJsInterp *ji, CZNode *node)
+{ // a <style> element gained content: parse its text into live CSS rules.
+  // This is how CSS-in-JS frameworks style the page.
+	U8	*buf;
+	I64	 len = 0;
+
+	if (!node || StrCompare(node->tag, "style"))
+		return;
+	buf = MAlloc(32768);
+	ZNodeTextCollect(node, buf, 32760, &len);
+	if (len)
+		ZCssParseRegion(buf, buf + len);
+	Free(buf);
+	ji->dom_dirty = TRUE;
+}
+
+U0 JsNodeAppend(CJsInterp *ji, CZNode *p, CZNode *c)
+{
+	if (!p || !c || p == c)
+		return;
+	JsNodeDetach(c);
+	c->parent = p;
+	c->next = NULL;
+	if (p->last_child)
+		p->last_child->next = c;
+	else
+		p->first_child = c;
+	p->last_child = c;
+	zh_dom_gen++;
+	ji->dom_dirty = TRUE;
+	JsStyleIngest(ji, c); // CSS-in-JS: appending a filled <style> applies it
+}
+
+U0 JsQSelSplit(U8 *sel, U8 *tag, U8 *cls, U8 *id)
+{ // one compound selector: tag, .class, #id in any combination
+	I64 tn = 0, cn = 0, in = 0, mode = 0;
+
+	tag[0] = 0;
+	cls[0] = 0;
+	id[0] = 0;
+	while (*sel == ' ')
+		sel++;
+	while (*sel && *sel != ' ' && *sel != ',')
+	{
+		if (*sel == '.')
+		{ mode = 1; cn = 0; sel++; }
+		else if (*sel == '#')
+		{ mode = 2; in = 0; sel++; }
+		else
+		{
+			if (mode == 0 && tn < 15)
+				tag[tn++] = ZChLower(*sel);
+			else if (mode == 1 && cn < 31)
+				cls[cn++] = *sel;
+			else if (mode == 2 && in < 31)
+				id[in++] = *sel;
+			sel++;
+		}
+	}
+	tag[tn] = 0;
+	cls[cn] = 0;
+	id[in] = 0;
+}
+
+Bool JsClassHasTok(U8 *class_attr, U8 *tok)
+{
+	U8	*p = class_attr;
+	I64	 tl = StrLen(tok);
+
+	if (!p || !tl)
+		return FALSE;
+	while (*p)
+	{
+		while (*p == ' ')
+			p++;
+		if (!StrNICompare(p, tok, tl) && (p[tl] == 0 || p[tl] == ' '))
+			return TRUE;
+		while (*p && *p != ' ')
+			p++;
+	}
+	return FALSE;
+}
+
+Bool JsQSelMatch(CZNode *node, U8 *tag, U8 *cls, U8 *id)
+{
+	U8 *a;
+
+	if (node->type != ZH_ELEM)
+		return FALSE;
+	if (tag[0] && StrCompare(node->tag, tag))
+		return FALSE;
+	if (id[0])
+	{
+		a = ZNodeAttr(node, "id");
+		if (!a || StrCompare(a, id))
+			return FALSE;
+	}
+	if (cls[0])
+	{
+		a = ZNodeAttr(node, "class");
+		if (!JsClassHasTok(a, cls))
+			return FALSE;
+	}
+	return tag[0] || cls[0] || id[0];
+}
+
+CZNode *JsQSelWalk(CZNode *node, U8 *tag, U8 *cls, U8 *id,
+				   CJsInterp *ji, CJsVal *all)
+{ // depth-first; all != NULL collects every match, else returns the first
+	CZNode *child, *hit;
+
+	if (!node)
+		return NULL;
+	if (JsQSelMatch(node, tag, cls, id))
+	{
+		if (!all)
+			return node;
+		if (all->count < 400)
+			JsArrPush(ji, all, JsElemV(ji, node));
+	}
+	child = node->first_child;
+	while (child)
+	{
+		hit = JsQSelWalk(child, tag, cls, id, ji, all);
+		if (hit && !all)
+			return hit;
+		child = child->next;
+	}
+	return NULL;
+}
+
+U0 JsClassListMod(CJsInterp *ji, CZNode *node, U8 *tok, I64 mode)
+{ // mode 0 add, 1 remove, 2 toggle
+	U8	 buf[512];
+	U8	*a = ZNodeAttr(node, "class"), *p;
+	I64	 n = 0, tl = StrLen(tok);
+	Bool has = JsClassHasTok(a, tok), keep;
+
+	if (mode == 2)
+	{
+		if (has)
+			mode = 1;
+		else
+			mode = 0;
+	}
+	if (mode == 0 && has)
+		return;
+	buf[0] = 0;
+	if (a)
+	{ // copy tokens, dropping tok when removing
+		p = a;
+		while (*p)
+		{
+			while (*p == ' ')
+				p++;
+			if (!*p)
+				break;
+			keep = TRUE;
+			if (mode == 1 && !StrNICompare(p, tok, tl) &&
+				(p[tl] == 0 || p[tl] == ' '))
+				keep = FALSE;
+			while (*p && *p != ' ')
+			{
+				if (keep && n < 508)
+					buf[n++] = *p;
+				p++;
+			}
+			if (keep && n < 508)
+				buf[n++] = ' ';
+		}
+	}
+	if (mode == 0)
+	{
+		p = tok;
+		while (*p && n < 508)
+			buf[n++] = *p++;
+	}
+	while (n && buf[n - 1] == ' ')
+		n--;
+	buf[n] = 0;
+	ZNodeAttrSet(node, "class", buf);
+	ji->dom_dirty = TRUE;
+	no_warn tl;
 }
 
 /* ---- event loop, events, and XMLHttpRequest ----
@@ -2293,12 +3465,15 @@ Bool JsDispatchEvent(CJsInterp *ji, CZNode *node, U8 *type)
 		l = l->next;
 	}
 	if (ran)
+	{
+		JsMicroDrain(ji); // promise chains started by the handlers
 		JsFlushWrites(ji);
+	}
 	return ran;
 }
 
 U0 JsEventLoopPump(CJsInterp *ji)
-{ // fire timers whose deadline has passed and deliver completed async XHRs.
+{ // drain promise microtasks, then fire due timers / async XHRs.
   // Bounded per call so a storm of 0ms timers cannot wedge the frame.
 	CJsTimer *t;
 	I64		  fired = 0;
@@ -2306,6 +3481,7 @@ U0 JsEventLoopPump(CJsInterp *ji)
 
 	if (!ji)
 		return;
+	JsMicroDrain(ji); // promise reactions run before (and after) timers
 	now = tS;
 	t = ji->timers;
 	while (t && fired < 256)
@@ -2339,18 +3515,22 @@ U0 JsEventLoopPump(CJsInterp *ji)
 	}
 	if (fired)
 		JsFlushWrites(ji);
+	JsMicroDrain(ji); // reactions queued by the timers that just fired
 }
 
-CJsVal *JsCallNative(CJsInterp *ji, I64 id, CJsVal *this_val,
+CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 					 CJsVal **args, I64 argc)
-{
+{ // self = the native function value itself (carries promise binding in proto)
 	U8	 buf[1024];
-	U8	*s, *sep;
+	U8	*s, *sep, *bb;
 	I64	 i, a, b, len;
 	F64	 best, ms;
-	CJsVal *v;
-	CZNode *node;
+	CJsVal *v, *w, *pr, *resv, *rej;
+	CJsVal *pa[2];
+	CZNode *node, *nd2;
 	CJsTimer *t;
+	CJsProp *prp;
+	U8	 qtag[16], qcls[32], qid[32];
 
 	switch (id)
 	{
@@ -2426,6 +3606,95 @@ CJsVal *JsCallNative(CJsInterp *ji, I64 id, CJsVal *this_val,
 			JsPropSet(ji, v, "status", JsNumV(ji, 0));
 			JsPropSet(ji, v, "responseText", JsStrV(ji, ""));
 			return v;
+		case JSN_PROMISE_CTOR:
+			pr = JsPromiseNew(ji);
+			if (argc && (args[0]->type == JV_FUNC || args[0]->type == JV_NATIVE))
+			{ // run the executor now with bound resolve/reject
+				resv = JsNativeV(ji, JSN_PROMISE_RESOLVE);
+				resv->proto = pr;
+				rej = JsNativeV(ji, JSN_PROMISE_REJECT);
+				rej->proto = pr;
+				pa[0] = resv;
+				pa[1] = rej;
+				JsCall(ji, args[0], NULL, pa, 2);
+			}
+			return pr;
+		case JSN_PROMISE_RESOLVE:
+			if (self && self->proto)
+				JsPromiseSettle(ji, self->proto, JsArgOr(ji, args, argc, 0), FALSE);
+			return JsUndefV(ji);
+		case JSN_PROMISE_REJECT:
+			if (self && self->proto)
+				JsPromiseSettle(ji, self->proto, JsArgOr(ji, args, argc, 0), TRUE);
+			return JsUndefV(ji);
+		case JSN_PROMISE_SRESOLVE:
+			pr = JsPromiseNew(ji);
+			JsPromiseSettle(ji, pr, JsArgOr(ji, args, argc, 0), FALSE);
+			return pr;
+		case JSN_FETCH:
+			return JsFetch(ji, args, argc);
+		case JSN_JSON_PARSE:
+			s = JsToStr(ji, JsArgOr(ji, args, argc, 0));
+			return JsJsonParseVal(ji, &s, 0);
+		case JSN_JSON_STR:
+			bb = MAlloc(16384);
+			i = 0;
+			bb[0] = 0;
+			JsJsonStringify(ji, JsArgOr(ji, args, argc, 0), bb, &i, 16384, 0);
+			v = JsStrV(ji, bb);
+			Free(bb);
+			return v;
+		case JSN_DOC_CREATE_EL:
+			nd2 = ZNodeNew(ZH_ELEM, NULL);
+			if (!nd2)
+				return JsNullV(ji);
+			s = JsToStr(ji, JsArgOr(ji, args, argc, 0));
+			i = 0;
+			while (s[i] && i < 15)
+			{
+				nd2->tag[i] = ZChLower(s[i]);
+				i++;
+			}
+			nd2->tag[i] = 0;
+			return JsElemV(ji, nd2);
+		case JSN_DOC_CREATE_TX:
+			nd2 = ZNodeNew(ZH_TEXT, NULL);
+			if (!nd2)
+				return JsNullV(ji);
+			nd2->text = StrNew(JsToStr(ji, JsArgOr(ji, args, argc, 0)));
+			return JsElemV(ji, nd2);
+		case JSN_OBJ_KEYS:
+			v = JsArrV(ji);
+			w = JsArgOr(ji, args, argc, 0);
+			if (w->type == JV_OBJ)
+			{
+				prp = w->props;
+				while (prp)
+				{
+					JsArrPush(ji, v, JsStrV(ji, prp->name));
+					prp = prp->next;
+				}
+			}
+			return v;
+		case JSN_OBJ_ASSIGN:
+			if (!argc)
+				return JsUndefV(ji);
+			v = args[0];
+			for (a = 1; a < argc; a++)
+			{
+				if (args[a]->type == JV_OBJ && v->type == JV_OBJ)
+				{
+					prp = args[a]->props;
+					while (prp)
+					{
+						JsPropSet(ji, v, prp->name, prp->val(CJsVal *));
+						prp = prp->next;
+					}
+				}
+			}
+			return v;
+		case JSN_ARR_ISARR:
+			return JsBoolV(ji, JsArgOr(ji, args, argc, 0)->type == JV_ARR);
 		case JSN_MATH_FLOOR:
 			return JsNumV(ji, Floor(JsToNum(JsArgOr(ji, args, argc, 0))));
 		case JSN_MATH_CEIL:
@@ -2581,9 +3850,13 @@ CJsVal *JsCallNative(CJsInterp *ji, I64 id, CJsVal *this_val,
 			}
 			return JsUndefV(ji);
 		case JSN_EL_ADDLISTEN:
-			if (this_val->type == JV_OBJ && this_val->node && argc >= 2)
-				JsListenerAdd(ji, this_val->node, JsToStr(ji, args[0]),
-							  args[1], FALSE);
+			if (this_val->type == JV_OBJ && argc >= 2)
+			{
+				node = this_val->node;
+				if (!node)
+					node = ji->dom_root; // document/window listeners
+				JsListenerAdd(ji, node, JsToStr(ji, args[0]), args[1], FALSE);
+			}
 			return JsUndefV(ji);
 		case JSN_EL_REMLISTEN:
 			if (this_val->type == JV_OBJ && this_val->node && argc >= 2)
@@ -2617,6 +3890,277 @@ CJsVal *JsCallNative(CJsInterp *ji, I64 id, CJsVal *this_val,
 			return JsNullV(ji); // minimal: no single-header lookup yet
 		case JSN_EVT_NOOP:
 			return JsUndefV(ji);
+		case JSN_PROMISE_THEN:
+			if (this_val->native_id == JSO_PROMISE)
+			{
+				JsPromiseReact(ji, this_val, JsArgOr(ji, args, argc, 0), FALSE);
+				if (argc > 1)
+					JsPromiseReact(ji, this_val, args[1], TRUE);
+			}
+			return this_val;
+		case JSN_PROMISE_CATCH:
+			if (this_val->native_id == JSO_PROMISE)
+				JsPromiseReact(ji, this_val, JsArgOr(ji, args, argc, 0), TRUE);
+			return this_val;
+		case JSN_PROMISE_FINALLY:
+			if (this_val->native_id == JSO_PROMISE)
+			{
+				JsPromiseReact(ji, this_val, JsArgOr(ji, args, argc, 0), FALSE);
+				JsPromiseReact(ji, this_val, JsArgOr(ji, args, argc, 0), TRUE);
+			}
+			return this_val;
+		case JSN_RESP_TEXT:
+		case JSN_RESP_JSON:
+			pr = JsPromiseNew(ji);
+			v = JsPropGet(this_val, "_body");
+			if (!v)
+				v = JsStrV(ji, "");
+			if (id == JSN_RESP_JSON)
+			{
+				s = JsToStr(ji, v);
+				w = JsJsonParseVal(ji, &s, 0);
+			}
+			else
+				w = v;
+			JsPromiseSettle(ji, pr, w, FALSE);
+			return pr;
+		case JSN_EL_APPEND:
+			if (this_val->type == JV_OBJ && this_val->node && argc &&
+				args[0]->type == JV_OBJ && args[0]->node)
+				JsNodeAppend(ji, this_val->node, args[0]->node);
+			return JsArgOr(ji, args, argc, 0);
+		case JSN_EL_REMOVE_CH:
+			if (argc && args[0]->type == JV_OBJ && args[0]->node)
+			{
+				JsNodeDetach(args[0]->node);
+				ji->dom_dirty = TRUE;
+			}
+			return JsArgOr(ji, args, argc, 0);
+		case JSN_EL_REMOVE:
+			if (this_val->type == JV_OBJ && this_val->node)
+			{
+				JsNodeDetach(this_val->node);
+				ji->dom_dirty = TRUE;
+			}
+			return JsUndefV(ji);
+		case JSN_QSEL:
+		case JSN_QSELALL:
+			JsQSelSplit(JsToStr(ji, JsArgOr(ji, args, argc, 0)), qtag, qcls, qid);
+			nd2 = NULL;
+			if (this_val->type == JV_OBJ)
+				nd2 = this_val->node;
+			if (!nd2)
+				nd2 = ji->dom_root; // document / window scope
+			if (id == JSN_QSELALL)
+			{
+				v = JsArrV(ji);
+				JsQSelWalk(nd2, qtag, qcls, qid, ji, v);
+				return v;
+			}
+			nd2 = JsQSelWalk(nd2, qtag, qcls, qid, ji, NULL);
+			if (nd2)
+				return JsElemV(ji, nd2);
+			return JsNullV(ji);
+		case JSN_CL_ADD:
+		case JSN_CL_REMOVE:
+		case JSN_CL_TOGGLE:
+			if (this_val->type == JV_OBJ && this_val->node && argc)
+			{
+				if (id == JSN_CL_ADD)
+					i = 0;
+				else if (id == JSN_CL_REMOVE)
+					i = 1;
+				else
+					i = 2;
+				JsClassListMod(ji, this_val->node, JsToStr(ji, args[0]), i);
+			}
+			return JsUndefV(ji);
+		case JSN_CL_CONTAINS:
+			if (this_val->type == JV_OBJ && this_val->node && argc)
+				return JsBoolV(ji, JsClassHasTok(ZNodeAttr(this_val->node, "class"),
+												 JsToStr(ji, args[0])));
+			return JsBoolV(ji, FALSE);
+		case JSN_STR_SPLIT:
+			v = JsArrV(ji);
+			if (this_val->type != JV_STR)
+				return v;
+			sep = JsToStr(ji, JsArgOr(ji, args, argc, 0));
+			s = this_val->str;
+			if (!*sep)
+			{ // split into characters
+				while (*s)
+				{
+					buf[0] = *s++;
+					buf[1] = 0;
+					JsArrPush(ji, v, JsStrV(ji, buf));
+				}
+				return v;
+			}
+			len = StrLen(sep);
+			while (TRUE)
+			{
+				bb = StrFind(sep, s);
+				if (!bb)
+				{
+					JsArrPush(ji, v, JsStrV(ji, s));
+					break;
+				}
+				i = bb - s;
+				if (i > 1020)
+					i = 1020;
+				MemCopy(buf, s, i);
+				buf[i] = 0;
+				JsArrPush(ji, v, JsStrV(ji, buf));
+				s = bb + len;
+			}
+			return v;
+		case JSN_STR_REPLACE:
+			if (this_val->type != JV_STR || argc < 2)
+				return this_val;
+			sep = JsToStr(ji, args[0]); // pattern (string only, first hit)
+			bb = StrFind(sep, this_val->str);
+			if (!bb || !*sep)
+				return this_val;
+			s = MAlloc(StrLen(this_val->str) + StrLen(JsToStr(ji, args[1])) + 2);
+			i = bb - this_val->str;
+			MemCopy(s, this_val->str, i);
+			s[i] = 0;
+			CatPrint(s, "%s%s", JsToStr(ji, args[1]), bb + StrLen(sep));
+			v = JsStrV(ji, s);
+			Free(s);
+			return v;
+		case JSN_STR_TRIM:
+			if (this_val->type != JV_STR)
+				return this_val;
+			s = this_val->str;
+			while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r')
+				s++;
+			len = StrLen(s);
+			while (len && (s[len - 1] == ' ' || s[len - 1] == '\t' ||
+						   s[len - 1] == '\n' || s[len - 1] == '\r'))
+				len--;
+			if (len > 1020)
+				len = 1020;
+			MemCopy(buf, s, len);
+			buf[len] = 0;
+			return JsStrV(ji, buf);
+		case JSN_STR_INCLUDES:
+			if (this_val->type != JV_STR)
+				return JsBoolV(ji, FALSE);
+			return JsBoolV(ji,
+				StrFind(JsToStr(ji, JsArgOr(ji, args, argc, 0)), this_val->str) != NULL);
+		case JSN_STR_STARTS:
+			if (this_val->type != JV_STR)
+				return JsBoolV(ji, FALSE);
+			sep = JsToStr(ji, JsArgOr(ji, args, argc, 0));
+			return JsBoolV(ji, !StrNCompare(this_val->str, sep, StrLen(sep)));
+		case JSN_STR_ENDS:
+			if (this_val->type != JV_STR)
+				return JsBoolV(ji, FALSE);
+			sep = JsToStr(ji, JsArgOr(ji, args, argc, 0));
+			len = StrLen(this_val->str);
+			i = StrLen(sep);
+			if (i > len)
+				return JsBoolV(ji, FALSE);
+			return JsBoolV(ji, !StrCompare(this_val->str + len - i, sep));
+		case JSN_STR_CHARCODE:
+			if (this_val->type != JV_STR)
+				return JsNumV(ji, 0);
+			i = JsToNum(JsArgOr(ji, args, argc, 0));
+			if (0 <= i < StrLen(this_val->str))
+				return JsNumV(ji, this_val->str[i]);
+			return JsNumV(ji, 0);
+		case JSN_ARR_MAP:
+		case JSN_ARR_FILTER:
+		case JSN_ARR_FOREACH:
+		case JSN_ARR_FIND:
+			if (this_val->type != JV_ARR || !argc)
+			{
+				if (id == JSN_ARR_FIND)
+					return JsUndefV(ji);
+				if (id == JSN_ARR_FOREACH)
+					return JsUndefV(ji);
+				return JsArrV(ji);
+			}
+			v = JsArrV(ji);
+			for (i = 0; i < this_val->count && !ji->has_err; i++)
+			{
+				pa[0] = this_val->items[i];
+				pa[1] = JsNumV(ji, i);
+				w = JsCall(ji, args[0], NULL, pa, 2);
+				if (id == JSN_ARR_MAP)
+					JsArrPush(ji, v, w);
+				else if (id == JSN_ARR_FILTER)
+				{
+					if (JsToBool(w))
+						JsArrPush(ji, v, this_val->items[i]);
+				}
+				else if (id == JSN_ARR_FIND)
+				{
+					if (JsToBool(w))
+						return this_val->items[i];
+				}
+			}
+			if (id == JSN_ARR_FOREACH)
+				return JsUndefV(ji);
+			if (id == JSN_ARR_FIND)
+				return JsUndefV(ji);
+			return v;
+		case JSN_ARR_SLICE:
+			v = JsArrV(ji);
+			if (this_val->type != JV_ARR)
+				return v;
+			a = 0;
+			b = this_val->count;
+			if (argc > 0)
+				a = JsToNum(args[0]);
+			if (argc > 1)
+				b = JsToNum(args[1]);
+			if (a < 0)
+				a = this_val->count + a;
+			if (b < 0)
+				b = this_val->count + b;
+			if (a < 0)
+				a = 0;
+			if (b > this_val->count)
+				b = this_val->count;
+			for (i = a; i < b; i++)
+				JsArrPush(ji, v, this_val->items[i]);
+			return v;
+		case JSN_ARR_CONCAT:
+			v = JsArrV(ji);
+			if (this_val->type == JV_ARR)
+				for (i = 0; i < this_val->count; i++)
+					JsArrPush(ji, v, this_val->items[i]);
+			for (a = 0; a < argc; a++)
+			{
+				if (args[a]->type == JV_ARR)
+					for (i = 0; i < args[a]->count; i++)
+						JsArrPush(ji, v, args[a]->items[i]);
+				else
+					JsArrPush(ji, v, args[a]);
+			}
+			return v;
+		case JSN_ARR_INCLUDES:
+			if (this_val->type != JV_ARR)
+				return JsBoolV(ji, FALSE);
+			for (i = 0; i < this_val->count; i++)
+				if (JsStrictEq(this_val->items[i], JsArgOr(ji, args, argc, 0)))
+					return JsBoolV(ji, TRUE);
+			return JsBoolV(ji, FALSE);
+		case JSN_ARR_POP:
+			if (this_val->type != JV_ARR || !this_val->count)
+				return JsUndefV(ji);
+			this_val->count--;
+			return this_val->items[this_val->count];
+		case JSN_ARR_SHIFT:
+			if (this_val->type != JV_ARR || !this_val->count)
+				return JsUndefV(ji);
+			v = this_val->items[0];
+			for (i = 1; i < this_val->count; i++)
+				this_val->items[i - 1] = this_val->items[i];
+			this_val->count--;
+			return v;
 	}
 
 	JsErr(ji, "unknown native");
@@ -2643,7 +4187,7 @@ CJsVal *JsCall(CJsInterp *ji, CJsVal *fn, CJsVal *this_val,
 
 	if (fn->type == JV_NATIVE)
 	{
-		result = JsCallNative(ji, fn->native_id, this_val, args, argc);
+		result = JsCallNative(ji, fn, fn->native_id, this_val, args, argc);
 		ji->depth--;
 		return result;
 	}
@@ -2656,7 +4200,10 @@ CJsVal *JsCall(CJsInterp *ji, CJsVal *fn, CJsVal *this_val,
 
 	func = fn->func(CJsNode *);
 	call_env = JsAlloc(ji, sizeof(CJsEnv))(CJsEnv *);
-	call_env->parent = ji->genv; // no closures: functions see globals only
+	if (fn->fenv)
+		call_env->parent = fn->fenv(CJsEnv *); // closure: defining environment
+	else
+		call_env->parent = ji->genv;
 
 	param = func->a;
 	i = 0;
@@ -2669,6 +4216,8 @@ CJsVal *JsCall(CJsInterp *ji, CJsVal *fn, CJsVal *this_val,
 		param = param->next;
 		i++;
 	}
+	if (this_val)
+		JsEnvDeclare(ji, call_env, "this", this_val);
 
 	saved_env = ji->env;
 	ji->env = call_env;
@@ -2680,7 +4229,8 @@ CJsVal *JsCall(CJsInterp *ji, CJsVal *fn, CJsVal *this_val,
 		result = ji->ret_val;
 	else
 		result = JsUndefV(ji);
-	ji->flow = JF_NORMAL;
+	if (ji->flow != JF_THROW)
+		ji->flow = JF_NORMAL; // a throw crosses the call boundary to try/catch
 	ji->env = saved_env;
 	ji->depth--;
 
@@ -2750,6 +4300,22 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsGlobalNative(ji, "clearTimeout",	JSN_CLEARTIMER);
 	JsGlobalNative(ji, "clearInterval",	JSN_CLEARTIMER);
 	JsGlobalNative(ji, "XMLHttpRequest",JSN_XHR_NEW);
+	JsGlobalNative(ji, "Promise",		JSN_PROMISE_CTOR);
+	JsGlobalNative(ji, "fetch",			JSN_FETCH);
+
+	math = JsValNew(ji, JV_OBJ); // reuse the local for the JSON namespace
+	JsPropSet(ji, math, "parse",	 JsNativeV(ji, JSN_JSON_PARSE));
+	JsPropSet(ji, math, "stringify", JsNativeV(ji, JSN_JSON_STR));
+	JsEnvDeclare(ji, ji->genv, "JSON", math);
+
+	math = JsValNew(ji, JV_OBJ); // Object namespace
+	JsPropSet(ji, math, "keys",   JsNativeV(ji, JSN_OBJ_KEYS));
+	JsPropSet(ji, math, "assign", JsNativeV(ji, JSN_OBJ_ASSIGN));
+	JsEnvDeclare(ji, ji->genv, "Object", math);
+
+	math = JsValNew(ji, JV_OBJ); // Array namespace
+	JsPropSet(ji, math, "isArray", JsNativeV(ji, JSN_ARR_ISARR));
+	JsEnvDeclare(ji, ji->genv, "Array", math);
 
 	return ji;
 }
@@ -2801,7 +4367,9 @@ Bool JsRun(CJsInterp *ji, U8 *src)
 		stmt = JsParseStmt(ji);
 		if (stmt)
 			JsEval(ji, stmt);
-		ji->flow = JF_NORMAL; // stray top-level break/return
+		if (ji->flow == JF_THROW)
+			NetLog("JS: uncaught exception."); // log, then keep executing
+		ji->flow = JF_NORMAL; // stray top-level break/return/throw
 		if (ji->pos == before)
 			ji->pos++;
 	}
