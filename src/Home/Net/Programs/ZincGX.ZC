@@ -61,6 +61,8 @@ class CGxOp
 	U8				*img_url;	//GXO_IMG: absolute URL (MAlloc'ed).
 	I64				 radius;	//GXO_WIDGET: border-radius px (-1 = unset).
 	Bool			 bold, ul, has_bg;
+	I16				 bg_px, bg_py, bg_sw, bg_sh;	//GXO_BOX: CSS background-position/size (CSS.ZC encoding).
+	I8				 bg_rep;						//GXO_BOX: background-repeat (-1 unset / 0 repeat / 1 no-repeat).
 };
 
 //Decoded-image cache, keyed by absolute URL. Persists across relayout so we
@@ -1545,6 +1547,106 @@ U0 GxPageStyle()
 //inline flow above. Provides L2Node + the zinc_layout2/Layout2() toggle.
 #include "Zinc/Layout"
 
+CDC *GxBgSpriteDC(CDC *src, I64 bw, I64 bh, I64 e_px, I64 e_py, I64 e_sw, I64 e_sh, I64 rep)
+{//Build a bw x bh DC showing the CSS-background image positioned / sized /
+//cropped / tiled per the encoded params (CSS.ZC encodings). Gaps stay
+//TRANSPARENT (no-repeat). Owned by caller (sys_task). This is what makes CSS
+//sprite atlases (4chan flags etc) crop one sub-rect via background-position.
+	CDC *dst;
+	I64  iw, ih, ox = 0, oy = 0, dx, dy, sx, sy, srcx, srcy, rw, rh;
+	I64  sw = src->width, sh = src->height, swi = src->width_internal;
+	U32 *sb = src->body, *db;
+
+	//--- rendered image size (background-size) ---
+	iw = sw;
+	ih = sh;
+	if (e_sw == -200 || e_sh == -200 || e_sw == -201 || e_sh == -201)
+	{//cover (fill box, max ratio) / contain (fit box, min ratio); aspect kept
+		rw = bw * 1000 / sw;
+		rh = bh * 1000 / sh;
+		if (e_sw == -200 || e_sh == -200)
+		{
+			if (rh > rw)
+				rw = rh;
+		}
+		else if (rh < rw)
+			rw = rh;
+		iw = sw * rw / 1000;
+		ih = sh * rw / 1000;
+	}
+	else
+	{
+		if (e_sw > 0)
+			iw = e_sw;
+		else if (-100 <= e_sw < 0)
+			iw = bw * -e_sw / 100;
+		if (e_sh > 0)
+			ih = e_sh;
+		else if (-100 <= e_sh < 0)
+			ih = bh * -e_sh / 100;
+		if (e_sw != 0 && e_sh == 0)
+			ih = sh * iw / sw;	// one axis set, other auto: keep aspect
+		else if (e_sh != 0 && e_sw == 0)
+			iw = sw * ih / sh;
+	}
+	if (iw < 1)
+		iw = 1;
+	if (ih < 1)
+		ih = 1;
+
+	//--- position (background-position); percent = (box - image)*pct/100 ---
+	if (e_px != ZCSS_OFF_UNSET)
+	{
+		if (e_px <= -2000)
+			ox = (bw - iw) * (-(e_px) - 2000) / 100;
+		else
+			ox = e_px;
+	}
+	if (e_py != ZCSS_OFF_UNSET)
+	{
+		if (e_py <= -2000)
+			oy = (bh - ih) * (-(e_py) - 2000) / 100;
+		else
+			oy = e_py;
+	}
+
+	dst = DCNew(bw, bh, sys_task);
+	DCFill(dst, TRANSPARENT);
+	for (dy = 0; dy < bh; dy++)
+	{
+		db = dst->body + dy * dst->width_internal;
+		for (dx = 0; dx < bw; dx++)
+		{
+			sx = dx - ox;
+			sy = dy - oy;
+			if (rep == 1)
+			{//no-repeat: outside the placed image = transparent gap
+				if (sx < 0 || sx >= iw || sy < 0 || sy >= ih)
+					goto gx_sprite_skip;
+			}
+			else
+			{//repeat (default): tile
+				sx = ((sx % iw) + iw) % iw;
+				sy = ((sy % ih) + ih) % ih;
+			}
+			srcx = sx * sw / iw;
+			srcy = sy * sh / ih;
+			if (srcx < 0)
+				srcx = 0;
+			if (srcy < 0)
+				srcy = 0;
+			if (srcx >= sw)
+				srcx = sw - 1;
+			if (srcy >= sh)
+				srcy = sh - 1;
+			db[dx] = sb[srcy * swi + srcx];
+gx_sprite_skip:;
+		}
+	}
+
+	return dst;
+}
+
 U0 GxBgImgAttach()
 {//Post-layout: give every CSS-background box its picture. Box heights are
 //final only now. Cached images attach immediately (scaled to the box, owned
@@ -1569,7 +1671,14 @@ U0 GxBgImgAttach()
 		{
 			bw = MinI64(op->w, 1024);
 			bh = MinI64(op->h, 1024);
-			op->sc = DEDCScaleNew(ce->dc, bw, bh, sys_task);
+			if (op->bg_px != ZCSS_OFF_UNSET || op->bg_py != ZCSS_OFF_UNSET ||
+				op->bg_sw != 0 || op->bg_sh != 0 || op->bg_rep == 1)
+				//Sprite/positioned/sized/no-repeat: crop a sub-rect.
+				op->sc = GxBgSpriteDC(ce->dc, bw, bh, op->bg_px, op->bg_py,
+									  op->bg_sw, op->bg_sh, op->bg_rep);
+			else
+				//Plain background image: keep the stretch-to-box default.
+				op->sc = DEDCScaleNew(ce->dc, bw, bh, sys_task);
 		}
 gx_bg_next:;
 	}

@@ -355,7 +355,7 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	I64		 box_op, op0, avail, bw, center_add, save_wrap, save_wrap2;
 	I64		 box_y0, dx, dy, mw, mh, x0, saved_y, saved_indent, saved_wrapa;
 	I64		 save_cbx, save_cby, save_cbw, save_cbh, save_curbg;
-	Bool	 boxed, is_body, is_abs, is_flex, is_posn;
+	Bool	 boxed, is_body, is_abs, is_flex, is_posn, spr_fixed;
 
 	is_body = L2IsBody(node->tag);
 	is_flex = author->display == ZCSS_DISP_FLEX && author->flex_col != 1;
@@ -403,6 +403,11 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	if (!StrCompare(node->tag, "blockquote") && style->ml < 0)
 		ml_eff = 24;
 	boxed = author->bg >= 0 || author->border >= 0 || author->bg_img >= 0;
+	// Fixed-size background sprite / icon (e.g. a 16x11 country flag): the element
+	// IS the sprite cell, so the box must be exactly its CSS width/height, not a
+	// full-line block (else the sub-rect blit paints a whole atlas row).
+	spr_fixed = author->bg_img >= 0 && author->width > 0 && author->width <= 64 &&
+				author->height > 0 && author->height <= 64;
 	pt_eff = author->pt;
 	pb_eff = author->pb;
 	if (pt_eff < 0)
@@ -508,14 +513,27 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 			if (author->radius > 0)
 				op->wkind = author->radius; //wkind = corner radius for GXO_BOX
 			if (author->bg_img >= 0 && author->bg_img < zcss_bgimg_count)
-				//Absolute URL rides on the op; GxBgImgAttach (post-layout)
-				//resolves it against the shared image cache + fetch task.
+			{//Absolute URL + CSS background-position/size/repeat ride on the op;
+			//GxBgImgAttach (post-layout) resolves + crops/scales via the cache.
 				op->img_url = ZincResolveLink(zcss_bgimg[author->bg_img]);
+				op->bg_px  = author->bg_px;
+				op->bg_py  = author->bg_py;
+				op->bg_sw  = author->bg_sw;
+				op->bg_sh  = author->bg_sh;
+				op->bg_rep = author->bg_repeat;
+			}
 		}
 		gx.line_start_op = gx.op_count;
 		kid.bg = -1; // the box already painted it
 		if (author->bg >= 0)
 			gx.cur_bg = author->bg; // children's text AA'es against this bg
+	}
+	if (spr_fixed && box_op >= 0)
+	{//Fixed sprite/icon: clamp the box to its exact CSS cell (one flag, not a row).
+		gx.ops[box_op].x = GX_MARGIN + gx.indent;
+		gx.ops[box_op].y = box_y0;
+		gx.ops[box_op].w = author->width;
+		gx.ops[box_op].h = author->height;
 	}
 	gx.indent += pl_eff;
 	gx.y += pt_eff;
@@ -558,11 +576,13 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	gx.y += pb_eff;
 	if (author->height > 0 && gx.y < box_y0 + author->height)
 		gx.y = box_y0 + author->height; // min-height floor
-	if (box_op >= 0)
+	if (box_op >= 0 && !spr_fixed)
 	{
 		gx.ops[box_op].h = MaxI64(8, gx.y + 2 - gx.ops[box_op].y);
 		gx.line_start_op = gx.op_count;
 	}
+	else if (box_op >= 0)
+		gx.line_start_op = gx.op_count; // sprite box keeps its clamped size
 
 	if (is_abs)
 	{ // restore the flow as if we were never here
