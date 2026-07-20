@@ -40,7 +40,7 @@
 
 #define GXO_IMG			4
 #define GXO_BOX			5	//Block background fill and/or 1px border.
-#define GX_IMG_CACHE	48
+#define GX_IMG_CACHE	96
 #define GX_IMG_MAXW		480
 #define GX_IMG_MAXH		360
 #define GX_IV_MAXDIM	2000	//Image-view: cap stored full-size decode.
@@ -741,6 +741,9 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 		I64		 iw, ih;
 		U8		 dkey[48];
 
+		if (!src || !*src)
+			src = ZNodeAttr(node, "data-src"); //lazy-load pattern: real URL
+											   //parked for a JS loader we lack
 		GxRunFlush;
 		if (gx.x <= GX_MARGIN + gx.indent && style.align > 0)
 			gx.line_align = style.align;
@@ -809,7 +812,32 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 				return;
 			}
 			//Not yet decoded: placeholder box; the img task will fetch it.
-			op = GxOpAdd(GXO_IMG, gx.x, gx.y, 80, 40);
+			//Honor the width=/height= attributes (or CSS width) so the layout
+			//does NOT shift when the real image arrives - a shifting page is
+			//why clicks sometimes landed on nothing.
+			iw = 0;
+			ih = 0;
+			attr = ZNodeAttr(node, "width");
+			if (attr)
+				iw = ClampI64(Str2I64(attr), 0, 2000);
+			attr = ZNodeAttr(node, "height");
+			if (attr)
+				ih = ClampI64(Str2I64(attr), 0, 2000);
+			if (!iw && style.width > 0)
+				iw = style.width;
+			if (iw && !ih)
+				ih = iw * 3 / 4;
+			if (!iw)
+			{
+				iw = 80;
+				ih = 40;
+			}
+			if (iw > gx.wrap_w - gx.x)
+			{
+				ih = MaxI64(1, ih * MaxI64(1, gx.wrap_w - gx.x) / iw);
+				iw = MaxI64(1, gx.wrap_w - gx.x);
+			}
+			op = GxOpAdd(GXO_IMG, gx.x, gx.y, iw, ih);
 			if (op)
 			{
 				op->img_url = abs; //Owned by op; freed on reset.
@@ -817,9 +845,9 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 			}
 			else
 				Free(abs);
-			gx.x += 80 + FONT_WIDTH;
-			if (40 + GX_LINE_LEAD > gx.line_h)
-				gx.line_h = 40 + GX_LINE_LEAD;
+			gx.x += iw + FONT_WIDTH;
+			if (ih + GX_LINE_LEAD > gx.line_h)
+				gx.line_h = ih + GX_LINE_LEAD;
 			return;
 		}
 		attr = ZNodeAttr(node, "alt");
@@ -1683,6 +1711,18 @@ gx_draw_next:;
 		StrPrint(buf, "%s", zinc_note);
 	buf[MinI64(166, (task->pix_width - 8) / FONT_WIDTH)] = 0;
 	GrPrint(dc, 4, task->pix_height - GX_STATUS_H + 4, "%s", buf);
+	//Image fetch progress, right-aligned: users otherwise read the slow
+	//one-TLS-handshake-at-a-time trickle as "images are broken".
+	ty = 0;
+	for (th = 0; th < gx.img_count; th++)
+		if (!gx.img[th].fetched)
+			ty++;
+	if (ty || gx.img_busy)
+	{
+		StrPrint(buf, "img %d/%d", gx.img_count - ty, gx.img_count);
+		GrPrint(dc, task->pix_width - 4 - StrLen(buf) * FONT_WIDTH,
+				task->pix_height - GX_STATUS_H + 4, "%s", buf);
+	}
 
 	gx.hover_href = hover;
 	GxDrawChrome(dc);
@@ -1805,6 +1845,9 @@ U0 GxImgTask()
 
 	while (TRUE)
 	{
+		if (gx.quit)
+			break;	//Checked up top too: teardown waits out img_busy, then
+					//this task must not claim another fetch.
 		//Gate on page teardown (gx.fetch) / body fetch (gx.loading) ONLY, NOT
 		//on gx.busy. v2 layout holds gx.busy for long, frequent windows; gating
 		//on it starved image fetches to one-per-relayout (images looked broken).
@@ -1845,6 +1888,9 @@ U0 GxImgTask()
 		if (!StrNICompare(ce->url, "http", 4))
 		{
 			r = HttpGet(ce->url);
+			if (!r)
+				r = HttpGet(ce->url); //Retry once: a parked keep-alive socket
+									  //may have gone stale server-side.
 			if (r && r->status == 200 && r->body_length > 8)
 			{//Sniff by content: PNG (0x89 P N G) or JPEG (FFD8).
 				dc = NULL;
@@ -2465,6 +2511,8 @@ public U0 ZincGX(U8 *start_url=NULL)
 
 	Fs->draw_it = &GxDrawIt;
 	gx.img_task = Spawn(&GxImgTask, NULL, "ZincGX Images", 3);
+	http_pool_task2 = gx.img_task; //persistent for the session: may keep-alive,
+								   //so image batches share one TLS session.
 
 	while (!gx.quit)
 	{
@@ -3011,6 +3059,11 @@ gx_next:
 	Fs->draw_it = NULL;
 	http_pool_task = NULL;	// stop pooling before this task dies; ZincPageFree
 							// below closes any sockets it parked
+	http_pool_task2 = NULL;
+	while (gx.img_busy)		// let an in-flight image fetch finish cleanly
+		Sleep(5);
+	HttpConnsClose;			// close img-task-parked sockets while its heap is
+							// still alive - THEN it may die
 	if (TaskValidate(gx.img_task))
 		Kill(gx.img_task);
 	if (TaskValidate(gx.load_task))
