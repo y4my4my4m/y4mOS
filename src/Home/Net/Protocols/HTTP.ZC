@@ -393,12 +393,12 @@ I64 HttpDechunk(U8 *body, I64 len)
 /* ---- gzip (RFC 1952) ---- */
 
 U8 *HttpGunzip(U8 *src, I64 src_len, I64 *_out_len)
-{ // decode a gzip member using GrPNG's DEFLATE inflater (uz_inflate_data).
+{ // decode a gzip member using the shared DEFLATE inflater (uz_inflate_data).
   // Returns MAlloc'ed buffer (NUL-terminated) or NULL.
-	I64		pos = 10, isize;
-	U8		flg;
-	U8	   *out;
-	upng_t	uz;
+	I64			pos = 10, isize;
+	U8			flg;
+	U8		   *out;
+	CInflate	uz;
 
 	*_out_len = 0;
 	if (src_len < 18 || src[0] != 0x1F || src[1] != 0x8B || src[2] != 8)
@@ -434,7 +434,7 @@ U8 *HttpGunzip(U8 *src, I64 src_len, I64 *_out_len)
 		NetErr("HTTP GUNZIP: Cannot allocate %d bytes.", isize + 1);
 		return NULL;
 	}
-	MemSet(&uz, 0, sizeof(upng_t));
+	MemSet(&uz, 0, sizeof(CInflate));
 	uz_inflate_data(&uz, out, isize, src, src_len - 8, pos);
 	if (uz.error != UPNG_EOK)
 	{

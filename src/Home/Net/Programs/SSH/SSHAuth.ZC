@@ -1,0 +1,114 @@
+// SSH-2 auth: service request + password userauth. Needs SSHTransport.
+
+#define SSH_MSG_USERAUTH_REQUEST	50
+#define SSH_MSG_USERAUTH_FAILURE	51
+#define SSH_MSG_USERAUTH_SUCCESS	52
+#define SSH_MSG_USERAUTH_BANNER		53
+#define SSH_MSG_GLOBAL_REQUEST		80
+#define SSH_MSG_REQUEST_SUCCESS		81
+#define SSH_MSG_REQUEST_FAILURE		82
+
+I64 SSHRecvFiltered(CSSH *ssh, U8 *payload, I64 *len_out)
+{ // one encrypted packet, swallowing transport housekeeping. Channel messages
+  // (90-100) and everything else are returned to the caller.
+	I64 len;
+
+	while (TRUE)
+	{
+		if (SSHPacketRecv(ssh, payload, &len) < 0)
+			return -1;
+		if (len >= 1)	// empty packet: fall through and read the next one
+		{
+			switch (payload[0])
+			{
+				case SSH_MSG_DISCONNECT:
+					NetErr("SSH: server sent DISCONNECT.");
+					return -1;
+
+				case SSH_MSG_IGNORE:
+				case SSH_MSG_UNIMPLEMENTED:
+				case SSH_MSG_DEBUG:
+					break;	// skip, read next
+
+				case SSH_MSG_GLOBAL_REQUEST:
+				{ // string(name) bool(want_reply). Decline if a reply is wanted.
+					I64 nlen = SSHGetU32(payload + 1);
+					U8	want_reply = payload[1 + 4 + nlen];
+					if (want_reply)
+						SSHPacketSendByte(ssh, SSH_MSG_REQUEST_FAILURE);
+					break;
+				}
+
+				default:
+					*len_out = len;
+					return 0;
+			}
+		}
+	}
+}
+
+I64 SSHServiceRequest(CSSH *ssh, U8 *service)
+{
+	U8	*pl = MAlloc(SSH_MAX_PACKET);
+	I64	 o = 0, len;
+
+	o = SSHPutByte(pl, o, SSH_MSG_SERVICE_REQUEST);
+	o = SSHPutStringZ(pl, o, service);
+	if (SSHPacketSend(ssh, pl, o) < 0)
+		goto fail;
+
+	if (SSHRecvFiltered(ssh, pl, &len) < 0)
+		goto fail;
+	if (len < 1 || pl[0] != SSH_MSG_SERVICE_ACCEPT)
+	{
+		NetErr("SSH: expected SERVICE_ACCEPT, got msg %d.", pl[0]);
+		goto fail;
+	}
+	Free(pl);
+	return 0;
+fail:
+	Free(pl);
+	return -1;
+}
+
+Bool SSHAuthPassword(CSSH *ssh, U8 *user, U8 *password)
+{ // returns TRUE on USERAUTH_SUCCESS.
+	U8	*pl = MAlloc(SSH_MAX_PACKET);
+	I64	 o = 0, len;
+
+	o = SSHPutByte(pl, o, SSH_MSG_USERAUTH_REQUEST);
+	o = SSHPutStringZ(pl, o, user);
+	o = SSHPutStringZ(pl, o, "ssh-connection");
+	o = SSHPutStringZ(pl, o, "password");
+	o = SSHPutByte(pl, o, 0);				// FALSE: not a password change
+	o = SSHPutStringZ(pl, o, password);
+	if (SSHPacketSend(ssh, pl, o) < 0)
+		goto fail;
+
+	while (TRUE)
+	{
+		if (SSHRecvFiltered(ssh, pl, &len) < 0)
+			goto fail;
+		if (len >= 1)
+		{
+			if (pl[0] == SSH_MSG_USERAUTH_SUCCESS)
+			{
+				Free(pl);
+				return TRUE;
+			}
+			else if (pl[0] == SSH_MSG_USERAUTH_FAILURE)
+			{
+				NetErr("SSH: password auth rejected.");
+				goto fail;
+			}
+			else if (pl[0] != SSH_MSG_USERAUTH_BANNER)
+			{ // BANNER: ignore and read the next; anything else is unexpected
+				NetErr("SSH: unexpected auth reply msg %d.", pl[0]);
+				goto fail;
+			}
+		}
+	}
+fail:
+	Free(pl);
+	return FALSE;
+}

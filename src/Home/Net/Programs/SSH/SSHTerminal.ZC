@@ -1,0 +1,269 @@
+// SSH terminal + entry points. Needs SSHTransport/SSHAuth/SSHChannel.
+//
+// v1 is a DolDoc-scrolling terminal (not a full ANSI grid like Telnet): a
+// reader task drains the channel into a ring, the main task prints it and
+// forwards keystrokes. A "dumb" pty keeps escape noise down. Good enough for
+// a shell, ls/cat, git; full ANSI emulation is future work.
+
+#define SSH_RING_SIZE	(1 << 16)
+
+CSSH		*ssh_conn	= NULL;
+CSSHChan	*ssh_chan	= NULL;
+Bool		 ssh_running	= FALSE;
+Bool		 ssh_reader_idle = TRUE;
+
+U8			 ssh_ring[SSH_RING_SIZE];
+I64			 ssh_ring_head = 0, ssh_ring_tail = 0;
+I64			 ssh_ring_lock = 0;
+
+U0 SSHRingPush(U8 *data, I64 len)
+{
+	I64 i, next;
+	while (LBts(&ssh_ring_lock, 0))
+		Yield;
+	for (i = 0; i < len; i++)
+	{
+		next = (ssh_ring_head + 1) & (SSH_RING_SIZE - 1);
+		if (next == ssh_ring_tail)
+			break;					// ring full: drop the rest
+		ssh_ring[ssh_ring_head] = data[i];
+		ssh_ring_head = next;
+	}
+	LBtr(&ssh_ring_lock, 0);
+}
+
+I64 SSHRingDrain(U8 *out, I64 max)
+{
+	I64 n = 0;
+	while (LBts(&ssh_ring_lock, 0))
+		Yield;
+	while (n < max && ssh_ring_tail != ssh_ring_head)
+	{
+		out[n++] = ssh_ring[ssh_ring_tail];
+		ssh_ring_tail = (ssh_ring_tail + 1) & (SSH_RING_SIZE - 1);
+	}
+	LBtr(&ssh_ring_lock, 0);
+	return n;
+}
+
+U0 SSHTermPrint(U8 *data, I64 len)
+{ // print channel bytes to the current doc, escaping DolDoc's '$' and dropping
+  // CR / NUL so text lands cleanly.
+	U8	*buf = MAlloc(len * 2 + 1);
+	I64	 i, o = 0;
+	U8	 c;
+
+	for (i = 0; i < len; i++)
+	{
+		c = data[i];
+		if (c != 0 && c != '\r')	// drop CR / NUL
+		{
+			if (c == '$')
+				buf[o++] = '$';		// DolDoc escape: "$$" renders one '$'
+			buf[o++] = c;
+		}
+	}
+	buf[o] = 0;
+	"%s", buf;
+	Free(buf);
+}
+
+U0 SSHReaderTask()
+{ // blocks on the channel, feeding decrypted data into the ring
+	U8	*buf = MAlloc(SSH_MAX_PACKET);
+	I64	 n, type;
+
+	ssh_reader_idle = FALSE;
+	while (ssh_running)
+	{
+		type = SSHChannelPump(ssh_chan, buf, &n);
+		if (type == SSHCH_ERR || type == SSHCH_CLOSE)
+		{
+			ssh_running = FALSE;
+			break;
+		}
+		if (type == SSHCH_DATA && n > 0)
+			SSHRingPush(buf, n);
+	}
+	Free(buf);
+	ssh_reader_idle = TRUE;
+}
+
+U0 SSHKeyToChannel(I64 ch, I64 sc)
+{ // translate one keypress into bytes for the remote pty
+	U8 seq[8];
+
+	if (ch == 0)
+	{ // special keys: send VT100 sequences
+		switch (sc.u8[0])
+		{
+			case SC_CURSOR_UP:		SSHChannelSend(ssh_chan, "\x1B[A", 3); break;
+			case SC_CURSOR_DOWN:	SSHChannelSend(ssh_chan, "\x1B[B", 3); break;
+			case SC_CURSOR_RIGHT:	SSHChannelSend(ssh_chan, "\x1B[C", 3); break;
+			case SC_CURSOR_LEFT:	SSHChannelSend(ssh_chan, "\x1B[D", 3); break;
+			case SC_HOME:			SSHChannelSend(ssh_chan, "\x1B[H", 3); break;
+			case SC_END:			SSHChannelSend(ssh_chan, "\x1B[F", 3); break;
+			case SC_DELETE:			SSHChannelSend(ssh_chan, "\x7F", 1);   break;
+		}
+		return;
+	}
+
+	if (ch == '\n')				// Enter -> carriage return for the pty
+		SSHChannelSend(ssh_chan, "\r", 1);
+	else if (ch == CH_BACKSPACE)
+		SSHChannelSend(ssh_chan, "\x7F", 1);
+	else
+	{ // printable, Tab, Esc, and Ctrl-<key> (ch 1..26) all pass through raw
+		seq[0] = ch;
+		SSHChannelSend(ssh_chan, seq, 1);
+	}
+}
+
+U0 SSHTerminalLoop()
+{ // main task: drain ring -> print, poll keyboard -> send. Non-blocking.
+	U8	*buf = MAlloc(SSH_MAX_PACKET);
+	I64	 ch, sc, n;
+	Bool busy;
+
+	while (ssh_running)
+	{
+		busy = FALSE;
+
+		n = SSHRingDrain(buf, SSH_MAX_PACKET);
+		if (n > 0)
+		{
+			SSHTermPrint(buf, n);
+			busy = TRUE;
+		}
+
+		if (KeyScan(&ch, &sc, FALSE))
+		{
+			if (ch == CH_SHIFT_ESC)
+			{
+				ssh_running = FALSE;
+				break;
+			}
+			SSHKeyToChannel(ch, sc);
+			busy = TRUE;
+		}
+
+		if (!busy)
+			Sleep(10);
+	}
+	Free(buf);
+}
+
+U0 SSHSessionTeardown()
+{
+	ssh_running = FALSE;
+	net_abort = TRUE;					// unblock the reader's socket read
+	while (!ssh_reader_idle)
+		Sleep(10);
+	net_abort = FALSE;
+	ssh_interactive = FALSE;
+	if (ssh_chan)
+		SSHChannelClose(ssh_chan);
+	if (ssh_chan)
+	{
+		Free(ssh_chan);
+		ssh_chan = NULL;
+	}
+	if (ssh_conn)
+	{
+		SSHTransportClose(ssh_conn);
+		ssh_conn = NULL;
+	}
+}
+
+public U0 SSH(U8 *host=NULL, U16 port=22, U8 *user=NULL)
+{ /* Interactive SSH shell. Prompts for anything not supplied.
+	  SSH;  SSH("host");  SSH("host", 2222, "root");
+	  Shift+Esc quits. NOTE: the password prompt is not masked. */
+	U8	host_buf[128], user_buf[64], pass_buf[128];
+	U8	*tmp;
+
+	if (host == NULL)
+	{
+		tmp = PopUpGetStr("SSH host:");
+		if (!tmp || !*tmp) { "No host.\n"; return; }
+		StrCopy(host_buf, tmp); Free(tmp);
+		host = host_buf;
+	}
+	if (user == NULL)
+	{
+		tmp = PopUpGetStr("Username:");
+		if (!tmp || !*tmp) { "No user.\n"; return; }
+		StrCopy(user_buf, tmp); Free(tmp);
+		user = user_buf;
+	}
+	tmp = PopUpGetStr("Password (shown in the clear):");
+	if (!tmp) { "No password.\n"; return; }
+	StrCopy(pass_buf, tmp); Free(tmp);
+
+	"$$LTBLUE$$Connecting to %s:%d...$$FG$$\n", host, port;
+	ssh_conn = SSHTransportConnect(host, port);
+	if (!ssh_conn)			{ "$$RED$$Transport handshake failed.$$FG$$\n"; return; }
+	if (SSHServiceRequest(ssh_conn, "ssh-userauth") < 0)
+							{ "$$RED$$Service request failed.$$FG$$\n"; SSHSessionTeardown; return; }
+	if (!SSHAuthPassword(ssh_conn, user, pass_buf))
+							{ "$$RED$$Authentication failed.$$FG$$\n"; SSHSessionTeardown; return; }
+	MemSet(pass_buf, 0, sizeof(pass_buf));	// don't linger in memory
+
+	ssh_chan = SSHChannelOpen(ssh_conn);
+	if (!ssh_chan)			{ "$$RED$$Channel open failed.$$FG$$\n"; SSHSessionTeardown; return; }
+	SSHChannelPtyReq(ssh_chan, "dumb", 80, 25);
+	if (SSHChannelShell(ssh_chan) < 0)
+							{ "$$RED$$Shell request failed.$$FG$$\n"; SSHSessionTeardown; return; }
+
+	"$$GREEN$$Connected. Shift+Esc to quit.$$FG$$\n\n";
+
+	ssh_conn->sock->timeout = 300;		// poll cadence for the reader's recv
+	ssh_interactive = TRUE;
+	ssh_running = TRUE;
+	ssh_ring_head = ssh_ring_tail = 0;
+
+	Spawn(&SSHReaderTask, NULL, "SSHReader");
+
+	try
+		SSHTerminalLoop;
+	catch
+		PutExcept;
+
+	SSHSessionTeardown;
+	"\n$$LTBLUE$$SSH session closed.$$FG$$\n";
+}
+
+public U0 SSHRun(U8 *host, U16 port, U8 *user, U8 *password, U8 *cmd)
+{ /* Run one command and print its output (no pty, no keyboard).
+	  SSHRun("host", 22, "root", "pw", "uname -a"); */
+	U8	*buf = MAlloc(SSH_MAX_PACKET);
+	I64	 n, type;
+
+	ssh_conn = SSHTransportConnect(host, port);
+	if (!ssh_conn)			{ "$$RED$$Handshake failed.$$FG$$\n"; goto done; }
+	if (SSHServiceRequest(ssh_conn, "ssh-userauth") < 0)
+							{ "$$RED$$Service request failed.$$FG$$\n"; goto done; }
+	if (!SSHAuthPassword(ssh_conn, user, password))
+							{ "$$RED$$Auth failed.$$FG$$\n"; goto done; }
+
+	ssh_chan = SSHChannelOpen(ssh_conn);
+	if (!ssh_chan)			{ "$$RED$$Channel open failed.$$FG$$\n"; goto done; }
+	if (SSHChannelExec(ssh_chan, cmd) < 0)
+							{ "$$RED$$Exec failed.$$FG$$\n"; goto done; }
+
+	while (TRUE)
+	{
+		type = SSHChannelPump(ssh_chan, buf, &n);
+		if (type == SSHCH_ERR || type == SSHCH_CLOSE)
+			break;
+		if (type == SSHCH_DATA && n > 0)
+			SSHTermPrint(buf, n);
+	}
+	if (ssh_chan->exit_status >= 0)
+		"\n$$LTBLUE$$[exit status %d]$$FG$$\n", ssh_chan->exit_status;
+
+done:
+	if (ssh_chan) { SSHChannelClose(ssh_chan); Free(ssh_chan); ssh_chan = NULL; }
+	if (ssh_conn) { SSHTransportClose(ssh_conn); ssh_conn = NULL; }
+	Free(buf);
+}

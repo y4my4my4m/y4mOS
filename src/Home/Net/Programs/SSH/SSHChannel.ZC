@@ -1,0 +1,332 @@
+// SSH-2 session channel: open, pty-req, shell/exec, data + flow control.
+// Needs SSHTransport + SSHAuth (for SSHRecvFiltered).
+
+#define SSH_MSG_CHANNEL_OPEN			90
+#define SSH_MSG_CHANNEL_OPEN_CONFIRM	91
+#define SSH_MSG_CHANNEL_OPEN_FAILURE	92
+#define SSH_MSG_CHANNEL_WINDOW_ADJUST	93
+#define SSH_MSG_CHANNEL_DATA			94
+#define SSH_MSG_CHANNEL_EXTENDED_DATA	95
+#define SSH_MSG_CHANNEL_EOF				96
+#define SSH_MSG_CHANNEL_CLOSE			97
+#define SSH_MSG_CHANNEL_REQUEST			98
+#define SSH_MSG_CHANNEL_SUCCESS			99
+#define SSH_MSG_CHANNEL_FAILURE			100
+
+#define SSH_WINDOW_INITIAL	0x200000	// 2 MB local receive window
+#define SSH_WINDOW_LOW		0x100000	// replenish below this
+#define SSH_MAX_CHUNK		0x8000		// 32 KB max packet we advertise
+
+// SSHChannelPump return codes
+#define SSHCH_ERR	-1
+#define SSHCH_DATA	 0
+#define SSHCH_WADJ	 1
+#define SSHCH_EOF	 2
+#define SSHCH_CLOSE	 3
+#define SSHCH_REQ	 4
+#define SSHCH_OK	 5
+#define SSHCH_FAIL	 6
+#define SSHCH_OTHER	 7
+
+class CSSHChan
+{
+	CSSH	*ssh;
+	U32		 local_id;
+	U32		 remote_id;
+	I64		 local_window;		// bytes we will still accept from the server
+	I64		 remote_window;		// bytes the server will accept from us
+	U32		 remote_maxpkt;
+	Bool	 eof;
+	Bool	 closed;
+	I64		 exit_status;
+};
+
+CSSHChan *SSHChannelOpen(CSSH *ssh)
+{ // open a "session" channel and wait for OPEN_CONFIRMATION
+	CSSHChan	*chan = MAlloc(sizeof(CSSHChan));
+	U8			*pl	  = MAlloc(SSH_MAX_PACKET);
+	I64			 o = 0, len;
+
+	MemSet(chan, 0, sizeof(CSSHChan));
+	chan->ssh			= ssh;
+	chan->local_id		= 0;
+	chan->local_window	= SSH_WINDOW_INITIAL;
+	chan->exit_status	= -1;
+
+	o = SSHPutByte(pl, o, SSH_MSG_CHANNEL_OPEN);
+	o = SSHPutStringZ(pl, o, "session");
+	o = SSHPutU32(pl, o, chan->local_id);
+	o = SSHPutU32(pl, o, SSH_WINDOW_INITIAL);
+	o = SSHPutU32(pl, o, SSH_MAX_CHUNK);
+	if (SSHPacketSend(ssh, pl, o) < 0)
+		goto fail;
+
+	if (SSHRecvFiltered(ssh, pl, &len) < 0)
+		goto fail;
+	if (len < 1 || pl[0] != SSH_MSG_CHANNEL_OPEN_CONFIRM)
+	{
+		NetErr("SSH: channel open failed, msg %d.", pl[0]);
+		goto fail;
+	}
+	// byte(91) u32(recipient) u32(sender) u32(window) u32(maxpkt)
+	chan->remote_id		= SSHGetU32(pl + 5);
+	chan->remote_window	= SSHGetU32(pl + 9);
+	chan->remote_maxpkt	= SSHGetU32(pl + 13);
+	if (chan->remote_maxpkt == 0 || chan->remote_maxpkt > SSH_MAX_CHUNK)
+		chan->remote_maxpkt = SSH_MAX_CHUNK;
+
+	Free(pl);
+	return chan;
+fail:
+	Free(pl);
+	Free(chan);
+	return NULL;
+}
+
+I64 SSHChannelPtyReq(CSSHChan *chan, U8 *term, I64 cols, I64 rows)
+{ // request a pseudo-terminal (want_reply FALSE, so no reply to read)
+	U8	*pl = MAlloc(SSH_MAX_PACKET);
+	I64	 o = 0, r;
+
+	o = SSHPutByte(pl, o, SSH_MSG_CHANNEL_REQUEST);
+	o = SSHPutU32(pl, o, chan->remote_id);
+	o = SSHPutStringZ(pl, o, "pty-req");
+	o = SSHPutByte(pl, o, 0);				// want_reply = FALSE
+	o = SSHPutStringZ(pl, o, term);
+	o = SSHPutU32(pl, o, cols);
+	o = SSHPutU32(pl, o, rows);
+	o = SSHPutU32(pl, o, 0);				// width px
+	o = SSHPutU32(pl, o, 0);				// height px
+	o = SSHPutStringZ(pl, o, "");			// encoded modes (empty = defaults)
+
+	r = SSHPacketSend(chan->ssh, pl, o);
+	Free(pl);
+	return r;
+}
+
+I64 SSHChannelStartReply(CSSHChan *chan)
+{ // read the reply to a want_reply CHANNEL_REQUEST, skipping WINDOW_ADJUST
+	U8	*pl = MAlloc(SSH_MAX_PACKET);
+	I64	 len;
+
+	while (TRUE)
+	{
+		if (SSHRecvFiltered(chan->ssh, pl, &len) < 0)
+			goto fail;
+		if (len >= 1)
+		{
+			if (pl[0] == SSH_MSG_CHANNEL_WINDOW_ADJUST)
+				chan->remote_window += SSHGetU32(pl + 5);	// then read next
+			else if (pl[0] == SSH_MSG_CHANNEL_SUCCESS)
+			{
+				Free(pl);
+				return 0;
+			}
+			else
+			{
+				NetErr("SSH: channel request refused, msg %d.", pl[0]);
+				goto fail;
+			}
+		}
+	}
+fail:
+	Free(pl);
+	return -1;
+}
+
+I64 SSHChannelShell(CSSHChan *chan)
+{ // request an interactive shell (want_reply TRUE)
+	U8	*pl = MAlloc(SSH_MAX_PACKET);
+	I64	 o = 0;
+
+	o = SSHPutByte(pl, o, SSH_MSG_CHANNEL_REQUEST);
+	o = SSHPutU32(pl, o, chan->remote_id);
+	o = SSHPutStringZ(pl, o, "shell");
+	o = SSHPutByte(pl, o, 1);
+	if (SSHPacketSend(chan->ssh, pl, o) < 0)
+	{
+		Free(pl);
+		return -1;
+	}
+	Free(pl);
+	return SSHChannelStartReply(chan);
+}
+
+I64 SSHChannelExec(CSSHChan *chan, U8 *cmd)
+{ // run a single command (want_reply TRUE)
+	U8	*pl = MAlloc(SSH_MAX_PACKET);
+	I64	 o = 0;
+
+	o = SSHPutByte(pl, o, SSH_MSG_CHANNEL_REQUEST);
+	o = SSHPutU32(pl, o, chan->remote_id);
+	o = SSHPutStringZ(pl, o, "exec");
+	o = SSHPutByte(pl, o, 1);
+	o = SSHPutStringZ(pl, o, cmd);
+	if (SSHPacketSend(chan->ssh, pl, o) < 0)
+	{
+		Free(pl);
+		return -1;
+	}
+	Free(pl);
+	return SSHChannelStartReply(chan);
+}
+
+I64 SSHChannelSend(CSSHChan *chan, U8 *data, I64 len)
+{ // send channel data, chunked to remote_maxpkt and paced by remote_window.
+  // The pump task replenishes remote_window from WINDOW_ADJUST.
+	U8	*pl;
+	I64	 n, o;
+
+	while (len > 0 && !chan->closed)
+	{
+		n = len;
+		if (n > chan->remote_maxpkt)
+			n = chan->remote_maxpkt;
+
+		while (chan->remote_window < n && !chan->closed)
+			Sleep(2);			// wait for a WINDOW_ADJUST
+		if (chan->closed)
+			return -1;
+
+		pl = MAlloc(n + 16);
+		o = 0;
+		o = SSHPutByte(pl, o, SSH_MSG_CHANNEL_DATA);
+		o = SSHPutU32(pl, o, chan->remote_id);
+		o = SSHPutString(pl, o, data, n);
+		if (SSHPacketSend(chan->ssh, pl, o) < 0)
+		{
+			Free(pl);
+			return -1;
+		}
+		Free(pl);
+
+		chan->remote_window -= n;
+		data += n;
+		len  -= n;
+	}
+	return 0;
+}
+
+U0 SSHChannelReplenish(CSSHChan *chan)
+{ // top our receive window back up so the server keeps sending
+	U8	pl[16];
+	I64	inc, o = 0;
+
+	if (chan->local_window >= SSH_WINDOW_LOW)
+		return;
+	inc = SSH_WINDOW_INITIAL - chan->local_window;
+	o = SSHPutByte(pl, o, SSH_MSG_CHANNEL_WINDOW_ADJUST);
+	o = SSHPutU32(pl, o, chan->remote_id);
+	o = SSHPutU32(pl, o, inc);
+	if (SSHPacketSend(chan->ssh, pl, o) == 0)
+		chan->local_window += inc;
+}
+
+I64 SSHChannelPump(CSSHChan *chan, U8 *out, I64 *out_len)
+{ // block for one channel message; returns an SSHCH_* code. On SSHCH_DATA,
+  // out/out_len hold the payload bytes.
+	U8	*pl = MAlloc(SSH_MAX_PACKET);
+	I64	 len, dlen, doff, type;
+
+	*out_len = 0;
+
+	if (SSHRecvFiltered(chan->ssh, pl, &len) < 0)
+	{
+		Free(pl);
+		return SSHCH_ERR;
+	}
+	if (len < 1)
+	{
+		Free(pl);
+		return SSHCH_OTHER;
+	}
+
+	switch (pl[0])
+	{
+		case SSH_MSG_CHANNEL_WINDOW_ADJUST:
+			chan->remote_window += SSHGetU32(pl + 5);
+			type = SSHCH_WADJ;
+			break;
+
+		case SSH_MSG_CHANNEL_DATA:
+			// u32(recipient) string(data)
+			dlen = SSHGetU32(pl + 5);
+			doff = 9;
+			MemCopy(out, pl + doff, dlen);
+			*out_len = dlen;
+			chan->local_window -= dlen;
+			SSHChannelReplenish(chan);
+			type = SSHCH_DATA;
+			break;
+
+		case SSH_MSG_CHANNEL_EXTENDED_DATA:
+			// u32(recipient) u32(data_type) string(data) -- stderr, shown inline
+			dlen = SSHGetU32(pl + 9);
+			doff = 13;
+			MemCopy(out, pl + doff, dlen);
+			*out_len = dlen;
+			chan->local_window -= dlen;
+			SSHChannelReplenish(chan);
+			type = SSHCH_DATA;
+			break;
+
+		case SSH_MSG_CHANNEL_EOF:
+			chan->eof = TRUE;
+			type = SSHCH_EOF;
+			break;
+
+		case SSH_MSG_CHANNEL_CLOSE:
+			chan->closed = TRUE;
+			type = SSHCH_CLOSE;
+			break;
+
+		case SSH_MSG_CHANNEL_REQUEST:
+		{ // u32(recipient) string(type) bool(want_reply) [data]
+			I64 nlen = SSHGetU32(pl + 5);
+			U8	*name = pl + 9;
+			U8	want_reply = pl[9 + nlen];
+			if (nlen == 11 && !MemCompare(name, "exit-status", 11))
+				chan->exit_status = SSHGetU32(pl + 9 + nlen + 1);
+			if (want_reply)
+				SSHPacketSendByte(chan->ssh, SSH_MSG_CHANNEL_FAILURE);
+			type = SSHCH_REQ;
+			break;
+		}
+
+		case SSH_MSG_CHANNEL_SUCCESS:
+			type = SSHCH_OK;
+			break;
+		case SSH_MSG_CHANNEL_FAILURE:
+			type = SSHCH_FAIL;
+			break;
+
+		default:
+			type = SSHCH_OTHER;
+			break;
+	}
+
+	Free(pl);
+	return type;
+}
+
+U0 SSHChannelClose(CSSHChan *chan)
+{ // send EOF + CLOSE, best effort
+	if (!chan)
+		return;
+	if (!chan->eof)
+	{
+		U8	pl[8];
+		I64	o = 0;
+		o = SSHPutByte(pl, o, SSH_MSG_CHANNEL_EOF);
+		o = SSHPutU32(pl, o, chan->remote_id);
+		SSHPacketSend(chan->ssh, pl, o);
+	}
+	if (!chan->closed)
+	{
+		U8	pl[8];
+		I64	o = 0;
+		o = SSHPutByte(pl, o, SSH_MSG_CHANNEL_CLOSE);
+		o = SSHPutU32(pl, o, chan->remote_id);
+		SSHPacketSend(chan->ssh, pl, o);
+	}
+}

@@ -1,0 +1,140 @@
+// SHA-1 (RFC 3174) for y4mOS. Git names objects by SHA-1; ZealOS ships only
+// SHA-256, so the git client carries its own. Not for security use.
+
+#define GIT_ROTL32(x, n)	(((x) << (n) | ((x) & 0xFFFFFFFF) >> (32 - (n))) & 0xFFFFFFFF)
+
+class CSHA1
+{
+	U32	state[5];
+	U64	bitlen;
+	U8	buf[64];
+	I64	buf_used;
+};
+
+U0 SHA1Block(CSHA1 *ctx, U8 *p)
+{
+	U32	w[80];
+	U32	a, b, c, d, e, f, k, tmp;
+	I64	t;
+
+	for (t = 0; t < 16; t++)
+		w[t] = p[t*4] << 24 | p[t*4+1] << 16 | p[t*4+2] << 8 | p[t*4+3];
+	for (t = 16; t < 80; t++)
+		w[t] = GIT_ROTL32(w[t-3] ^ w[t-8] ^ w[t-14] ^ w[t-16], 1);
+
+	a = ctx->state[0]; b = ctx->state[1]; c = ctx->state[2];
+	d = ctx->state[3]; e = ctx->state[4];
+
+	for (t = 0; t < 80; t++)
+	{
+		if (t < 20)			{ f = (b & c) | (~b & d);			k = 0x5A827999; }
+		else if (t < 40)	{ f = b ^ c ^ d;					k = 0x6ED9EBA1; }
+		else if (t < 60)	{ f = (b & c) | (b & d) | (c & d);	k = 0x8F1BBCDC; }
+		else				{ f = b ^ c ^ d;					k = 0xCA62C1D6; }
+
+		tmp = (GIT_ROTL32(a, 5) + f + e + k + w[t]) & 0xFFFFFFFF;
+		e = d;
+		d = c;
+		c = GIT_ROTL32(b, 30);
+		b = a;
+		a = tmp;
+	}
+
+	ctx->state[0] = (ctx->state[0] + a) & 0xFFFFFFFF;
+	ctx->state[1] = (ctx->state[1] + b) & 0xFFFFFFFF;
+	ctx->state[2] = (ctx->state[2] + c) & 0xFFFFFFFF;
+	ctx->state[3] = (ctx->state[3] + d) & 0xFFFFFFFF;
+	ctx->state[4] = (ctx->state[4] + e) & 0xFFFFFFFF;
+}
+
+U0 SHA1Init(CSHA1 *ctx)
+{
+	ctx->state[0] = 0x67452301;
+	ctx->state[1] = 0xEFCDAB89;
+	ctx->state[2] = 0x98BADCFE;
+	ctx->state[3] = 0x10325476;
+	ctx->state[4] = 0xC3D2E1F0;
+	ctx->bitlen	  = 0;
+	ctx->buf_used = 0;
+}
+
+U0 SHA1Update(CSHA1 *ctx, U8 *data, I64 len)
+{
+	I64 i;
+	for (i = 0; i < len; i++)
+	{
+		ctx->buf[ctx->buf_used++] = data[i];
+		ctx->bitlen += 8;
+		if (ctx->buf_used == 64)
+		{
+			SHA1Block(ctx, ctx->buf);
+			ctx->buf_used = 0;
+		}
+	}
+}
+
+U0 SHA1Final(CSHA1 *ctx, U8 *out)
+{
+	U64	len = ctx->bitlen;
+	I64	i;
+
+	SHA1Update(ctx, "\x80", 1);
+	while (ctx->buf_used != 56)
+		SHA1Update(ctx, "\x00", 1);
+	for (i = 7; i >= 0; i--)
+	{
+		U8 b = len >> (i * 8) & 0xFF;
+		SHA1Update(ctx, &b, 1);
+	}
+	for (i = 0; i < 5; i++)
+	{
+		out[i*4]	 = ctx->state[i] >> 24 & 0xFF;
+		out[i*4 + 1] = ctx->state[i] >> 16 & 0xFF;
+		out[i*4 + 2] = ctx->state[i] >> 8  & 0xFF;
+		out[i*4 + 3] = ctx->state[i]	   & 0xFF;
+	}
+}
+
+U0 SHA1(U8 *data, I64 len, U8 *out)
+{
+	CSHA1 ctx;
+	SHA1Init(&ctx);
+	SHA1Update(&ctx, data, len);
+	SHA1Final(&ctx, out);
+}
+
+U0 SHA1HexStr(U8 *hash20, U8 *out41)
+{ // 20-byte digest -> 40 lowercase hex chars + NUL
+	I64 i;
+	for (i = 0; i < 20; i++)
+	{
+		U8 hi = hash20[i] >> 4, lo = hash20[i] & 0xF;
+		out41[i*2]	   = hi < 10 ? '0' + hi : 'a' + hi - 10;
+		out41[i*2 + 1] = lo < 10 ? '0' + lo : 'a' + lo - 10;
+	}
+	out41[40] = 0;
+}
+
+Bool SHA1Test()
+{ // RFC 3174 / FIPS known-answer vectors
+	U8	hash[20], hex[41];
+
+	SHA1("abc", 3, hash);
+	SHA1HexStr(hash, hex);
+	if (StrCmp(hex, "a9993e364706816aba3e25717850c26c9cd0d89d"))
+	{
+		"$$RED$$SHA1 KAT failed ('abc'): %s$$FG$$\n", hex;
+		return FALSE;
+	}
+
+	SHA1("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 56, hash);
+	SHA1HexStr(hash, hex);
+	if (StrCmp(hex, "84983e441c3bd26ebaae4aa1f95129e5e54670f1"))
+	{
+		"$$RED$$SHA1 KAT failed (2-block): %s$$FG$$\n", hex;
+		return FALSE;
+	}
+
+	"$$GREEN$$SHA1 KAT passed.$$FG$$\n";
+	return TRUE;
+}

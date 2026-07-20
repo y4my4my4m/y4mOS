@@ -1,0 +1,232 @@
+// Git smart-HTTP client (protocol v0) for y4mOS. Needs the HTTP stack.
+//
+// Implemented: pkt-line framing, ref discovery (GET info/refs), and packfile
+// fetch (POST git-upload-pack, want/done, no side-band). This is the network
+// half of a clone -- it pulls the real packfile. Unpacking the pack (zlib
+// inflate with byte accounting, ofs/ref-delta resolution) and writing the
+// working tree are the next milestone; see GitClone's notes.
+
+I64 GitHexVal(U8 c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+I64 GitPktLen(U8 *p)
+{ // 4 hex chars -> length (includes the 4-byte prefix). -1 on bad hex.
+	I64 i, v = 0, d;
+	for (i = 0; i < 4; i++)
+	{
+		d = GitHexVal(p[i]);
+		if (d < 0) return -1;
+		v = v * 16 + d;
+	}
+	return v;
+}
+
+I64 GitPktPut(U8 *buf, I64 o, U8 *data)
+{ // write one pkt-line (4 hex length + data). Returns new offset.
+	I64	len = StrLen(data) + 4;
+	U8	hdr[5];
+	StrPrint(hdr, "%04X", len);
+	MemCopy(buf + o, hdr, 4);
+	MemCopy(buf + o + 4, data, StrLen(data));
+	return o + len;
+}
+
+// --- ref discovery ---------------------------------------------------------
+
+class CGitRef
+{
+	U8	sha[41];		// 40 hex + NUL
+	U8	name[256];
+};
+
+I64 GitParseRefs(U8 *body, I64 len, CGitRef *refs, I64 max_refs)
+{ // parse an info/refs advertisement into refs[]. Returns the count.
+	I64	off = 0, n = 0, plen, dstart, dlen, i, j;
+	U8	*d;
+
+	while (off + 4 <= len)
+	{
+		plen = GitPktLen(body + off);
+		if (plen == 0)								// flush-pkt: advance, read next
+			off += 4;
+		else if (plen < 4 || off + plen > len)
+			break;
+		else
+		{
+			dstart = off + 4;
+			dlen   = plen - 4;
+			d	   = body + dstart;
+			off   += plen;
+
+			// a ref line is "<40 hex sha> SP <name> [NUL caps] [LF]"; skip the
+			// "# service=..." header, short lines, and stop when refs[] is full.
+			if (dlen >= 40 && d[0] != '#' && n < max_refs)
+			{
+				for (i = 0; i < 40; i++)
+					refs[n].sha[i] = d[i];
+				refs[n].sha[40] = 0;
+
+				j = 41;								// past sha + space
+				i = 0;
+				while (j < dlen && d[j] != 0 && d[j] != '\n' && i < 255)
+					refs[n].name[i++] = d[j++];
+				refs[n].name[i] = 0;
+				n++;
+			}
+		}
+	}
+	return n;
+}
+
+U8 *GitInfoRefsUrl(U8 *base)
+{ // caller frees
+	return MStrPrint("%s/info/refs?service=git-upload-pack", base);
+}
+
+I64 GitLsRemoteInto(U8 *base, CGitRef *refs, I64 max_refs)
+{ // fetch + parse remote refs. Returns count, or -1 on HTTP failure.
+	U8			  *url = GitInfoRefsUrl(base);
+	CHttpResponse *resp = HttpGet(url);
+	I64			   n;
+
+	Free(url);
+	if (!resp || resp->status != 200)
+	{
+		NetErr("git: info/refs HTTP status %d.", resp ? resp->status : 0);
+		if (resp) HttpResponseFree(resp);
+		return -1;
+	}
+	n = GitParseRefs(resp->body, resp->body_length, refs, max_refs);
+	HttpResponseFree(resp);
+	return n;
+}
+
+public U0 GitLsRemote(U8 *base)
+{ /* List a remote's refs over HTTPS.
+	  GitLsRemote("https://github.com/user/repo"); */
+	CGitRef	*refs = MAlloc(sizeof(CGitRef) * 512);
+	I64		 n, i;
+
+	"$$LTBLUE$$--- git ls-remote %s ---$$FG$$\n", base;
+	n = GitLsRemoteInto(base, refs, 512);
+	if (n < 0)
+		"$$RED$$Failed.$$FG$$ See the Network Log.\n";
+	else
+	{
+		for (i = 0; i < n; i++)
+			"%s\t%s\n", refs[i].sha, refs[i].name;
+		"$$GREEN$$%d refs.$$FG$$\n", n;
+	}
+	Free(refs);
+}
+
+// --- pack fetch ------------------------------------------------------------
+
+I64 GitFetchPack(U8 *base, U8 *want_sha, U8 **out, I64 *out_len)
+{ // POST want/done, return the raw packfile (from the "PACK" magic). 0 on ok.
+	U8			  *url  = MStrPrint("%s/git-upload-pack", base);
+	U8			  *body = MAlloc(256);
+	U8			   line[80];
+	I64			   blen = 0, i;
+	CHttpResponse *resp;
+	U8			  *pack;
+
+	StrPrint(line, "want %s\n", want_sha);
+	blen = GitPktPut(body, blen, line);
+	MemCopy(body + blen, "0000", 4);	blen += 4;		// flush
+	blen = GitPktPut(body, blen, "done\n");
+
+	resp = HttpNav(url, "POST", "application/x-git-upload-pack-request", body, blen);
+	Free(url);
+	Free(body);
+
+	if (!resp || resp->status != 200)
+	{
+		NetErr("git: upload-pack HTTP status %d.", resp ? resp->status : 0);
+		if (resp) HttpResponseFree(resp);
+		return -1;
+	}
+
+	// response = pkt-line "NAK\n" then the raw packfile; locate "PACK".
+	pack = NULL;
+	for (i = 0; i + 4 <= resp->body_length; i++)
+	{
+		if (resp->body[i] == 'P' && resp->body[i+1] == 'A' &&
+			resp->body[i+2] == 'C' && resp->body[i+3] == 'K')
+		{
+			pack = resp->body + i;
+			break;
+		}
+	}
+	if (!pack)
+	{
+		NetErr("git: no PACK magic in upload-pack response.");
+		HttpResponseFree(resp);
+		return -1;
+	}
+
+	*out_len = resp->body_length - (pack - resp->body);
+	*out = MAlloc(*out_len);
+	MemCopy(*out, pack, *out_len);
+	HttpResponseFree(resp);
+	return 0;
+}
+
+U8 *GitPickHead(CGitRef *refs, I64 n)
+{ // choose the sha to fetch: HEAD, else refs/heads/main|master, else first.
+	I64 i;
+	for (i = 0; i < n; i++)
+		if (!StrCmp(refs[i].name, "HEAD"))
+			return refs[i].sha;
+	for (i = 0; i < n; i++)
+		if (!StrCmp(refs[i].name, "refs/heads/main") ||
+			!StrCmp(refs[i].name, "refs/heads/master"))
+			return refs[i].sha;
+	if (n > 0)
+		return refs[0].sha;
+	return NULL;
+}
+
+public U0 GitClone(U8 *base, U8 *save_pack=NULL)
+{ /* Fetch a repo's packfile over HTTPS. Optionally save it to disk.
+	  GitClone("https://github.com/user/repo");
+	  GitClone("https://github.com/user/repo", "::/Tmp/repo.pack");
+
+	NOTE: this downloads and (optionally) stores the packfile. Unpacking it to
+	a working tree needs delta resolution + a byte-accounting inflate, which is
+	the next milestone -- not done here. */
+	CGitRef	*refs = MAlloc(sizeof(CGitRef) * 512);
+	U8		*head, *pack;
+	I64		 n, pack_len;
+
+	"$$LTBLUE$$--- git clone %s ---$$FG$$\n", base;
+
+	n = GitLsRemoteInto(base, refs, 512);
+	if (n < 0) { "$$RED$$ref discovery failed.$$FG$$\n"; Free(refs); return; }
+	head = GitPickHead(refs, n);
+	if (!head) { "$$RED$$no refs to fetch.$$FG$$\n"; Free(refs); return; }
+	"Fetching %s ...\n", head;
+
+	if (GitFetchPack(base, head, &pack, &pack_len) < 0)
+	{
+		"$$RED$$pack fetch failed.$$FG$$\n";
+		Free(refs);
+		return;
+	}
+	"$$GREEN$$Got packfile: %d bytes.$$FG$$\n", pack_len;
+
+	if (save_pack)
+	{
+		FileWrite(save_pack, pack, pack_len);
+		"Saved to %s\n", save_pack;
+	}
+	"$$YELLOW$$(unpack + checkout not yet implemented -- see GitClone notes)$$FG$$\n";
+
+	Free(pack);
+	Free(refs);
+}

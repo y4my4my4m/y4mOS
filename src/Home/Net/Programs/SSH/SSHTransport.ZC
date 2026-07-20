@@ -1,0 +1,623 @@
+// SSH-2 transport for y4mOS, by y4my4m. Public Domain.
+//
+// Version exchange, binary packets, curve25519-sha256 KEX, exchange hash H,
+// RFC 4253 key derivation, chacha20-poly1305@openssh AEAD. After
+// SSHTransportConnect the channel is encrypted via SSHPacketSend/Recv.
+// Reuses Crypto/*.ZC primitives; no host-key verify in v1 (accept-any).
+
+#define SSH_MSG_DISCONNECT			1
+#define SSH_MSG_IGNORE				2
+#define SSH_MSG_UNIMPLEMENTED		3
+#define SSH_MSG_DEBUG				4
+#define SSH_MSG_SERVICE_REQUEST		5
+#define SSH_MSG_SERVICE_ACCEPT		6
+#define SSH_MSG_KEXINIT				20
+#define SSH_MSG_NEWKEYS				21
+#define SSH_MSG_KEX_ECDH_INIT		30
+#define SSH_MSG_KEX_ECDH_REPLY		31
+
+#define SSH_MAX_PACKET				35000	// sanity cap on an inbound packet
+#define SSH_VERSION_STRING			"SSH-2.0-y4mOS_0.1"
+
+class CSSH
+{
+	CTCPSocket	*sock;
+
+	U8			 v_c[64];		// our version identification, no CRLF
+	I64			 v_c_len;
+	U8			 v_s[256];		// server version identification, no CRLF
+	I64			 v_s_len;
+
+	U8			 sess_id[32];	// session id = H of the first key exchange
+
+	// chacha20-poly1305 keys, split main(data)/header(length) per direction.
+	U8			 c2s_main[32], c2s_hdr[32];
+	U8			 s2c_main[32], s2c_hdr[32];
+
+	U64			 send_seq;		// per-direction packet counters, from 0,
+	U64			 recv_seq;		// counting the plaintext handshake packets too
+
+	I64			 send_lock;		// serialises SSHPacketSend across tasks
+
+	Bool		 encrypted;		// TRUE once NEWKEYS has been exchanged
+};
+
+// Wire helpers. SSH `string` = u32 BE length + bytes; scalars big-endian.
+// Each Put* returns the new offset.
+
+I64 SSHPutU32(U8 *b, I64 o, U32 v)
+{
+	b[o]	 = v >> 24 & 0xFF;
+	b[o + 1] = v >> 16 & 0xFF;
+	b[o + 2] = v >> 8 & 0xFF;
+	b[o + 3] = v & 0xFF;
+	return o + 4;
+}
+
+I64 SSHPutByte(U8 *b, I64 o, U8 v)
+{
+	b[o] = v;
+	return o + 1;
+}
+
+I64 SSHPutBytes(U8 *b, I64 o, U8 *s, I64 n)
+{
+	MemCopy(b + o, s, n);
+	return o + n;
+}
+
+I64 SSHPutString(U8 *b, I64 o, U8 *s, I64 n)
+{ // length-prefixed byte string
+	o = SSHPutU32(b, o, n);
+	return SSHPutBytes(b, o, s, n);
+}
+
+I64 SSHPutStringZ(U8 *b, I64 o, U8 *s)
+{ // length-prefixed from a C string
+	return SSHPutString(b, o, s, StrLen(s));
+}
+
+I64 SSHPutMpint(U8 *b, I64 o, U8 *v, I64 n)
+{ // mpint from unsigned big-endian v: drop leading zeros, prepend 0x00 if the
+  // top bit is set (keep it non-negative).
+	I64	 i = 0;
+	Bool pad;
+	I64	 len;
+
+	while (i < n && v[i] == 0)
+		i++;
+	pad = (i < n) && (v[i] & 0x80);
+	len = (n - i) + pad;
+
+	o = SSHPutU32(b, o, len);
+	if (pad)
+		b[o++] = 0;
+	while (i < n)
+		b[o++] = v[i++];
+	return o;
+}
+
+U32 SSHGetU32(U8 *b)
+{
+	return b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3];
+}
+
+// Read exactly n bytes. Socket timeout is a poll tick, not an error; wait up
+// to a stall deadline, cancellable via net_abort (shared with TLS).
+
+Bool ssh_interactive = FALSE;	// TRUE = wait indefinitely (idle shell), no stall deadline
+
+I64 SSHReadN(CSSH *ssh, U8 *buf, I64 n)
+{
+	I64 got = 0, r;
+	I64 deadline = counts.jiffies + NET_READ_STALL_MS * JIFFY_FREQ / 1000;
+
+	while (got < n)
+	{
+		if (net_abort)
+			return -1;
+		r = TCPSocketReceive(ssh->sock, buf + got, n - got);
+		if (r > 0)
+		{
+			got += r;
+			deadline = counts.jiffies + NET_READ_STALL_MS * JIFFY_FREQ / 1000;
+		}
+		else if (r == 0)
+		{
+			NetErr("SSH: peer closed wanting %d more bytes.", n - got);
+			return -1;
+		}
+		else if (!ssh_interactive && counts.jiffies > deadline)
+		{
+			NetErr("SSH: read stalled wanting %d more bytes.", n - got);
+			return -1;
+		}
+	}
+	return got;
+}
+
+// Padding, same for "none" and chacha20-poly1305: pad (padding_length +
+// payload) to a multiple of 8, min 4 bytes. The 4-byte length field is NOT in
+// the rounded block (validated against OpenSSH).
+
+I64 SSHPadLen(I64 payload_len)
+{
+	I64 pad = 8 - ((1 + payload_len) % 8);
+	if (pad < 4)
+		pad += 8;
+	return pad;
+}
+
+U0 SSHNonce(U64 seq, U8 *out)
+{ // nonce = 4 zero bytes || 8-byte big-endian seqnr
+	I64 i;
+	MemSet(out, 0, 12);
+	for (i = 0; i < 8; i++)
+		out[11 - i] = seq >> (i * 8) & 0xFF;
+}
+
+// Plaintext packets (pre-NEWKEYS "none" cipher): no MAC.
+
+I64 SSHSendPlain(CSSH *ssh, U8 *payload, I64 payload_len)
+{
+	I64	 pad	= SSHPadLen(payload_len);
+	I64	 plen	= 1 + payload_len + pad;
+	I64	 total	= 4 + plen;
+	U8	*pkt	= MAlloc(total);
+	I64	 o		= 0;
+	I64	 sent;
+
+	o = SSHPutU32(pkt, o, plen);
+	o = SSHPutByte(pkt, o, pad);
+	o = SSHPutBytes(pkt, o, payload, payload_len);
+	CryptoRandBytes(pkt + o, pad);
+
+	sent = TCPSocketSendAll(ssh->sock, pkt, total);
+	Free(pkt);
+
+	ssh->send_seq++;
+	if (sent < total)
+		return -1;
+	return 0;
+}
+
+I64 SSHRecvPlain(CSSH *ssh, U8 *payload_out, I64 *payload_len_out)
+{ // returns the payload (message byte + body), padding stripped
+	U8	hdr[4];
+	I64	plen, pad, payload_len;
+	U8	*body;
+
+	if (SSHReadN(ssh, hdr, 4) < 0)
+		return -1;
+	plen = SSHGetU32(hdr);
+	if (plen < 8 || plen > SSH_MAX_PACKET)
+	{
+		NetErr("SSH: bad plaintext packet length %d.", plen);
+		return -1;
+	}
+
+	body = MAlloc(plen);
+	if (SSHReadN(ssh, body, plen) < 0)
+	{
+		Free(body);
+		return -1;
+	}
+
+	pad			= body[0];
+	payload_len	= plen - 1 - pad;
+	if (payload_len < 0)
+	{
+		NetErr("SSH: plaintext padding %d exceeds packet.", pad);
+		Free(body);
+		return -1;
+	}
+
+	MemCopy(payload_out, body + 1, payload_len);
+	*payload_len_out = payload_len;
+	Free(body);
+
+	ssh->recv_seq++;
+	return 0;
+}
+
+// Encrypted packets (chacha20-poly1305@openssh): length under K_hdr at ctr 0,
+// body under K_main at ctr 1, Poly1305 key = K_main keystream block 0.
+
+U0 SSHPolyKey(U8 *main_key, U8 *nonce, U8 *poly_out)
+{ // one-time Poly1305 key = first 32 bytes of the main-key keystream (ctr 0)
+	U8 zeros[32], ks[32];
+	MemSet(zeros, 0, 32);
+	ChaCha20Xor(main_key, nonce, 0, zeros, ks, 32);
+	MemCopy(poly_out, ks, 32);
+}
+
+I64 SSHPacketSend(CSSH *ssh, U8 *payload, I64 payload_len)
+{
+	I64	 pad	 = SSHPadLen(payload_len);
+	I64	 plen	 = 1 + payload_len + pad;
+	I64	 total	 = 4 + plen + 16;			// enc_len + enc_pkt + tag
+	U8	*wire	 = MAlloc(total);
+	U8	*block	 = MAlloc(plen);
+	U8	 nonce[12], polykey[32], lenbe[4];
+	I64	 sent;
+
+	while (LBts(&ssh->send_lock, 0))	// serialise: nonce/seq are per-direction
+		Yield;
+
+	SSHNonce(ssh->send_seq, nonce);
+
+	SSHPutU32(lenbe, 0, plen);
+	ChaCha20Xor(ssh->c2s_hdr, nonce, 0, lenbe, wire, 4);	// enc length
+
+	block[0] = pad;										// padlen || payload || pad
+	MemCopy(block + 1, payload, payload_len);
+	CryptoRandBytes(block + 1 + payload_len, pad);
+	ChaCha20Xor(ssh->c2s_main, nonce, 1, block, wire + 4, plen);
+
+	SSHPolyKey(ssh->c2s_main, nonce, polykey);
+	Poly1305Mac(polykey, wire, 4 + plen, wire + 4 + plen);
+
+	sent = TCPSocketSendAll(ssh->sock, wire, total);
+
+	Free(block);
+	Free(wire);
+
+	ssh->send_seq++;
+	LBtr(&ssh->send_lock, 0);
+	if (sent < total)
+		return -1;
+	return 0;
+}
+
+I64 SSHPacketRecv(CSSH *ssh, U8 *payload_out, I64 *payload_len_out)
+{
+	U8	 enc_len[4], nonce[12], polykey[32], want_tag[16], lenbe[4];
+	I64	 plen, pad, payload_len;
+	U8	*enc_pkt;
+	U8	*macbuf;
+
+	SSHNonce(ssh->recv_seq, nonce);
+
+	if (SSHReadN(ssh, enc_len, 4) < 0)
+		return -1;
+	ChaCha20Xor(ssh->s2c_hdr, nonce, 0, enc_len, lenbe, 4);
+	plen = SSHGetU32(lenbe);
+	if (plen < 8 || plen > SSH_MAX_PACKET)
+	{
+		NetErr("SSH: bad encrypted packet length %d.", plen);
+		return -1;
+	}
+
+	enc_pkt = MAlloc(plen);
+	if (SSHReadN(ssh, enc_pkt, plen) < 0)
+	{
+		Free(enc_pkt);
+		return -1;
+	}
+	if (SSHReadN(ssh, want_tag, 16) < 0)
+	{
+		Free(enc_pkt);
+		return -1;
+	}
+
+	SSHPolyKey(ssh->s2c_main, nonce, polykey);	// verify tag over enc_len||enc_pkt
+	macbuf = MAlloc(4 + plen);
+	MemCopy(macbuf, enc_len, 4);
+	MemCopy(macbuf + 4, enc_pkt, plen);
+	U8 got_tag[16];
+	Poly1305Mac(polykey, macbuf, 4 + plen, got_tag);
+	Free(macbuf);
+	if (!CryptoBytesEqual(got_tag, want_tag, 16))
+	{
+		NetErr("SSH: Poly1305 tag mismatch on recv.");
+		Free(enc_pkt);
+		return -1;
+	}
+
+	U8 *plain = MAlloc(plen);
+	ChaCha20Xor(ssh->s2c_main, nonce, 1, enc_pkt, plain, plen);
+	Free(enc_pkt);
+
+	pad			= plain[0];
+	payload_len	= plen - 1 - pad;
+	if (payload_len < 0)
+	{
+		NetErr("SSH: encrypted padding %d exceeds packet.", pad);
+		Free(plain);
+		return -1;
+	}
+	MemCopy(payload_out, plain + 1, payload_len);
+	*payload_len_out = payload_len;
+	Free(plain);
+
+	ssh->recv_seq++;
+	return 0;
+}
+
+I64 SSHPacketSendByte(CSSH *ssh, U8 msg)
+{ // one-byte payload
+	if (ssh->encrypted)
+		return SSHPacketSend(ssh, &msg, 1);
+	return SSHSendPlain(ssh, &msg, 1);
+}
+
+// Version exchange. CRLF stripped; both strings kept (no CRLF) for H.
+
+I64 SSHExchangeVersions(CSSH *ssh)
+{
+	U8	line[80];
+	I64	line_len, n;
+
+	ssh->v_c_len = StrLen(SSH_VERSION_STRING);
+	MemCopy(ssh->v_c, SSH_VERSION_STRING, ssh->v_c_len);
+	ssh->v_c[ssh->v_c_len] = 0;
+
+	StrPrint(line, "%s\r\n", SSH_VERSION_STRING);
+	line_len = StrLen(line);
+	if (TCPSocketSendAll(ssh->sock, line, line_len) < line_len)
+	{
+		NetErr("SSH: failed to send version string.");
+		return -1;
+	}
+
+	// read lines until one starts with "SSH-" (RFC 4253 allows banner lines)
+	while (TRUE)
+	{
+		n = TCPSocketReceiveLine(ssh->sock, ssh->v_s, 256);
+		if (n < 0)
+		{
+			NetErr("SSH: failed reading server version.");
+			return -1;
+		}
+		if (n >= 4 && !MemCompare(ssh->v_s, "SSH-", 4))
+			break;
+	}
+	ssh->v_s_len = StrLen(ssh->v_s);
+	return 0;
+}
+
+// KEXINIT payload I_C. MAC names cosmetic under AEAD but must be present.
+
+I64 SSHBuildKexInit(U8 *out)
+{
+	I64 o = 0;
+	o = SSHPutByte(out, o, SSH_MSG_KEXINIT);
+	CryptoRandBytes(out + o, 16);	// cookie
+	o += 16;
+	o = SSHPutStringZ(out, o, "curve25519-sha256");					// kex
+	o = SSHPutStringZ(out, o, "ssh-ed25519");						// host key
+	o = SSHPutStringZ(out, o, "chacha20-poly1305@openssh.com");		// enc c2s
+	o = SSHPutStringZ(out, o, "chacha20-poly1305@openssh.com");		// enc s2c
+	o = SSHPutStringZ(out, o, "hmac-sha2-256");						// mac c2s
+	o = SSHPutStringZ(out, o, "hmac-sha2-256");						// mac s2c
+	o = SSHPutStringZ(out, o, "none");								// comp c2s
+	o = SSHPutStringZ(out, o, "none");								// comp s2c
+	o = SSHPutStringZ(out, o, "");									// lang c2s
+	o = SSHPutStringZ(out, o, "");									// lang s2c
+	o = SSHPutByte(out, o, 0);			// first_kex_packet_follows
+	o = SSHPutU32(out, o, 0);			// reserved
+	return o;
+}
+
+// RFC 4253 7.2: K(X) = HASH(K_mpint || H || X || session_id), extended one
+// HASH block (64 bytes = 32 main + 32 header for chacha20-poly1305).
+
+U0 SSHDeriveKey(U8 *k_mpint, I64 k_mpint_len, U8 *h, U8 letter,
+				U8 *sess_id, U8 *out64)
+{
+	CSHA256 ctx;
+	U8		k1[32];
+
+	// K1 = HASH(K_mpint || H || letter || session_id)
+	SHA256Init(&ctx);
+	SHA256Update(&ctx, k_mpint, k_mpint_len);
+	SHA256Update(&ctx, h, 32);
+	SHA256Update(&ctx, &letter, 1);
+	SHA256Update(&ctx, sess_id, 32);
+	SHA256Final(&ctx, k1);
+	MemCopy(out64, k1, 32);
+
+	// K2 = HASH(K_mpint || H || K1)
+	SHA256Init(&ctx);
+	SHA256Update(&ctx, k_mpint, k_mpint_len);
+	SHA256Update(&ctx, h, 32);
+	SHA256Update(&ctx, k1, 32);
+	SHA256Final(&ctx, out64 + 32);
+}
+
+// Handshake: version -> KEXINIT -> ECDH -> H -> NEWKEYS -> derive keys.
+// Returns a CSSH* with the encrypted channel live, or NULL.
+
+CSSH *SSHTransportConnect(U8 *hostname, U16 port)
+{
+	CSSH	*ssh = MAlloc(sizeof(CSSH));
+	U8		*i_c = MAlloc(1024);	// our KEXINIT payload
+	U8		*i_s = MAlloc(4096);	// server KEXINIT payload
+	U8		*pl  = MAlloc(SSH_MAX_PACKET);
+	I64		 i_c_len, i_s_len, pl_len;
+
+	U8		 priv[32], q_c[32], q_s[32], shared[32];
+	U8		*ks;					// server host key blob (K_S)
+	I64		 ks_len;
+	U8		*hbuf;					// exchange-hash input
+	I64		 ho;
+	U8		 h[32];
+	U8		 k_mpint[40];			// mpint(K): 4 len + up to 33 bytes
+	I64		 k_mpint_len;
+	U8		 ckey[64], dkey[64];
+
+	MemSet(ssh, 0, sizeof(CSSH));
+
+	ssh->sock = TCPConnectionCreate(hostname, port);
+	if (ssh->sock <= 0)
+	{
+		NetErr("SSH: TCP/DNS connect to %s:%d failed.", hostname, port);
+		goto fail;
+	}
+
+	if (SSHExchangeVersions(ssh) < 0)
+		goto fail;
+
+	// --- KEXINIT exchange -------------------------------------------------
+	i_c_len = SSHBuildKexInit(i_c);
+	if (SSHSendPlain(ssh, i_c, i_c_len) < 0)
+		goto fail;
+
+	if (SSHRecvPlain(ssh, i_s, &i_s_len) < 0)
+		goto fail;
+	if (i_s_len < 1 || i_s[0] != SSH_MSG_KEXINIT)
+	{
+		NetErr("SSH: expected KEXINIT, got msg %d.", i_s[0]);
+		goto fail;
+	}
+
+	// --- ECDH: send Q_C, receive K_S || Q_S || sig ------------------------
+	CryptoRandBytes(priv, 32);		// X25519 clamps internally
+	X25519Base(q_c, priv);
+
+	pl_len = 0;
+	pl_len = SSHPutByte(pl, pl_len, SSH_MSG_KEX_ECDH_INIT);
+	pl_len = SSHPutString(pl, pl_len, q_c, 32);
+	if (SSHSendPlain(ssh, pl, pl_len) < 0)
+		goto fail;
+
+	if (SSHRecvPlain(ssh, pl, &pl_len) < 0)
+		goto fail;
+	if (pl_len < 1 || pl[0] != SSH_MSG_KEX_ECDH_REPLY)
+	{
+		NetErr("SSH: expected KEX_ECDH_REPLY, got msg %d.", pl[0]);
+		goto fail;
+	}
+	// parse: byte(31) string(K_S) string(Q_S) string(sig)
+	{
+		I64 p = 1;
+		ks_len = SSHGetU32(pl + p);		p += 4;
+		ks = pl + p;					p += ks_len;
+		I64 qlen = SSHGetU32(pl + p);	p += 4;
+		if (qlen != 32)
+		{
+			NetErr("SSH: server Q_S length %d, expected 32.", qlen);
+			goto fail;
+		}
+		MemCopy(q_s, pl + p, 32);
+		// signature (pl+p+32 ..) is ignored: host key not verified in v1
+	}
+
+	// shared secret K = X25519(priv, Q_S)
+	X25519(shared, priv, q_s);
+
+	// --- exchange hash H --------------------------------------------------
+	// H = SHA256( str(V_C) str(V_S) str(I_C) str(I_S) str(K_S) str(Q_C)
+	//             str(Q_S) mpint(K) )
+	hbuf = MAlloc(SSH_MAX_PACKET);
+	ho = 0;
+	ho = SSHPutString(hbuf, ho, ssh->v_c, ssh->v_c_len);
+	ho = SSHPutString(hbuf, ho, ssh->v_s, ssh->v_s_len);
+	ho = SSHPutString(hbuf, ho, i_c, i_c_len);
+	ho = SSHPutString(hbuf, ho, i_s, i_s_len);
+	ho = SSHPutString(hbuf, ho, ks, ks_len);
+	ho = SSHPutString(hbuf, ho, q_c, 32);
+	ho = SSHPutString(hbuf, ho, q_s, 32);
+	ho = SSHPutMpint(hbuf, ho, shared, 32);
+	SHA256(hbuf, ho, h);
+	Free(hbuf);
+
+	MemCopy(ssh->sess_id, h, 32);	// session id = H of the first KEX
+
+	// mpint(K) reused as the K_mpint prefix in key derivation
+	k_mpint_len = SSHPutMpint(k_mpint, 0, shared, 32);
+
+	// --- NEWKEYS ----------------------------------------------------------
+	if (SSHPacketSendByte(ssh, SSH_MSG_NEWKEYS) < 0)	// still plaintext
+		goto fail;
+	if (SSHRecvPlain(ssh, pl, &pl_len) < 0)
+		goto fail;
+	if (pl_len < 1 || pl[0] != SSH_MSG_NEWKEYS)
+	{
+		NetErr("SSH: expected NEWKEYS, got msg %d.", pl[0]);
+		goto fail;
+	}
+
+	// --- derive cipher keys ----------------------------------------------
+	// enc c2s = K('C'), enc s2c = K('D'). chacha20-poly1305 splits each 64-byte
+	// key: main = [0:32], header = [32:64]. IV/MAC letters unused (AEAD).
+	SSHDeriveKey(k_mpint, k_mpint_len, h, 'C', ssh->sess_id, ckey);
+	SSHDeriveKey(k_mpint, k_mpint_len, h, 'D', ssh->sess_id, dkey);
+	MemCopy(ssh->c2s_main, ckey,      32);
+	MemCopy(ssh->c2s_hdr,  ckey + 32, 32);
+	MemCopy(ssh->s2c_main, dkey,      32);
+	MemCopy(ssh->s2c_hdr,  dkey + 32, 32);
+
+	ssh->encrypted = TRUE;
+
+	Free(i_c);
+	Free(i_s);
+	Free(pl);
+	return ssh;
+
+fail:
+	if (ssh->sock > 0)
+		TCPSocketClose(ssh->sock);
+	Free(ssh);
+	Free(i_c);
+	Free(i_s);
+	Free(pl);
+	return NULL;
+}
+
+U0 SSHTransportClose(CSSH *ssh)
+{
+	if (!ssh)
+		return;
+	if (ssh->sock > 0)
+		TCPSocketClose(ssh->sock);
+	Free(ssh);
+}
+
+//----------------------------------------------------------------------------
+// Transport smoke test. Runs the full handshake, then proves the encrypted
+// channel by requesting the ssh-userauth service and reading SERVICE_ACCEPT
+// back. A green line here means KEX + key derivation + the chacha20-poly1305
+// AEAD are all correct end to end.
+
+public U0 SSHTransportTest(U8 *hostname, U16 port=22)
+{
+	CSSH	*ssh;
+	U8		*pl = MAlloc(SSH_MAX_PACKET);
+	I64		 pl_len, o;
+
+	"$$LTBLUE$$--- SSH transport test: %s:%d ---$$FG$$\n", hostname, port;
+
+	ssh = SSHTransportConnect(hostname, port);
+	if (!ssh)
+	{
+		"$$RED$$Transport handshake FAILED.$$FG$$ See the Network Log.\n";
+		Free(pl);
+		return;
+	}
+	"KEX + NEWKEYS done. Encrypted channel up. Requesting ssh-userauth...\n";
+
+	o = 0;
+	o = SSHPutByte(pl, o, SSH_MSG_SERVICE_REQUEST);
+	o = SSHPutStringZ(pl, o, "ssh-userauth");
+	if (SSHPacketSend(ssh, pl, o) < 0)
+	{
+		"$$RED$$Failed sending SERVICE_REQUEST.$$FG$$\n";
+		goto done;
+	}
+
+	if (SSHPacketRecv(ssh, pl, &pl_len) < 0)
+	{
+		"$$RED$$Failed reading reply (bad decrypt?).$$FG$$\n";
+		goto done;
+	}
+
+	if (pl_len >= 1 && pl[0] == SSH_MSG_SERVICE_ACCEPT)
+		"$$GREEN$$SERVICE_ACCEPT received -- transport + cipher VERIFIED.$$FG$$\n";
+	else
+		"$$RED$$Unexpected reply msg %d (wanted 6=SERVICE_ACCEPT).$$FG$$\n", pl[0];
+
+done:
+	SSHTransportClose(ssh);
+	Free(pl);
+}
