@@ -56,6 +56,7 @@ class CZStyle
 	I8	flex_col;				// flex-direction: -1 unset, 0 row, 1 column
 	I8	grid_cols;				// grid-template-columns track count; -1 unset
 	I16 bg_img;					// background-image: zcss_bgimg index; -1 unset
+	I16 line_h;					// line-height in px; -1 normal/unset. Inherits.
 };
 
 class CZCssRule
@@ -109,6 +110,7 @@ U0 ZStyleReset(CZStyle *s)
 	s->pos = -1;
 	s->grid_cols = -1;	// was missing: merge reads it, so garbage leaked in
 	s->bg_img = -1;
+	s->line_h = -1;
 }
 
 U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
@@ -145,6 +147,7 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	if (src->grow	   >= 0) dst->grow		= src->grow;
 	if (src->pos	   >= 0) dst->pos		= src->pos;
 	if (src->bg_img   >= 0) dst->bg_img	= src->bg_img;
+	if (src->line_h   >= 0) dst->line_h	= src->line_h;
 }
 
 U0 ZStyleStripBox(CZStyle *s)
@@ -1003,6 +1006,49 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 			n = ZCssBgImgAdd(ubuf);
 			if (n >= 0)
 				out->bg_img = n;
+		}
+	}
+	else if (!StrICompare(name, "line-height"))
+	{
+		if (!StrNICompare(val, "normal", 6))
+			out->line_h = -1;
+		else
+		{
+			//Unitless (1.5) multiplies the font size; anything with a unit
+			//goes through the normal length parser.
+			depth = TRUE; // reused as "is unitless" flag
+			p = val;
+			while (*p)
+			{
+				if (!('0' <= *p <= '9') && *p != '.' && *p != ' ')
+					depth = FALSE;
+				p++;
+			}
+			if (depth)
+			{
+				n = 0; // value in tenths: "1.5" -> 15
+				p = val;
+				while (*p == ' ')
+					p++;
+				while ('0' <= *p <= '9')
+				{
+					n = n * 10 + *p - '0';
+					p++;
+				}
+				n *= 10;
+				if (*p == '.' && '0' <= p[1] <= '9')
+					n += p[1] - '0';
+				if (out->fsize > 0)
+					out->line_h = ClampI64(out->fsize * n / 10, 8, 64);
+				else
+					out->line_h = ClampI64(16 * n / 10, 8, 64);
+			}
+			else
+			{
+				n = ZCssPx(val);
+				if (n > 0)
+					out->line_h = ClampI64(n, 8, 64);
+			}
 		}
 	}
 	else if (!StrICompare(name, "font-weight"))

@@ -372,7 +372,10 @@ U0 GxRunFlush()
 			op->text = StrNew(gx.run);
 			op->fg	 = GxPen(gx.run_style.fg, gx.text_pen);
 			op->bold = gx.run_style.bold == 1;
-			op->ul	 = gx.run_style.underline == 1 || gx.run_link;
+			//Links underline by DEFAULT, but author text-decoration:none wins
+			//(hacker news titles, most modern navs).
+			op->ul	 = gx.run_style.underline == 1 ||
+					   (gx.run_link && gx.run_style.underline != 0);
 			if (gx.run_style.bg >= 0)
 			{
 				op->has_bg = TRUE;
@@ -435,7 +438,14 @@ U0 GxWord(U8 *word, I64 len, CZStyle *style, I64 scale)
 	gx.run_len += len;
 	gx.run[gx.run_len++] = ' ';
 	gx.x += need + cw;
-	if (FONT_HEIGHT * scale + GX_LINE_LEAD > gx.line_h)
+	//Line advance: author line-height when set (floor: the glyphs must fit),
+	//else the default leading.
+	if (style->line_h > 0)
+	{
+		if (MaxI64(FONT_HEIGHT * scale + 2, style->line_h) > gx.line_h)
+			gx.line_h = MaxI64(FONT_HEIGHT * scale + 2, style->line_h);
+	}
+	else if (FONT_HEIGHT * scale + GX_LINE_LEAD > gx.line_h)
 		gx.line_h = FONT_HEIGHT * scale + GX_LINE_LEAD;
 }
 
@@ -951,6 +961,45 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 		}
 	}
 
+	if (!StrCompare(node->tag, "table"))
+	{//Table BOX: honor width= / CSS width; an outer <center> (or align) then
+	//centers the box itself - hacker news is a centered width=85% table.
+		I64 tw = 0, t_avail, t_save_i = gx.indent, t_save_w = gx.wrap_w;
+
+		GxRunFlush;
+		if (gx.x > GX_MARGIN + gx.indent)
+			GxNewline(0);
+		t_avail = gx.wrap_w - (GX_MARGIN + gx.indent);
+		if (author.width > 0)
+			tw = MinI64(author.width, t_avail);
+		else if (author.width < 0)
+			tw = t_avail * -author.width / 100;
+		if (tw >= 60 && tw < t_avail)
+		{
+			if (style.align == 1)
+				gx.indent += (t_avail - tw) / 2;
+			else if (style.align == 2)
+				gx.indent += t_avail - tw;
+			gx.wrap_w = GX_MARGIN + gx.indent + tw;
+			gx.x = GX_MARGIN + gx.indent;
+		}
+		MemCopy(&kid, &style, sizeof(CZStyle));
+		ZStyleStripBox(&kid);
+		child = node->first_child;
+		while (child)
+		{
+			GxNode(child, &kid);
+			child = child->next;
+		}
+		GxRunFlush;
+		if (gx.x > GX_MARGIN + gx.indent)
+			GxNewline(0);
+		gx.indent = t_save_i;
+		gx.wrap_w = t_save_w;
+		gx.x = GX_MARGIN + gx.indent;
+		return;
+	}
+
 	if (!StrCompare(node->tag, "tr"))
 	{//Table row: lay the td/th children out as side-by-side columns, sized by
 	//their content like a real table (equal thirds squeezed HN's title cell
@@ -977,6 +1026,12 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 		GxRunFlush;
 		if (gx.x > GX_MARGIN + gx.indent)
 			GxNewline(0);
+		if (!cells)
+		{//Spacer row (style="height:5px", no cells): advance only.
+			if (author.height > 0)
+				gx.y += author.height;
+			return;
+		}
 		base = GX_MARGIN + gx.indent;
 		avail = gx.wrap_w - base;
 		if (2 <= cells <= 16 && avail / cells >= 24)
@@ -1071,6 +1126,8 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 			gx.indent = save_indent;
 			gx.wrap_w = save_wrap;
 			gx.y	  = ymax;
+			if (author.height > 0 && gx.y < y0 + author.height)
+				gx.y = y0 + author.height; //row min-height (tr style height)
 			gx.x	  = GX_MARGIN + gx.indent;
 			gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
 			return;
