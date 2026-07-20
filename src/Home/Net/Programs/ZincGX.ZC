@@ -1435,15 +1435,32 @@ U0 GxUrlDel(I64 at)
 }
 
 //--- Inline text-field editing (mirrors the URL bar) --------------------------
+Bool gx_field_dispatching = FALSE; //JIT globals not zeroed: explicit. Re-entry
+                                   //guard for the input/change handlers below.
+
 U0 GxFieldCommit()
 {//Write the edit buffer back into the DOM node value + the op's display text,
 //so form submit picks it up and the field renders the typed text.
+	CZNode *node;
+
 	if (!gx.field_op)
 		return;
-	Free(gx.field_op->node->value);
-	gx.field_op->node->value = StrNew(gx.field_buf);
+	node = gx.field_op->node;
+	Free(node->value);
+	node->value = StrNew(gx.field_buf);
 	Free(gx.field_op->text);
 	gx.field_op->text = StrNew(gx.field_buf);
+
+	//Fire input/change handlers (addEventListener or el.oninput/onchange). The
+	//guard stops a handler that itself commits a field from recursing forever.
+	if (zinc_js && node && !gx_field_dispatching)
+	{
+		gx_field_dispatching = TRUE;
+		JsDispatchEvent(zinc_js, node, "input");
+		if (JsDispatchEvent(zinc_js, node, "change"))
+			gx.relayout = TRUE;
+		gx_field_dispatching = FALSE;
+	}
 }
 
 U0 GxFieldBlur()
@@ -1519,6 +1536,19 @@ U0 GxClickContent(I64 x, I64 y)
 			GxNavTo(ZincResolveLink(op->href));
 			return;
 		}
+		if (op->type == GXO_TEXT && op->node && zinc_js)
+		{//Non-link text with a click handler (addEventListener / el.onclick).
+			if (JsDispatchEvent(zinc_js, op->node, "click"))
+			{
+				gx.relayout = TRUE;
+				if (zinc_js->navigate)
+				{
+					GxNavTo(StrNew(zinc_js->navigate));
+					zinc_js->navigate = NULL;
+				}
+				return;
+			}
+		}
 		if (op->type == GXO_WIDGET)
 		{
 			switch (op->wkind)
@@ -1545,12 +1575,14 @@ U0 GxClickContent(I64 x, I64 y)
 						if (!JsRun(zinc_js, s))
 							ZincJsNote;
 						gx.relayout = TRUE;
-						if (zinc_js->navigate)
-						{
-							GxNavTo(StrNew(zinc_js->navigate));
-							zinc_js->navigate = NULL;
-							return;
-						}
+					}
+					if (zinc_js)
+						JsDispatchEvent(zinc_js, op->node, "click");
+					if (zinc_js && zinc_js->navigate)
+					{
+						GxNavTo(StrNew(zinc_js->navigate));
+						zinc_js->navigate = NULL;
+						return;
 					}
 					sub = ZincFormSubmitUrl(op->node);
 					if (sub)
@@ -1563,11 +1595,13 @@ U0 GxClickContent(I64 x, I64 y)
 						if (!JsRun(zinc_js, s))
 							ZincJsNote;
 						gx.relayout = TRUE; //DOM likely changed (innerHTML etc).
-						if (zinc_js->navigate)
-						{
-							GxNavTo(StrNew(zinc_js->navigate));
-							zinc_js->navigate = NULL;
-						}
+					}
+					if (zinc_js && JsDispatchEvent(zinc_js, op->node, "click"))
+						gx.relayout = TRUE;
+					if (zinc_js && zinc_js->navigate)
+					{
+						GxNavTo(StrNew(zinc_js->navigate));
+						zinc_js->navigate = NULL;
 					}
 					break;
 			}
@@ -1964,6 +1998,23 @@ public U0 ZincGX(U8 *start_url=NULL)
 					GxNavTo(StrNew(zinc_js->navigate));
 					zinc_js->navigate = NULL;
 				}
+			}
+		}
+
+		//Event loop: fire due setTimeout/setInterval callbacks and deliver
+		//completed async XMLHttpRequest results. Only touch it once any timer
+		//has ever been scheduled. A callback may mutate the DOM (relayout) or
+		//assign location.href (navigate), same as a click handler.
+		if (zinc_js && zinc_js->timers)
+		{
+			zinc_js->dom_dirty = FALSE;
+			JsEventLoopPump(zinc_js);
+			if (zinc_js->dom_dirty)
+				gx.relayout = TRUE;
+			if (zinc_js->navigate)
+			{
+				GxNavTo(StrNew(zinc_js->navigate));
+				zinc_js->navigate = NULL;
 			}
 		}
 

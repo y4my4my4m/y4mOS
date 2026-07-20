@@ -52,17 +52,17 @@ U8 *zinc_welcome =
 	"<p>A small web browser for <b>ZealOS</b>: HTML, a CSS subset, a JS "
 	"subset, GET forms, http and https (TLS 1.3, unverified certs).</p>"
 	"<p class=dim>Tip: click the address bar and type an address "
-	"(<b>example.com</b>) or just a <b>search</b> - plain words go straight "
-	"to Google. For clean no-JavaScript results, type <b>frogfind.com</b>.</p>"
+	"(<b>example.com</b>) or just a <b>search</b> - plain words are sent to "
+	"DuckDuckGo. A typed URL always goes to that site unchanged.</p>"
 	"<hr>"
 	"<ul>"
-	"<li><a href=\"https://www.google.com/\">Google</a> (default search)</li>"
-	"<li><a href=\"http://frogfind.com/\">FrogFind</a> no-JS search engine</li>"
+	"<li><a href=\"https://duckduckgo.com/\">DuckDuckGo</a> (default search)</li>"
+	"<li><a href=\"http://frogfind.com/\">FrogFind</a> no-JS reader search</li>"
 	"<li><a href=\"http://textfiles.com/\">textfiles.com</a></li>"
 	"<li><a href=\"http://info.cern.ch/\">info.cern.ch</a> the first website</li>"
 	"<li><a href=\"https://example.com/\">example.com</a> https test</li>"
 	"</ul>"
-	"<form action=\"https://www.google.com/search\">"
+	"<form action=\"https://html.duckduckgo.com/html/\">"
 	"Search: <input type=text name=q> <input type=submit value=Go>"
 	"</form>"
 	"<hr>"
@@ -831,15 +831,16 @@ Bool ZincAllDigits(U8 *s)
 	return TRUE;
 }
 
-// Default search engine for plain-text queries typed in the address bar.
-// A bare query goes straight to Google -- no proxy, no rewrite: google is
-// google. %s is replaced with the URL-encoded query. Google's results page
-// leans heavily on JavaScript, so it renders thin until the JS engine grows;
-// swap in a lighter engine here if you prefer readable no-JS results:
-//   "http://frogfind.com/?q=%s"                (HTTP, clean no-JS HTML)
-//   "https://lite.duckduckgo.com/lite/?q=%s"   (HTTPS, minimal markup)
-//   "https://html.duckduckgo.com/html/?q=%s"
-U8 *zinc_search_url = "https://www.google.com/search?q=%s";
+// Default search engine for plain-text queries typed in the address bar. This
+// is NOT a proxy: a typed URL (google.com, frogfind.com) goes to that site
+// unchanged; only a bare query is sent here. DuckDuckGo's HTML endpoint returns
+// static markup with real result links, so it renders cleanly in this engine.
+// %s is replaced with the URL-encoded query. Swap in a different engine:
+//   "https://lite.duckduckgo.com/lite/?q=%s"   (even lighter markup)
+//   "http://frogfind.com/?q=%s"                (HTTP, no-JS reader)
+//   "https://www.google.com/search?q=%s"       (real google; renders thin
+//                                               until the JS engine grows)
+U8 *zinc_search_url = "https://html.duckduckgo.com/html/?q=%s";
 
 U8 *ZincUrlEncode(U8 *s)
 { // percent-encode a query for use in a URL; MAlloc'ed. Space -> '+'.

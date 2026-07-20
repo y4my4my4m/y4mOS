@@ -10,11 +10,15 @@
 	  document.write, document.title, document.getElementById, element
 	  innerHTML/textContent/value/checked/className/style.X, get/setAttribute,
 	  location.href (assignment navigates), alert, console.log, Math.*,
-	  parseInt, parseFloat, String, Number, isNaN, Date.now, setTimeout
-	  (fires immediately, once).
+	  parseInt, parseFloat, String, Number, isNaN, Date.now.
+	Async + events (need the front-end to call JsEventLoopPump / JsDispatchEvent):
+	  setTimeout/setInterval/clearTimeout/clearInterval (real, deferred),
+	  addEventListener/removeEventListener, el.onclick = function, and
+	  XMLHttpRequest (open/send/responseText/status/onload/onreadystatechange;
+	  the fetch is synchronous under the hood, callbacks fire on the next pump).
 	Not supported (script just errors out harmlessly): closures over nested
 	scopes, regex literals, for-in/of, arrow functions, classes, try/catch,
-	bitwise ops, prototypes, el.onclick = function (use the onclick attr).
+	bitwise ops, prototypes, fetch()/Promise.
 
 	All interpreter memory comes from a per-page arena freed in one shot by
 	JsInterpFree. Execution has step and call-depth budgets, so hostile or
@@ -46,6 +50,7 @@
 #define JSO_WINDOW		3
 #define JSO_ELEMENT		4
 #define JSO_STYLE		5
+#define JSO_XHR			6
 
 /* native function ids */
 #define JSN_ALERT			1
@@ -79,6 +84,18 @@
 #define JSN_ARR_INDEXOF		42
 #define JSN_EL_GETATTR		50
 #define JSN_EL_SETATTR		51
+#define JSN_EL_ADDLISTEN	52
+#define JSN_EL_REMLISTEN	53
+/* event loop + async (added to run dynamic pages) */
+#define JSN_SETINTERVAL		60
+#define JSN_CLEARTIMER		61
+#define JSN_XHR_NEW			62
+#define JSN_XHR_OPEN		63
+#define JSN_XHR_SEND		64
+#define JSN_XHR_SETREQHDR	65
+#define JSN_XHR_GETALLHDR	66
+#define JSN_XHR_GETHDR		67
+#define JSN_EVT_NOOP		68	// preventDefault / stopPropagation
 
 /* token types */
 #define JT_EOF		0
@@ -164,6 +181,28 @@ class CJsVal
 	I64		 count, cap;
 };
 
+class CJsTimer
+{ // one setTimeout/setInterval registration, or a pending async-XHR callback
+	CJsTimer *next;
+	I64		  id;
+	CJsVal	 *fn;		// callback (JV_FUNC/JV_NATIVE); NULL for is_xhr timers
+	CJsVal	 *this_val;	// 'this' for the callback (the XHR object, or NULL)
+	F64		  due;		// tS at which it fires
+	F64		  interval;	// repeat period in seconds; 0 = one-shot
+	Bool	  active;
+	Bool	  is_xhr;	// fire the XHR object's onreadystatechange/onload instead
+};
+
+class CJsListener
+{ // an addEventListener registration, or an el.onX = fn property handler
+	CJsListener *next;
+	CZNode		*node;	// element the handler is bound to
+	U8			*type;	// "click", "input", ... (no "on" prefix)
+	CJsVal		*fn;
+	Bool		 active;
+	Bool		 is_prop; // set via el.onX= (replaces prior); FALSE = addEventListener
+};
+
 class CJsNode
 {
 	I64		 type;
@@ -204,6 +243,9 @@ class CJsInterp
 	Bool	 has_err;
 	CJsTok	*toks;
 	I64		 tok_count, pos;
+	CJsTimer	*timers;		// setTimeout/setInterval/async-XHR queue
+	CJsListener	*listeners;		// addEventListener + el.onX handlers
+	I64			 next_timer_id;
 };
 
 /* forward declarations for the recursive parser/evaluator */
@@ -213,6 +255,9 @@ extern CJsNode *JsParseFunc(CJsInterp *ji, Bool need_name);
 extern CJsVal  *JsEval(CJsInterp *ji, CJsNode *node);
 extern CJsVal  *JsCall(CJsInterp *ji, CJsVal *fn, CJsVal *this_val,
 					   CJsVal **args, I64 argc);
+// JsMemberSet (el.onX = fn) registers a listener; the definition is far below.
+extern CJsListener *JsListenerAdd(CJsInterp *ji, CZNode *node, U8 *type,
+								  CJsVal *fn, Bool is_prop);
 
 /* ---- arena ---- */
 
@@ -1501,9 +1546,28 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				return JsNativeV(ji, JSN_EL_GETATTR);
 			if (!StrCompare(name, "setAttribute"))
 				return JsNativeV(ji, JSN_EL_SETATTR);
+			if (!StrCompare(name, "addEventListener"))
+				return JsNativeV(ji, JSN_EL_ADDLISTEN);
+			if (!StrCompare(name, "removeEventListener"))
+				return JsNativeV(ji, JSN_EL_REMLISTEN);
 			attr = ZNodeAttr(node, name);
 			if (attr)
 				return JsStrV(ji, attr);
+			return JsUndefV(ji);
+		case JSO_XHR:
+			if (!StrCompare(name, "open"))
+				return JsNativeV(ji, JSN_XHR_OPEN);
+			if (!StrCompare(name, "send"))
+				return JsNativeV(ji, JSN_XHR_SEND);
+			if (!StrCompare(name, "setRequestHeader"))
+				return JsNativeV(ji, JSN_XHR_SETREQHDR);
+			if (!StrCompare(name, "getAllResponseHeaders"))
+				return JsNativeV(ji, JSN_XHR_GETALLHDR);
+			if (!StrCompare(name, "getResponseHeader"))
+				return JsNativeV(ji, JSN_XHR_GETHDR);
+			v = JsPropGet(obj, name); // readyState/status/responseText/onload/...
+			if (v)
+				return v;
 			return JsUndefV(ji);
 	}
 
@@ -1573,6 +1637,9 @@ U0 JsMemberSet(CJsInterp *ji, CJsVal *obj, U8 *name, CJsVal *val)
 				ZNodeAttrSet(node, "class", JsToStr(ji, val));
 				ji->dom_dirty = TRUE;
 			}
+			else if (name[0] == 'o' && name[1] == 'n' && name[2] &&
+					 (val->type == JV_FUNC || val->type == JV_NATIVE))
+				JsListenerAdd(ji, node, name + 2, val, TRUE); // onclick -> "click"
 			else
 			{
 				ZNodeAttrSet(node, name, JsToStr(ji, val));
@@ -1994,15 +2061,296 @@ CJsVal *JsArgOr(CJsInterp *ji, CJsVal **args, I64 argc, I64 i)
 	return JsUndefV(ji);
 }
 
+/* ---- event loop, events, and XMLHttpRequest ----
+   These give the interpreter what dynamic pages assume: timers that fire later,
+   event handlers that fire on user interaction, and JS-driven network requests.
+   Callbacks are invoked from JsEventLoopPump / JsDispatchEvent, which the
+   browser front-end (ZincGX) calls each frame and on clicks. JsCall is
+   forward-declared above. */
+
+CJsVal *JsEventObj(CJsInterp *ji, CZNode *node, U8 *type)
+{ // the minimal Event passed to a handler
+	CJsVal *e = JsValNew(ji, JV_OBJ);
+
+	JsPropSet(ji, e, "type", JsStrV(ji, type));
+	if (node)
+		JsPropSet(ji, e, "target", JsElemV(ji, node));
+	JsPropSet(ji, e, "preventDefault",  JsNativeV(ji, JSN_EVT_NOOP));
+	JsPropSet(ji, e, "stopPropagation", JsNativeV(ji, JSN_EVT_NOOP));
+	return e;
+}
+
+CJsTimer *JsTimerAdd(CJsInterp *ji, CJsVal *fn, CJsVal *this_val,
+					 F64 ms, Bool repeat, Bool is_xhr)
+{
+	CJsTimer *t = JsAlloc(ji, sizeof(CJsTimer))(CJsTimer *);
+
+	t->id = ++ji->next_timer_id;
+	t->fn = fn;
+	t->this_val = this_val;
+	if (ms < 0.0)
+		ms = 0.0;
+	t->due = tS + ms / 1000.0;
+	if (repeat)
+	{
+		t->interval = ms / 1000.0;
+		if (t->interval < 0.004)
+			t->interval = 0.004; // throttle a runaway setInterval(fn, 0)
+	}
+	else
+		t->interval = 0.0;
+	t->is_xhr = is_xhr;
+	t->active = TRUE;
+	t->next = ji->timers;
+	ji->timers = t;
+	return t;
+}
+
+U0 JsTimerClear(CJsInterp *ji, I64 id)
+{
+	CJsTimer *t = ji->timers;
+
+	while (t)
+	{
+		if (t->id == id)
+		{
+			t->active = FALSE;
+			return;
+		}
+		t = t->next;
+	}
+}
+
+CJsListener *JsListenerAdd(CJsInterp *ji, CZNode *node, U8 *type,
+						   CJsVal *fn, Bool is_prop)
+{
+	CJsListener *l;
+
+	if (!node || !fn || (fn->type != JV_FUNC && fn->type != JV_NATIVE))
+		return NULL;
+
+	if (is_prop)
+	{ // el.onX = fn replaces any earlier el.onX handler of the same type
+		l = ji->listeners;
+		while (l)
+		{
+			if (l->active && l->is_prop && l->node == node &&
+				!StrCompare(l->type, type))
+				l->active = FALSE;
+			l = l->next;
+		}
+	}
+
+	l = JsAlloc(ji, sizeof(CJsListener))(CJsListener *);
+	l->node = node;
+	l->type = JsStrDup(ji, type);
+	l->fn = fn;
+	l->is_prop = is_prop;
+	l->active = TRUE;
+	l->next = ji->listeners;
+	ji->listeners = l;
+	return l;
+}
+
+U0 JsListenerRemove(CJsInterp *ji, CZNode *node, U8 *type, CJsVal *fn)
+{
+	CJsListener *l = ji->listeners;
+
+	while (l)
+	{
+		if (l->active && l->node == node && !StrCompare(l->type, type) &&
+			l->fn == fn)
+			l->active = FALSE;
+		l = l->next;
+	}
+}
+
+U0 JsXhrFire(CJsInterp *ji, CJsVal *xhr)
+{ // deliver a completed request: onreadystatechange, then onload/onerror
+	CJsVal *cb, *st;
+	I64		status = 0;
+
+	if (!xhr || xhr->type != JV_OBJ)
+		return;
+	st = JsPropGet(xhr, "status");
+	if (st)
+		status = JsToNum(st);
+
+	cb = JsPropGet(xhr, "onreadystatechange");
+	if (cb && (cb->type == JV_FUNC || cb->type == JV_NATIVE))
+	{
+		ji->steps = 0; ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
+		JsCall(ji, cb, xhr, NULL, 0);
+	}
+
+	if (status > 0)
+		cb = JsPropGet(xhr, "onload");
+	else
+		cb = JsPropGet(xhr, "onerror");
+	if (cb && (cb->type == JV_FUNC || cb->type == JV_NATIVE))
+	{
+		ji->steps = 0; ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
+		JsCall(ji, cb, xhr, NULL, 0);
+	}
+
+	if (ji->has_err)
+	{
+		NetLog("%s", ji->err);
+		ji->has_err = FALSE;
+	}
+}
+
+U0 JsXhrSend(CJsInterp *ji, CJsVal *xhr, CJsVal *body_val)
+{ // resolve the URL against the page, fetch, then stash the result on the XHR.
+  // The fetch is synchronous here (the net stack is already blocking); async
+  // requests just defer their callbacks to the next event-loop pump.
+	U8			  *method = NULL, *url, *abs = NULL, *body = NULL;
+	CJsVal		  *pm, *pu, *pa;
+	CHttpUrl	   base;
+	CHttpResponse *r;
+	Bool		   is_async = TRUE;
+
+	if (!xhr || xhr->type != JV_OBJ)
+		return;
+	pu = JsPropGet(xhr, "_url");
+	if (!pu)
+	{ // send() before open(): report a failed, completed request
+		JsPropSet(ji, xhr, "status", JsNumV(ji, 0));
+		JsPropSet(ji, xhr, "readyState", JsNumV(ji, 4));
+		JsXhrFire(ji, xhr);
+		return;
+	}
+	url = JsToStr(ji, pu);
+	pm = JsPropGet(xhr, "_method");
+	if (pm)
+		method = JsToStr(ji, pm);
+	pa = JsPropGet(xhr, "_async");
+	if (pa && !JsToBool(pa))
+		is_async = FALSE;
+
+	if (HttpUrlParse(ji->url, &base) >= 0)
+		abs = HttpUrlResolve(&base, url);
+	if (!abs)
+		abs = StrNew(url);
+
+	if (body_val && body_val->type != JV_UNDEF && body_val->type != JV_NULL)
+		body = JsToStr(ji, body_val);
+
+	if (method && !StrICompare(method, "POST") && body)
+		r = HttpPost(abs, body);
+	else
+		r = HttpGet(abs);
+	Free(abs);
+
+	if (r)
+	{
+		JsPropSet(ji, xhr, "status", JsNumV(ji, r->status));
+		JsPropSet(ji, xhr, "responseText", JsStrV(ji, r->body));
+		JsPropSet(ji, xhr, "response", JsStrV(ji, r->body));
+		if (r->headers)
+			JsPropSet(ji, xhr, "_respHeaders", JsStrV(ji, r->headers));
+		JsPropSet(ji, xhr, "readyState", JsNumV(ji, 4));
+		HttpResponseFree(r);
+	}
+	else
+	{
+		JsPropSet(ji, xhr, "status", JsNumV(ji, 0));
+		JsPropSet(ji, xhr, "readyState", JsNumV(ji, 4));
+	}
+
+	if (is_async)
+		JsTimerAdd(ji, NULL, xhr, 0.0, FALSE, TRUE); // fire callbacks next pump
+	else
+		JsXhrFire(ji, xhr);
+}
+
+Bool JsDispatchEvent(CJsInterp *ji, CZNode *node, U8 *type)
+{ // fire every active handler bound to (node, type). Returns TRUE if any ran.
+	CJsListener *l;
+	CJsVal		*evt, *a1;
+	Bool		 ran = FALSE;
+
+	if (!ji || !node || !type)
+		return FALSE;
+
+	evt = JsEventObj(ji, node, type);
+	l = ji->listeners;
+	while (l)
+	{
+		if (l->active && l->node == node && !StrCompare(l->type, type))
+		{
+			ji->has_err = FALSE;
+			ji->steps = 0; ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
+			a1 = evt;
+			JsCall(ji, l->fn, JsElemV(ji, node), &a1, 1);
+			ran = TRUE;
+			if (ji->has_err)
+			{
+				NetLog("%s", ji->err);
+				ji->has_err = FALSE;
+			}
+		}
+		l = l->next;
+	}
+	if (ran)
+		JsFlushWrites(ji);
+	return ran;
+}
+
+U0 JsEventLoopPump(CJsInterp *ji)
+{ // fire timers whose deadline has passed and deliver completed async XHRs.
+  // Bounded per call so a storm of 0ms timers cannot wedge the frame.
+	CJsTimer *t;
+	I64		  fired = 0;
+	F64		  now;
+
+	if (!ji)
+		return;
+	now = tS;
+	t = ji->timers;
+	while (t && fired < 256)
+	{
+		if (t->active && now >= t->due)
+		{
+			ji->has_err = FALSE;
+			ji->steps = 0; ji->depth = 0; ji->flow = JF_NORMAL; ji->env = ji->genv;
+			if (t->is_xhr)
+			{
+				t->active = FALSE;
+				JsXhrFire(ji, t->this_val);
+			}
+			else
+			{
+				if (t->interval > 0.0)
+					t->due = now + t->interval;
+				else
+					t->active = FALSE;
+				if (t->fn)
+					JsCall(ji, t->fn, t->this_val, NULL, 0);
+			}
+			fired++;
+			if (ji->has_err)
+			{
+				NetLog("%s", ji->err);
+				ji->has_err = FALSE;
+			}
+		}
+		t = t->next;
+	}
+	if (fired)
+		JsFlushWrites(ji);
+}
+
 CJsVal *JsCallNative(CJsInterp *ji, I64 id, CJsVal *this_val,
 					 CJsVal **args, I64 argc)
 {
 	U8	 buf[1024];
 	U8	*s, *sep;
 	I64	 i, a, b, len;
-	F64	 best;
+	F64	 best, ms;
 	CJsVal *v;
 	CZNode *node;
+	CJsTimer *t;
 
 	switch (id)
 	{
@@ -2057,10 +2405,27 @@ CJsVal *JsCallNative(CJsInterp *ji, I64 id, CJsVal *this_val,
 		case JSN_DATE_NOW:
 			return JsNumV(ji, tS * 1000.0);
 		case JSN_SETTIMEOUT:
+		case JSN_SETINTERVAL:
 			v = JsArgOr(ji, args, argc, 0);
 			if (v->type == JV_FUNC || v->type == JV_NATIVE)
-				JsCall(ji, v, NULL, NULL, 0); // fires now, once
+			{
+				ms = 0.0;
+				if (argc > 1)
+					ms = JsToNum(args[1]);
+				t = JsTimerAdd(ji, v, NULL, ms, id == JSN_SETINTERVAL, FALSE);
+				return JsNumV(ji, t->id);
+			}
 			return JsNumV(ji, 0);
+		case JSN_CLEARTIMER:
+			JsTimerClear(ji, JsToNum(JsArgOr(ji, args, argc, 0)));
+			return JsUndefV(ji);
+		case JSN_XHR_NEW:
+			v = JsValNew(ji, JV_OBJ);
+			v->native_id = JSO_XHR;
+			JsPropSet(ji, v, "readyState", JsNumV(ji, 0));
+			JsPropSet(ji, v, "status", JsNumV(ji, 0));
+			JsPropSet(ji, v, "responseText", JsStrV(ji, ""));
+			return v;
 		case JSN_MATH_FLOOR:
 			return JsNumV(ji, Floor(JsToNum(JsArgOr(ji, args, argc, 0))));
 		case JSN_MATH_CEIL:
@@ -2215,6 +2580,43 @@ CJsVal *JsCallNative(CJsInterp *ji, I64 id, CJsVal *this_val,
 				ji->dom_dirty = TRUE;
 			}
 			return JsUndefV(ji);
+		case JSN_EL_ADDLISTEN:
+			if (this_val->type == JV_OBJ && this_val->node && argc >= 2)
+				JsListenerAdd(ji, this_val->node, JsToStr(ji, args[0]),
+							  args[1], FALSE);
+			return JsUndefV(ji);
+		case JSN_EL_REMLISTEN:
+			if (this_val->type == JV_OBJ && this_val->node && argc >= 2)
+				JsListenerRemove(ji, this_val->node, JsToStr(ji, args[0]), args[1]);
+			return JsUndefV(ji);
+		case JSN_XHR_OPEN:
+			if (this_val->type == JV_OBJ)
+			{
+				JsPropSet(ji, this_val, "_method",
+						  JsStrV(ji, JsToStr(ji, JsArgOr(ji, args, argc, 0))));
+				JsPropSet(ji, this_val, "_url",
+						  JsStrV(ji, JsToStr(ji, JsArgOr(ji, args, argc, 1))));
+				b = TRUE; // async unless the 3rd arg is explicitly false
+				if (argc > 2 && !JsToBool(args[2]))
+					b = FALSE;
+				JsPropSet(ji, this_val, "_async", JsBoolV(ji, b));
+				JsPropSet(ji, this_val, "readyState", JsNumV(ji, 1));
+			}
+			return JsUndefV(ji);
+		case JSN_XHR_SEND:
+			JsXhrSend(ji, this_val, JsArgOr(ji, args, argc, 0));
+			return JsUndefV(ji);
+		case JSN_XHR_SETREQHDR:
+			return JsUndefV(ji); // request headers not threaded through HttpGet yet
+		case JSN_XHR_GETALLHDR:
+			v = JsPropGet(this_val, "_respHeaders");
+			if (v)
+				return v;
+			return JsStrV(ji, "");
+		case JSN_XHR_GETHDR:
+			return JsNullV(ji); // minimal: no single-header lookup yet
+		case JSN_EVT_NOOP:
+			return JsUndefV(ji);
 	}
 
 	JsErr(ji, "unknown native");
@@ -2343,8 +2745,11 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsGlobalNative(ji, "String",	 JSN_STRING);
 	JsGlobalNative(ji, "Number",	 JSN_NUMBER);
 	JsGlobalNative(ji, "isNaN",		 JSN_ISNAN);
-	JsGlobalNative(ji, "setTimeout", JSN_SETTIMEOUT);
-	JsGlobalNative(ji, "setInterval",JSN_SETTIMEOUT);
+	JsGlobalNative(ji, "setTimeout",	JSN_SETTIMEOUT);
+	JsGlobalNative(ji, "setInterval",	JSN_SETINTERVAL);
+	JsGlobalNative(ji, "clearTimeout",	JSN_CLEARTIMER);
+	JsGlobalNative(ji, "clearInterval",	JSN_CLEARTIMER);
+	JsGlobalNative(ji, "XMLHttpRequest",JSN_XHR_NEW);
 
 	return ji;
 }
