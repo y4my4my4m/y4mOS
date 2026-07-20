@@ -177,11 +177,12 @@ U0 SSHSessionTeardown()
 }
 
 public U0 SSH(U8 *host=NULL, U16 port=22, U8 *user=NULL)
-{ /* Interactive SSH shell. Prompts for anything not supplied.
-	  SSH;  SSH("host");  SSH("host", 2222, "root");
-	  Shift+Esc quits. NOTE: the password prompt is not masked. */
+{ /* Interactive SSH shell. Prompts for anything not supplied. If a key is
+	loaded (SSHKeyGen/SSHKeyLoad), tries publickey auth first, else password.
+	  SSH;  SSH("host");  SSH("host", 2222, "root");   Shift+Esc quits. */
 	U8	host_buf[128], user_buf[64], pass_buf[128];
 	U8	*tmp;
+	Bool authed = FALSE;
 
 	if (host == NULL)
 	{
@@ -197,18 +198,27 @@ public U0 SSH(U8 *host=NULL, U16 port=22, U8 *user=NULL)
 		StrCopy(user_buf, tmp); Free(tmp);
 		user = user_buf;
 	}
-	tmp = PopUpGetStr("Password (shown in the clear):");
-	if (!tmp) { "No password.\n"; return; }
-	StrCopy(pass_buf, tmp); Free(tmp);
 
 	"$$LTBLUE$$Connecting to %s:%d...$$FG$$\n", host, port;
 	ssh_conn = SSHTransportConnect(host, port);
 	if (!ssh_conn)			{ "$$RED$$Transport handshake failed.$$FG$$\n"; return; }
 	if (SSHServiceRequest(ssh_conn, "ssh-userauth") < 0)
 							{ "$$RED$$Service request failed.$$FG$$\n"; SSHSessionTeardown; return; }
-	if (!SSHAuthPassword(ssh_conn, user, pass_buf))
-							{ "$$RED$$Authentication failed.$$FG$$\n"; SSHSessionTeardown; return; }
-	MemSet(pass_buf, 0, sizeof(pass_buf));	// don't linger in memory
+
+	if (ssh_agent_loaded)
+	{ // try the loaded Ed25519 key first
+		"Trying publickey auth...\n";
+		authed = SSHAuthPubkey(ssh_conn, user, ssh_agent_sk, ssh_agent_pk);
+	}
+	if (!authed)
+	{ // fall back to password
+		tmp = PopUpGetStr("Password (shown in the clear):");
+		if (!tmp) { "No password.\n"; SSHSessionTeardown; return; }
+		StrCopy(pass_buf, tmp); Free(tmp);
+		authed = SSHAuthPassword(ssh_conn, user, pass_buf);
+		MemSet(pass_buf, 0, sizeof(pass_buf));	// don't linger in memory
+	}
+	if (!authed)			{ "$$RED$$Authentication failed.$$FG$$\n"; SSHSessionTeardown; return; }
 
 	ssh_chan = SSHChannelOpen(ssh_conn);
 	if (!ssh_chan)			{ "$$RED$$Channel open failed.$$FG$$\n"; SSHSessionTeardown; return; }

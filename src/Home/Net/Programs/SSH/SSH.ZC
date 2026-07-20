@@ -10,6 +10,9 @@
 Cd(__DIR__);;
 
 #include "SSHTransport"
-#include "SSHAuth"
+#include "SSHSHA512"		// SHA-512, needed by Ed25519
+#include "SSHEd25519"		// Ed25519 sign/keygen (pubkey auth)
+#include "SSHAuth"			// password + publickey userauth
 #include "SSHChannel"
+#include "SSHKeyGen"		// keygen + storage + in-memory agent
 #include "SSHTerminal"

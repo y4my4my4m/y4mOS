@@ -13,6 +13,8 @@
 #define GIT_OBJ_OFS_DELTA	6
 #define GIT_OBJ_REF_DELTA	7
 
+Bool git_abort = FALSE;		// set by Esc during unpack/checkout to cancel a clone
+
 class CGitObj
 {
 	I64		type;			// final type 1..4 (after delta resolve), or raw 6/7 until then
@@ -103,6 +105,35 @@ I64 GitDeltaVarint(U8 *p, I64 *val_out)
 U32 GitU32BE(U8 *p)
 {
 	return p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3];
+}
+
+U0 GitRepoName(U8 *url, U8 *out)
+{ // last path segment of the URL, minus a trailing "/" or ".git"
+	I64 len = StrLen(url), end, start, i, j;
+
+	end = len;
+	while (end > 0 && url[end-1] == '/')
+		end--;
+	if (end >= 4 && url[end-4] == '.' && url[end-3] == 'g' &&
+		url[end-2] == 'i' && url[end-1] == 't')
+		end -= 4;
+	start = end;
+	while (start > 0 && url[start-1] != '/')
+		start--;
+	j = 0;
+	for (i = start; i < end && j < 127; i++)
+		out[j++] = url[i];
+	out[j] = 0;
+	if (j == 0)
+		StrCopy(out, "repo");
+}
+
+Bool GitCheckCancel()
+{ // poll Esc; TRUE once the user asks to cancel
+	I64 ch, sc;
+	if (KeyScan(&ch, &sc, FALSE) && (ch == CH_ESC || ch == CH_SHIFT_ESC))
+		git_abort = TRUE;
+	return git_abort;
 }
 
 // --- lookups (return an index into objs[], or -1) --------------------------
@@ -238,6 +269,11 @@ I64 GitUnpack(U8 *pack, I64 pack_len, CGitObj **objs_out, I64 *nobj_out)
 
 	for (i = 0; i < nobj; i++)
 	{
+		if (GitCheckCancel())
+		{ NetErr("git: unpack cancelled."); *objs_out = objs; *nobj_out = i; return -1; }
+		if (nobj >= 200 && !(i % (nobj / 20)))
+			"  inflating %d/%d\n", i, nobj;
+
 		objs[i].pack_offset = pos;
 		objs[i].base_offset = -1;
 
@@ -284,13 +320,19 @@ I64 GitUnpack(U8 *pack, I64 pack_len, CGitObj **objs_out, I64 *nobj_out)
 	}
 
 	// resolve deltas (recursive; bases may themselves be deltas)
+	if (nobj >= 200)
+		"  resolving deltas...\n";
 	for (i = 0; i < nobj; i++)
+	{
+		if (GitCheckCancel())
+		{ NetErr("git: unpack cancelled."); *objs_out = objs; *nobj_out = nobj; return -1; }
 		if (!objs[i].resolved && GitResolve(objs, nobj, i) < 0)
 		{
 			*objs_out = objs;
 			*nobj_out = nobj;
 			return -1;
 		}
+	}
 
 	*objs_out = objs;
 	*nobj_out = nobj;
@@ -320,7 +362,7 @@ I64 GitWriteTree(CGitObj *objs, I64 nobj, U8 *tree_sha, U8 *dir)
 	}
 
 	p = 0;
-	while (p < tree->size)
+	while (p < tree->size && !git_abort)
 	{
 		// entry = "<mode> <name>\0<20-byte sha>"
 		i = 0;
@@ -338,18 +380,21 @@ I64 GitWriteTree(CGitObj *objs, I64 nobj, U8 *tree_sha, U8 *dir)
 
 		child = MStrPrint("%s/%s", dir, name);
 
-		if (!StrCmp(mode, "40000"))
+		if (!StrCompare(mode, "40000"))
 		{ // subdirectory
 			DirMake(child);
 			if (ei >= 0)
 				GitWriteTree(objs, nobj, objs[ei].sha, child);
 		}
-		else if (!StrCmp(mode, "160000"))
+		else if (!StrCompare(mode, "160000"))
 			; // gitlink (submodule): no content in this pack, skip
 		else if (ei >= 0)
 		{ // blob (regular file, executable, or symlink) -> write bytes
 			FileWrite(child, objs[ei].data, objs[ei].size);
+			"  %s\n", child;			// show the checkout progress
 			nfiles++;
+			if (GitCheckCancel())
+			{ Free(child); return nfiles; }
 		}
 		Free(child);
 	}
@@ -393,38 +438,70 @@ U0 GitFreeObjs(CGitObj *objs, I64 nobj)
 	Free(objs);
 }
 
-public U0 GitClone(U8 *base, U8 *dir="::/Tmp/GitClone")
+public U0 GitClone(U8 *base, U8 *dir=NULL)
 { /* Full clone over HTTPS: fetch pack, unpack, check out the working tree.
-	  GitClone("https://github.com/user/repo");
-	  GitClone("https://host/user/repo", "::/Home/repo"); */
+	  By default clones into <current dir>/<repo name>. Press Esc during
+	  unpack/checkout to cancel.
+	  GitClone("https://github.com/user/repo");            // -> ./repo
+	  GitClone("https://host/user/repo", "::/Home/repo");  // explicit dir */
 	CGitRef	*refs = MAlloc(sizeof(CGitRef) * 512);
 	CGitObj	*objs = NULL;
-	U8		*head, *pack;
+	U8		*head, *pack, *cwd, *msg;
 	U8		 head_bin[20];
+	U8		 reponame[128], target[512];
 	I64		 n, pack_len, nobj, nfiles;
 
-	"$$LTBLUE$$--- git clone %s -> %s ---$$FG$$\n", base, dir;
+	// --- decide the target directory --------------------------------------
+	if (dir)
+		StrCopy(target, dir);
+	else
+	{
+		GitRepoName(base, reponame);
+		cwd = DirCur();
+		StrPrint(target, "%s/%s", cwd, reponame);
+		Free(cwd);
+	}
+
+	if (IsDir(target))
+	{ // overwrite guard: files would be written into an existing directory
+		msg = MStrPrint("Directory already exists:\n\n  %s\n\nWrite the clone into it anyway?", target);
+		n = PopUpNoYes(msg);
+		Free(msg);
+		if (!n)
+		{ "$$YELLOW$$Clone cancelled (directory exists).$$FG$$\n"; Free(refs); return; }
+	}
+
+	git_abort = FALSE;
+	"$$LTBLUE$$--- git clone %s -> %s ---$$FG$$\n", base, target;
 
 	n = GitLsRemoteInto(base, refs, 512);
 	if (n < 0)			{ "$$RED$$ref discovery failed.$$FG$$\n"; Free(refs); return; }
 	head = GitPickHead(refs, n);
 	if (!head)			{ "$$RED$$no refs.$$FG$$\n"; Free(refs); return; }
-	"HEAD = %s\nFetching pack...\n", head;
+	"HEAD = %s\nFetching pack (Esc cancels once unpacking starts)...\n", head;
 
 	if (GitFetchPack(base, head, &pack, &pack_len) < 0)
 	{ "$$RED$$pack fetch failed.$$FG$$\n"; Free(refs); return; }
 	"Got %d-byte pack. Unpacking...\n", pack_len;
 
 	if (GitUnpack(pack, pack_len, &objs, &nobj) < 0)
-	{ "$$RED$$unpack failed.$$FG$$\n"; if (objs) GitFreeObjs(objs, nobj); Free(pack); Free(refs); return; }
+	{
+		if (git_abort)	"$$YELLOW$$Clone cancelled.$$FG$$\n";
+		else			"$$RED$$unpack failed.$$FG$$\n";
+		if (objs) GitFreeObjs(objs, nobj);
+		Free(pack); Free(refs); return;
+	}
 	"Unpacked %d objects. Writing working tree...\n", nobj;
 
+	DirMake(target);
 	GitHexToBin(head, head_bin, 20);
-	nfiles = GitCheckout(objs, nobj, head_bin, dir);
-	if (nfiles < 0)
+	nfiles = GitCheckout(objs, nobj, head_bin, target);
+	if (git_abort)
+		"$$YELLOW$$Clone cancelled after %d files.$$FG$$\n", nfiles;
+	else if (nfiles < 0)
 		"$$RED$$checkout failed.$$FG$$\n";
 	else
-		"$$GREEN$$Clone complete: %d files under %s$$FG$$\n", nfiles, dir;
+		"$$GREEN$$Clone complete: %d files under %s$$FG$$\n", nfiles, target;
 
 	GitFreeObjs(objs, nobj);
 	Free(pack);

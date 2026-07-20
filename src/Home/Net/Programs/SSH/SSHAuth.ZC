@@ -112,3 +112,63 @@ fail:
 	Free(pl);
 	return FALSE;
 }
+
+Bool SSHAuthPubkey(CSSH *ssh, U8 *user, U8 *sk64, U8 *pk32)
+{ // Ed25519 publickey userauth (RFC 4252 7). sk64 = seed||pub, pk32 = pub.
+  // Needs SSHEd25519 (Ed25519Sign). Returns TRUE on USERAUTH_SUCCESS.
+	U8	*pl	= MAlloc(SSH_MAX_PACKET);
+	U8	*sd	= MAlloc(SSH_MAX_PACKET);	// data to be signed
+	U8	 keyblob[128], sigblob[128], sig[64];
+	I64	 kb = 0, sgb = 0, so = 0, o = 0, len;
+
+	// public key blob = string("ssh-ed25519") + string(pubkey)
+	kb = SSHPutStringZ(keyblob, kb, "ssh-ed25519");
+	kb = SSHPutString(keyblob, kb, pk32, 32);
+
+	// signed data = string(session_id) + the request through the key blob
+	so = SSHPutString(sd, so, ssh->sess_id, 32);
+	so = SSHPutByte(sd, so, SSH_MSG_USERAUTH_REQUEST);
+	so = SSHPutStringZ(sd, so, user);
+	so = SSHPutStringZ(sd, so, "ssh-connection");
+	so = SSHPutStringZ(sd, so, "publickey");
+	so = SSHPutByte(sd, so, 1);
+	so = SSHPutStringZ(sd, so, "ssh-ed25519");
+	so = SSHPutString(sd, so, keyblob, kb);
+
+	Ed25519Sign(sig, sd, so, sk64);
+
+	// signature blob = string("ssh-ed25519") + string(R||S)
+	sgb = SSHPutStringZ(sigblob, sgb, "ssh-ed25519");
+	sgb = SSHPutString(sigblob, sgb, sig, 64);
+
+	// the actual request: same fields + the signature
+	o = SSHPutByte(pl, o, SSH_MSG_USERAUTH_REQUEST);
+	o = SSHPutStringZ(pl, o, user);
+	o = SSHPutStringZ(pl, o, "ssh-connection");
+	o = SSHPutStringZ(pl, o, "publickey");
+	o = SSHPutByte(pl, o, 1);
+	o = SSHPutStringZ(pl, o, "ssh-ed25519");
+	o = SSHPutString(pl, o, keyblob, kb);
+	o = SSHPutString(pl, o, sigblob, sgb);
+	if (SSHPacketSend(ssh, pl, o) < 0)
+		goto pkfail;
+
+	while (TRUE)
+	{
+		if (SSHRecvFiltered(ssh, pl, &len) < 0)
+			goto pkfail;
+		if (len >= 1)
+		{
+			if (pl[0] == SSH_MSG_USERAUTH_SUCCESS)
+			{ Free(pl); Free(sd); return TRUE; }
+			else if (pl[0] == SSH_MSG_USERAUTH_FAILURE)
+			{ NetErr("SSH: pubkey auth rejected."); goto pkfail; }
+			else if (pl[0] != SSH_MSG_USERAUTH_BANNER)
+			{ NetErr("SSH: unexpected pubkey reply msg %d.", pl[0]); goto pkfail; }
+		}
+	}
+pkfail:
+	Free(pl);
+	Free(sd);
+	return FALSE;
+}

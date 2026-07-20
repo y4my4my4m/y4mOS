@@ -130,7 +130,7 @@ Bool SHA1Test()
 
 	SHA1("abc", 3, hash);
 	SHA1HexStr(hash, hex);
-	if (StrCmp(hex, "a9993e364706816aba3e25717850c26c9cd0d89d"))
+	if (StrCompare(hex, "a9993e364706816aba3e25717850c26c9cd0d89d"))
 	{
 		"$$RED$$SHA1 KAT failed ('abc'): %s$$FG$$\n", hex;
 		return FALSE;
@@ -138,7 +138,7 @@ Bool SHA1Test()
 
 	SHA1("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 56, hash);
 	SHA1HexStr(hash, hex);
-	if (StrCmp(hex, "84983e441c3bd26ebaae4aa1f95129e5e54670f1"))
+	if (StrCompare(hex, "84983e441c3bd26ebaae4aa1f95129e5e54670f1"))
 	{
 		"$$RED$$SHA1 KAT failed (2-block): %s$$FG$$\n", hex;
 		return FALSE;

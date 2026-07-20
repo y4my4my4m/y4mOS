@@ -185,11 +185,11 @@ U8 *GitPickHead(CGitRef *refs, I64 n)
 { // choose the sha to fetch: HEAD, else refs/heads/main|master, else first.
 	I64 i;
 	for (i = 0; i < n; i++)
-		if (!StrCmp(refs[i].name, "HEAD"))
+		if (!StrCompare(refs[i].name, "HEAD"))
 			return refs[i].sha;
 	for (i = 0; i < n; i++)
-		if (!StrCmp(refs[i].name, "refs/heads/main") ||
-			!StrCmp(refs[i].name, "refs/heads/master"))
+		if (!StrCompare(refs[i].name, "refs/heads/main") ||
+			!StrCompare(refs[i].name, "refs/heads/master"))
 			return refs[i].sha;
 	if (n > 0)
 		return refs[0].sha;

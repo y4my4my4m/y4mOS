@@ -1,0 +1,157 @@
+// SHA-512 (FIPS 180-4) for y4mOS. Needed by Ed25519 (SSH pubkey auth).
+// ZealOS ships SHA-256 only. U64 is native 64-bit so rotates need no masking.
+
+U64 sha512_k[80] = {
+	0x428A2F98D728AE22, 0x7137449123EF65CD, 0xB5C0FBCFEC4D3B2F, 0xE9B5DBA58189DBBC,
+	0x3956C25BF348B538, 0x59F111F1B605D019, 0x923F82A4AF194F9B, 0xAB1C5ED5DA6D8118,
+	0xD807AA98A3030242, 0x12835B0145706FBE, 0x243185BE4EE4B28C, 0x550C7DC3D5FFB4E2,
+	0x72BE5D74F27B896F, 0x80DEB1FE3B1696B1, 0x9BDC06A725C71235, 0xC19BF174CF692694,
+	0xE49B69C19EF14AD2, 0xEFBE4786384F25E3, 0x0FC19DC68B8CD5B5, 0x240CA1CC77AC9C65,
+	0x2DE92C6F592B0275, 0x4A7484AA6EA6E483, 0x5CB0A9DCBD41FBD4, 0x76F988DA831153B5,
+	0x983E5152EE66DFAB, 0xA831C66D2DB43210, 0xB00327C898FB213F, 0xBF597FC7BEEF0EE4,
+	0xC6E00BF33DA88FC2, 0xD5A79147930AA725, 0x06CA6351E003826F, 0x142929670A0E6E70,
+	0x27B70A8546D22FFC, 0x2E1B21385C26C926, 0x4D2C6DFC5AC42AED, 0x53380D139D95B3DF,
+	0x650A73548BAF63DE, 0x766A0ABB3C77B2A8, 0x81C2C92E47EDAEE6, 0x92722C851482353B,
+	0xA2BFE8A14CF10364, 0xA81A664BBC423001, 0xC24B8B70D0F89791, 0xC76C51A30654BE30,
+	0xD192E819D6EF5218, 0xD69906245565A910, 0xF40E35855771202A, 0x106AA07032BBD1B8,
+	0x19A4C116B8D2D0C8, 0x1E376C085141AB53, 0x2748774CDF8EEB99, 0x34B0BCB5E19B48A8,
+	0x391C0CB3C5C95A63, 0x4ED8AA4AE3418ACB, 0x5B9CCA4F7763E373, 0x682E6FF3D6B2B8A3,
+	0x748F82EE5DEFB2FC, 0x78A5636F43172F60, 0x84C87814A1F0AB72, 0x8CC702081A6439EC,
+	0x90BEFFFA23631E28, 0xA4506CEBDE82BDE9, 0xBEF9A3F7B2C67915, 0xC67178F2E372532B,
+	0xCA273ECEEA26619C, 0xD186B8C721C0C207, 0xEADA7DD6CDE0EB1E, 0xF57D4F7FEE6ED178,
+	0x06F067AA72176FBA, 0x0A637DC5A2C898A6, 0x113F9804BEF90DAE, 0x1B710B35131C471B,
+	0x28DB77F523047D84, 0x32CAAB7B40C72493, 0x3C9EBE0A15C9BEBC, 0x431D67C49C100D4C,
+	0x4CC5D4BECB3E42B6, 0x597F299CFC657E2A, 0x5FCB6FAB3AD6FAEC, 0x6C44198C4A475817 };
+
+U64 sha512_h0[8] = {
+	0x6A09E667F3BCC908, 0xBB67AE8584CAA73B, 0x3C6EF372FE94F82B, 0xA54FF53A5F1D36F1,
+	0x510E527FADE682D1, 0x9B05688C2B3E6C1F, 0x1F83D9ABFB41BD6B, 0x5BE0CD19137E2179 };
+
+class CSHA512
+{
+	U64	h[8];
+	U64	len;			// message length in bytes (< 2^61 assumed; high half of the
+						// 128-bit length is always 0 here)
+	U8	buf[128];
+	I64	buf_used;
+};
+
+U64 SHA512Ror(U64 x, I64 n)
+{
+	return x >> n | x << (64 - n);
+}
+
+U0 SHA512Block(CSHA512 *ctx, U8 *p)
+{
+	U64	w[80];
+	U64	a, b, c, d, e, f, g, hh, t1, t2, s0, s1, ch, maj;
+	I64	t, j;
+
+	for (t = 0; t < 16; t++)
+	{
+		w[t] = 0;
+		for (j = 0; j < 8; j++)
+			w[t] = w[t] << 8 | p[t*8 + j];
+	}
+	for (t = 16; t < 80; t++)
+	{
+		s0 = SHA512Ror(w[t-15], 1)  ^ SHA512Ror(w[t-15], 8)  ^ (w[t-15] >> 7);
+		s1 = SHA512Ror(w[t-2], 19)  ^ SHA512Ror(w[t-2], 61)  ^ (w[t-2] >> 6);
+		w[t] = w[t-16] + s0 + w[t-7] + s1;
+	}
+
+	a = ctx->h[0]; b = ctx->h[1]; c = ctx->h[2]; d = ctx->h[3];
+	e = ctx->h[4]; f = ctx->h[5]; g = ctx->h[6]; hh = ctx->h[7];
+
+	for (t = 0; t < 80; t++)
+	{
+		s1  = SHA512Ror(e, 14) ^ SHA512Ror(e, 18) ^ SHA512Ror(e, 41);
+		ch  = (e & f) ^ (~e & g);
+		t1  = hh + s1 + ch + sha512_k[t] + w[t];
+		s0  = SHA512Ror(a, 28) ^ SHA512Ror(a, 34) ^ SHA512Ror(a, 39);
+		maj = (a & b) ^ (a & c) ^ (b & c);
+		t2  = s0 + maj;
+		hh = g; g = f; f = e; e = d + t1;
+		d = c; c = b; b = a; a = t1 + t2;
+	}
+
+	ctx->h[0] += a; ctx->h[1] += b; ctx->h[2] += c; ctx->h[3] += d;
+	ctx->h[4] += e; ctx->h[5] += f; ctx->h[6] += g; ctx->h[7] += hh;
+}
+
+U0 SHA512Init(CSHA512 *ctx)
+{
+	I64 i;
+	for (i = 0; i < 8; i++)
+		ctx->h[i] = sha512_h0[i];
+	ctx->len = 0;
+	ctx->buf_used = 0;
+}
+
+U0 SHA512Update(CSHA512 *ctx, U8 *data, I64 len)
+{
+	I64 i;
+	for (i = 0; i < len; i++)
+	{
+		ctx->buf[ctx->buf_used++] = data[i];
+		if (ctx->buf_used == 128)
+		{
+			SHA512Block(ctx, ctx->buf);
+			ctx->buf_used = 0;
+		}
+	}
+	ctx->len += len;
+}
+
+U0 SHA512Final(CSHA512 *ctx, U8 *out)
+{
+	U64	bitlen = ctx->len * 8;
+	I64	i;
+
+	SHA512Update(ctx, "\x80", 1);
+	while (ctx->buf_used != 112)
+		SHA512Update(ctx, "\x00", 1);		// pads (wrapping a block if needed)
+	for (i = 0; i < 8; i++)					// high 64 bits of the 128-bit length
+		SHA512Update(ctx, "\x00", 1);
+	for (i = 7; i >= 0; i--)
+	{
+		U8 b = bitlen >> (i * 8) & 0xFF;
+		SHA512Update(ctx, &b, 1);
+	}
+	for (i = 0; i < 8; i++)
+	{
+		I64 j;
+		for (j = 0; j < 8; j++)
+			out[i*8 + j] = ctx->h[i] >> ((7 - j) * 8) & 0xFF;
+	}
+}
+
+U0 SHA512(U8 *data, I64 len, U8 *out)
+{
+	CSHA512 ctx;
+	SHA512Init(&ctx);
+	SHA512Update(&ctx, data, len);
+	SHA512Final(&ctx, out);
+}
+
+// HolyC only allows brace initializers at global scope, so the KAT vector
+// lives here rather than inside the test function.
+U8 sha512_kat_abc[64] = {
+	0xDD,0xAF,0x35,0xA1,0x93,0x61,0x7A,0xBA, 0xCC,0x41,0x73,0x49,0xAE,0x20,0x41,0x31,
+	0x12,0xE6,0xFA,0x4E,0x89,0xA9,0x7E,0xA2, 0x0A,0x9E,0xEE,0xE6,0x4B,0x55,0xD3,0x9A,
+	0x21,0x92,0x99,0x2A,0x27,0x4F,0xC1,0xA8, 0x36,0xBA,0x3C,0x23,0xA3,0xFE,0xEB,0xBD,
+	0x45,0x4D,0x44,0x23,0x64,0x3C,0xE8,0x0E, 0x2A,0x9A,0xC9,0x4F,0xA5,0x4C,0xA4,0x9F };
+
+Bool SHA512Test()
+{ // FIPS 180-4 "abc" known-answer
+	U8	hash[64];
+
+	SHA512("abc", 3, hash);
+	if (MemCompare(hash, sha512_kat_abc, 64))
+	{
+		"$$RED$$SHA512 KAT failed.$$FG$$\n";
+		return FALSE;
+	}
+	"$$GREEN$$SHA512 KAT passed.$$FG$$\n";
+	return TRUE;
+}
