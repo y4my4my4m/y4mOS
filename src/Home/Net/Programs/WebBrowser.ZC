@@ -393,6 +393,7 @@ U0 ZincRunScripts(CZNode *node)
 
 U0 ZincPageFree()
 {
+	HttpConnsClose; // release keep-alive sockets parked for the previous page
 	JsInterpFree(zinc_js);
 	zinc_js = NULL;
 	ZNodeFree(zinc_dom);
@@ -409,6 +410,7 @@ U0 ZincSetPage(U8 *url, U8 *html)
 	ZincPageFree;
 	zinc_base_ok = (HttpUrlParse(url, &zinc_base) >= 0);
 	zinc_dom = ZHtmlParse(html);
+	zcss_viewport_w = MaxI64(320, Fs->pix_width - 30); // for @media width tests
 	ZincCollectCss(zinc_dom, &external_css);
 	ZincFormInit(zinc_dom);
 	zinc_js = JsInterpNew(zinc_dom, url);

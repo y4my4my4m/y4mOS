@@ -1,6 +1,7 @@
 // Minimal HTTP client for ZealOS.
-// Speaks HTTP/1.0 with a Host header: 1.0 keeps responses un-chunked and
-// close-delimited, so "read until EOF" is the complete framing story.
+// Speaks HTTP/1.1 with keep-alive: responses are delimited by Content-Length
+// or chunked framing, and healthy connections are parked in a small cache so
+// repeat requests to the same host skip the TCP + TLS handshake.
 // HTTPS uses the TLS 1.3 client in Protocols/TLS.ZC (encrypted, but the
 // server certificate is NOT verified).
 
@@ -506,6 +507,214 @@ U8 *HttpUrlResolve(CHttpUrl *base, U8 *href)
 	return result;
 }
 
+/* ---- keep-alive connection cache ----
+   A page load makes a dozen requests to the same host; a fresh TCP + TLS 1.3
+   handshake for each one dominates load time (the pure-ZealC X25519 handshake
+   is the expensive part). Completed framed responses park their connection
+   here for the next request to reuse. Task-safe via busy flags under a lock;
+   concurrent fetch tasks each grab their own slot. */
+
+#define HTTP_CONN_MAX	4
+
+class CHttpConn
+{
+	U8			 host[256];
+	U16			 port;
+	Bool		 is_tls, alive, busy;
+	CTLS		*tls;
+	CTCPSocket	*sock;
+};
+
+CHttpConn http_conns[HTTP_CONN_MAX];
+I64		  http_conn_lock = 0;	 // statically initialized; JIT zeroes nothing
+Bool	  http_conn_init = FALSE;
+
+// Sockets are CAlloc'd on the CALLING task's heap and referenced by the TCP
+// RX interrupt via a global list. If a task dies (or is Killed) with a socket
+// still open, that memory is freed under the interrupt = crash. So keep-alive
+// pooling is allowed ONLY from this one persistent task (the browser main
+// task sets it at startup). Every spawned/cancellable fetch task closes its
+// connections as before - it never parks one.
+public CTask *http_pool_task = NULL;
+
+Bool HttpMayPool()
+{
+	return http_pool_task && Fs == http_pool_task;
+}
+
+U0 HttpConnLockAcq()
+{
+	while (LBts(&http_conn_lock, 0))
+		Yield;
+}
+
+U0 HttpConnLockRel()
+{
+	LBtr(&http_conn_lock, 0);
+}
+
+U0 HttpConnInitOnce()
+{
+	HttpConnLockAcq;
+	if (!http_conn_init)
+	{
+		MemSet(http_conns, 0, sizeof(http_conns));
+		http_conn_init = TRUE;
+	}
+	HttpConnLockRel;
+}
+
+CHttpConn *HttpConnTake(U8 *host, U16 port, Bool is_tls)
+{ // grab a parked live connection to host:port, marking it busy
+	I64 i;
+	CHttpConn *c = NULL;
+
+	HttpConnInitOnce;
+	HttpConnLockAcq;
+	for (i = 0; i < HTTP_CONN_MAX; i++)
+	{
+		if (http_conns[i].alive && !http_conns[i].busy &&
+			http_conns[i].is_tls == is_tls && http_conns[i].port == port &&
+			!StrICompare(http_conns[i].host, host))
+		{
+			http_conns[i].busy = TRUE;
+			c = &http_conns[i];
+			break;
+		}
+	}
+	HttpConnLockRel;
+	return c;
+}
+
+U0 HttpConnKill(CHttpConn *c)
+{ // close and forget a cached connection (stale or errored)
+	if (!c)
+		return;
+	HttpConnLockAcq;
+	if (c->tls)
+		TLSClose(c->tls); // closes the socket too
+	else if (c->sock)
+		TCPSocketClose(c->sock);
+	c->tls = NULL;
+	c->sock = NULL;
+	c->alive = FALSE;
+	c->busy = FALSE;
+	HttpConnLockRel;
+}
+
+U0 HttpConnGive(CHttpConn *reuse, U8 *host, U16 port, Bool is_tls,
+				CTCPSocket *sock, CTLS *tls)
+{ // park a healthy connection for reuse. reuse != NULL: it came from the
+  // cache, just release it. Else store into a free (or dead) slot.
+	I64 i, pick = -1;
+
+	if (reuse)
+	{
+		HttpConnLockAcq;
+		reuse->busy = FALSE;
+		HttpConnLockRel;
+		return;
+	}
+	HttpConnInitOnce;
+	HttpConnLockAcq;
+	for (i = 0; i < HTTP_CONN_MAX; i++)
+	{
+		if (!http_conns[i].alive && !http_conns[i].busy)
+		{
+			pick = i;
+			break;
+		}
+	}
+	if (pick < 0)
+	{ // all slots live: replace the first idle one
+		for (i = 0; i < HTTP_CONN_MAX; i++)
+		{
+			if (!http_conns[i].busy)
+			{
+				if (http_conns[i].tls)
+					TLSClose(http_conns[i].tls);
+				else if (http_conns[i].sock)
+					TCPSocketClose(http_conns[i].sock);
+				http_conns[i].alive = FALSE;
+				pick = i;
+				break;
+			}
+		}
+	}
+	if (pick < 0)
+	{ // every slot busy: nothing to do but close this one
+		HttpConnLockRel;
+		if (tls)
+			TLSClose(tls);
+		else if (sock)
+			TCPSocketClose(sock);
+		return;
+	}
+	StrCopy(http_conns[pick].host, host);
+	http_conns[pick].port = port;
+	http_conns[pick].is_tls = is_tls;
+	http_conns[pick].tls = tls;
+	http_conns[pick].sock = sock;
+	http_conns[pick].alive = TRUE;
+	http_conns[pick].busy = FALSE;
+	HttpConnLockRel;
+}
+
+public U0 HttpConnsClose()
+{ // drop every parked connection (debug / network reset)
+	I64 i;
+
+	HttpConnInitOnce;
+	for (i = 0; i < HTTP_CONN_MAX; i++)
+		if (http_conns[i].alive && !http_conns[i].busy)
+			HttpConnKill(&http_conns[i]);
+}
+
+I64 HttpChunkedComplete(U8 *body, I64 len)
+{ // TRUE-ish: the chunked payload (incl. terminating 0-chunk) has fully
+  // arrived. Returns 1 when complete, -1 when more data is needed.
+	U8	*p = body, *end = body + len;
+	I64	 chunk;
+	U8	 c;
+	Bool any;
+
+	while (TRUE)
+	{
+		chunk = 0;
+		any = FALSE;
+		while (p < end)
+		{
+			c = *p;
+			if ('0' <= c <= '9')
+				chunk = chunk * 16 + c - '0';
+			else if ('a' <= c <= 'f')
+				chunk = chunk * 16 + c - 'a' + 10;
+			else if ('A' <= c <= 'F')
+				chunk = chunk * 16 + c - 'A' + 10;
+			else
+				break;
+			any = TRUE;
+			p++;
+		}
+		if (!any)
+			return -1;
+		while (p < end && *p != '\n')
+			p++;
+		if (p >= end)
+			return -1;
+		p++; // past the size line's \n
+		if (chunk == 0)
+		{ // final chunk: complete once its closing CRLF (or trailer end) is in
+			if (p >= end)
+				return -1;
+			return 1;
+		}
+		if (p + chunk + 2 > end)
+			return -1; // chunk data (+ its CRLF) not fully here yet
+		p += chunk + 2;
+	}
+}
+
 CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 							  U8 *content_type=NULL, U8 *body=NULL, I64 body_len=0)
 { // One request/response round trip; no redirect handling here.
@@ -518,41 +727,67 @@ CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 	I64			   buf_size, buf_used, received, header_block_len, unzipped_len;
 	I64			   deadline, tries;
 	Bool		   aborted;
+	CHttpConn	  *conn;
+	Bool		   reused, have_hdr, is_chunked, complete, keep_ok, poolable;
+	I64			   content_len, hdr_len, body_have;
+	U8			  *hval, *conn_val;
+	U8			   save_ch;
 
-	//The PCNet path can drop the very first connection after boot (a transient
-	//"APAD XMT TRUNCATE"), which used to leave the first page blank. Retry the
-	//connect a couple of times before giving up.
-	sock = TCPConnectionCreate(url->host, url->port);
-	for (tries = 0; sock <= 0 && tries < 3 && !net_abort; tries++)
+	poolable = HttpMayPool; // only the persistent main task keeps connections
+	conn = NULL;
+	if (poolable)
+		conn = HttpConnTake(url->host, url->port, url->is_https);
+
+http_fresh:
+	if (conn)
+	{ // reuse a parked keep-alive connection: no TCP/TLS handshake needed
+		sock = conn->sock;
+		tls = conn->tls;
+		reused = TRUE;
+	}
+	else
 	{
-		Sleep(400);
+		reused = FALSE;
+		tls = NULL;
+		//The PCNet path can drop the very first connection after boot (a
+		//transient "APAD XMT TRUNCATE"), which used to leave the first page
+		//blank. Retry the connect a couple of times before giving up.
 		sock = TCPConnectionCreate(url->host, url->port);
-	}
-	if (sock <= 0)
-	{
-		NetErr("HTTP %s: Connection to %s:%d failed.", method, url->host, url->port);
-		return NULL;
-	}
-
-	sock->timeout = NET_READ_POLL_MS; // short polls so reads stay cancellable
-
-	if (url->is_https)
-	{ // TLS 1.3 owns the socket from here on (TLSClose closes it)
-		tls = TLSConnect(url->host, sock);
-		if (!tls)
+		for (tries = 0; sock <= 0 && tries < 3 && !net_abort; tries++)
 		{
-			NetErr("HTTP %s: TLS handshake to %s failed.", method, url->host);
-			TCPSocketClose(sock);
+			Sleep(400);
+			sock = TCPConnectionCreate(url->host, url->port);
+		}
+		if (sock <= 0)
+		{
+			NetErr("HTTP %s: Connection to %s:%d failed.", method, url->host, url->port);
 			return NULL;
+		}
+
+		sock->timeout = NET_READ_POLL_MS; // short polls: reads stay cancellable
+
+		if (url->is_https)
+		{ // TLS 1.3 owns the socket from here on (TLSClose closes it)
+			tls = TLSConnect(url->host, sock);
+			if (!tls)
+			{
+				NetErr("HTTP %s: TLS handshake to %s failed.", method, url->host);
+				TCPSocketClose(sock);
+				return NULL;
+			}
 		}
 	}
 
 	cookie_hdr = HttpCookieHeaderBuild(url); // "" or "Cookie: ...\r\n"
+	if (poolable)
+		conn_val = "keep-alive"; // this task reuses the socket for the next req
+	else
+		conn_val = "close";      // spawned/cancellable task: server closes, we EOF
 	if (body)
 	{
 		if (!content_type)
 			content_type = "application/x-www-form-urlencoded";
-		request = MStrPrint("%s %s HTTP/1.0\r\n"
+		request = MStrPrint("%s %s HTTP/1.1\r\n"
 							"Host: %s\r\n"
 							"User-Agent: ZealOS-Zinc/1.0\r\n"
 							"Accept: text/html, text/plain, */*\r\n"
@@ -560,21 +795,21 @@ CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 							"%s"
 							"Content-Type: %s\r\n"
 							"Content-Length: %d\r\n"
-							"Connection: close\r\n"
+							"Connection: %s\r\n"
 							"\r\n",
 							method, url->path, url->host, cookie_hdr,
-							content_type, body_len);
+							content_type, body_len, conn_val);
 	}
 	else
-		request = MStrPrint("%s %s HTTP/1.0\r\n"
+		request = MStrPrint("%s %s HTTP/1.1\r\n"
 							"Host: %s\r\n"
 							"User-Agent: ZealOS-Zinc/1.0\r\n"
 							"Accept: text/html, text/plain, */*\r\n"
 							"Accept-Encoding: gzip\r\n"
 							"%s"
-							"Connection: close\r\n"
+							"Connection: %s\r\n"
 							"\r\n",
-							method, url->path, url->host, cookie_hdr);
+							method, url->path, url->host, cookie_hdr, conn_val);
 	Free(cookie_hdr);
 	if (tls)
 	{
@@ -594,6 +829,12 @@ CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 	buf_used = 0;
 	buf = MAlloc(buf_size);
 	aborted = FALSE;
+	have_hdr = FALSE;
+	is_chunked = FALSE;
+	complete = FALSE;
+	keep_ok = FALSE;
+	content_len = -1;
+	hdr_len = 0;
 	deadline = counts.jiffies + NET_READ_STALL_MS * JIFFY_FREQ / 1000;
 
 	while (TRUE)
@@ -621,7 +862,60 @@ CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 		if (received > 0)
 		{
 			buf_used += received;
+			buf[buf_used] = 0;
 			deadline = counts.jiffies + NET_READ_STALL_MS * JIFFY_FREQ / 1000;
+
+			if (!have_hdr)
+			{ // learn the framing as soon as the header block is complete
+				header_end = StrFind("\r\n\r\n", buf);
+				if (header_end)
+				{
+					have_hdr = TRUE;
+					hdr_len = header_end - buf;
+					save_ch = buf[hdr_len];
+					buf[hdr_len] = 0;
+					hval = HttpHeaderGet(buf, "Content-Length");
+					if (hval)
+					{
+						content_len = Str2I64(hval);
+						Free(hval);
+					}
+					hval = HttpHeaderGet(buf, "Transfer-Encoding");
+					if (hval)
+					{
+						if (StrIMatch("chunked", hval))
+							is_chunked = TRUE;
+						Free(hval);
+					}
+					keep_ok = !StrNCompare(buf, "HTTP/1.1", 8);
+					hval = HttpHeaderGet(buf, "Connection");
+					if (hval)
+					{
+						if (StrIMatch("close", hval))
+							keep_ok = FALSE;
+						Free(hval);
+					}
+					buf[hdr_len] = save_ch;
+				}
+			}
+			if (have_hdr)
+			{ // framed completion beats waiting for EOF (keep-alive servers
+			  // never close, so EOF would stall until the read timeout)
+				body_have = buf_used - (hdr_len + 4);
+				if (is_chunked)
+				{
+					if (HttpChunkedComplete(buf + hdr_len + 4, body_have) > 0)
+					{
+						complete = TRUE;
+						break;
+					}
+				}
+				else if (content_len >= 0 && body_have >= content_len)
+				{
+					complete = TRUE;
+					break;
+				}
+			}
 			if (buf_used >= HTTP_BODY_MAX)
 			{ // giant response: stop here rather than exhaust memory / freeze
 				NetErr("HTTP %s: Response exceeded %d bytes, truncating.",
@@ -630,7 +924,7 @@ CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 			}
 		}
 		else if (received == 0)
-			break;			// EOF: HTTP/1.0 close-delimited response complete
+			break;			// EOF: close-delimited response complete
 		else
 		{ // -1: TLS already waited internally (real end/error); plain = poll tick
 			if (tls)
@@ -644,10 +938,27 @@ CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
 	if (net_abort) // a TLS read returning -1 from an abort exits via the break above
 		aborted = TRUE;
 
-	if (tls)
-		TLSClose(tls);      // closes the socket too
+	if (reused && !aborted && !have_hdr && buf_used == 0)
+	{ // the parked connection had gone stale (server idle-closed it):
+	  // drop it and retry once on a fresh connection
+		NetLog("HTTP %s: cached connection stale; reconnecting.", method);
+		HttpConnKill(conn);
+		conn = NULL;
+		Free(buf);
+		goto http_fresh;
+	}
+
+	if (poolable && complete && keep_ok && !aborted)
+		HttpConnGive(conn, url->host, url->port, url->is_https, sock, tls);
+	else if (conn)
+		HttpConnKill(conn); // cached connection is no longer clean
 	else
-		TCPSocketClose(sock);
+	{
+		if (tls)
+			TLSClose(tls);      // closes the socket too
+		else
+			TCPSocketClose(sock);
+	}
 
 	buf[buf_used] = 0;
 

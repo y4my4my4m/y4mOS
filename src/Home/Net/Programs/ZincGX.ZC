@@ -2051,6 +2051,9 @@ public U0 ZincGX(U8 *start_url=NULL)
 	gx.ops = CAlloc(sizeof(CGxOp) * GX_OPS_MAX);
 	gx.fetch = TRUE;
 	gx.last_wheel = mouse.pos.z;
+	http_pool_task = Fs; //this task is persistent: it alone may keep-alive.
+					     //Spawned/killable fetch tasks never pool (their socket
+					     //would dangle when the task dies -> RX-interrupt crash).
 	zinc_defer_ext_js = TRUE; //external scripts load in the background here
 	zinc_js_queue_count = 0;  //stale entries died with any previous GX task
 
@@ -2151,7 +2154,10 @@ public U0 ZincGX(U8 *start_url=NULL)
 				}
 				net_abort = FALSE; // don't leak the abort into background img/js fetches
 				if (gx.cancel)
+				{
+					HttpConnsClose; // a killed fetch may have parked a socket mid-read
 					StrCopy(zinc_note, "Cancelled.");
+				}
 				//Parse the fetched body (or an error page) in the main heap.
 				if (gx.cancel)
 					ZincSetPage(current, "<p>Load cancelled.</p>");
@@ -2521,6 +2527,8 @@ gx_next:
 
 	//Teardown.
 	Fs->draw_it = NULL;
+	http_pool_task = NULL;	// stop pooling before this task dies; ZincPageFree
+							// below closes any sockets it parked
 	if (TaskValidate(gx.img_task))
 		Kill(gx.img_task);
 	if (TaskValidate(gx.load_task))

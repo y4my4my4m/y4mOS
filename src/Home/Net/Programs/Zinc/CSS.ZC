@@ -1309,10 +1309,23 @@ U0 ZCssRuleAdd(U8 *sel, U8 *sel_end, CZStyle *style)
 	zh_dom_gen++; // new rule: memoized computed styles are stale
 }
 
+// The browser sets this to its content width before stylesheets parse, so
+// @media (min-width/max-width) blocks evaluate against the real viewport.
+public I64 zcss_viewport_w = 1024; // statically initialized (JIT zeroes nothing)
+
+I64 ZCssMediaWidth(U8 *p, U8 *end)
+{ // parse the number after "min-width"/"max-width" (":" then px); 0 if none
+	while (p < end && (*p == ':' || *p == ' ' || *p == '\t'))
+		p++;
+	if (p >= end || !('0' <= *p <= '9'))
+		return 0;
+	return Str2I64(p);
+}
+
 U0 ZCssParseRegion(U8 *p, U8 *end)
-{ // parse rules in [p, end); recurses into non-print @media blocks
+{ // parse rules in [p, end); recurses into matching @media blocks
 	U8	   *sel_start, *scan, *comma, *body, *body_end, *at_s, *at_e;
-	I64		depth;
+	I64		depth, mq_min, mq_max;
 	CZStyle style;
 	Bool	is_media, is_print;
 
@@ -1342,6 +1355,8 @@ U0 ZCssParseRegion(U8 *p, U8 *end)
 			{
 				is_media = FALSE;
 				is_print = FALSE;
+				mq_min = 0;
+				mq_max = 0;
 				scan = at_s + 1;
 				if (!StrNICompare(scan, "media", 5))
 					is_media = TRUE;
@@ -1354,8 +1369,18 @@ U0 ZCssParseRegion(U8 *p, U8 *end)
 										 // light-media query): we render dark,
 										 // so skip - entering both schemes'
 										 // blocks makes last-wins color soup
+					if (!StrNICompare(scan, "min-width", 9))
+						mq_min = ZCssMediaWidth(scan + 9, at_e);
+					if (!StrNICompare(scan, "max-width", 9))
+						mq_max = ZCssMediaWidth(scan + 9, at_e);
 					scan++;
 				}
+				// evaluate width conditions against the real viewport, so
+				// mobile and desktop breakpoint blocks stop BOTH applying
+				if (mq_min > 0 && zcss_viewport_w < mq_min)
+					is_print = TRUE;
+				if (mq_max > 0 && zcss_viewport_w > mq_max)
+					is_print = TRUE;
 				body = p + 1;
 				depth = 0;
 				do
