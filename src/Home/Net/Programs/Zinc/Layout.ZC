@@ -221,23 +221,35 @@ U0 L2FlexRow(CZNode *node, CZStyle *style, CZStyle *author)
 	if (gapv < 0)
 		gapv = 8;
 
-	for (i = 0; i < n; i++)
-	{ // basis: explicit width beats measured content width
-		ZCssApply(items[i], &ca);
-		bw = 0;
-		if (ca.width > 0)
-			bw = MinI64(ca.width, avail);
-		else if (ca.width < 0)
-			bw = avail * -ca.width / 100;
-		else
-		{
-			L2Measure(items[i], &kid, avail, &mw, &mh);
-			bw = MinI64(mw + 8, avail);
-		}
-		if (bw < 24)
-			bw = 24;
-		basis[i] = bw;
+	if (author->grid_cols > 1)
+	{ // explicit grid: equal fixed columns of grid_cols per row
+		k = author->grid_cols;
+		if (k > n)
+			k = n;
+		mw = (avail - gapv * (k - 1)) / k;
+		if (mw < 24)
+			mw = 24;
+		for (i = 0; i < n; i++)
+			basis[i] = mw;
 	}
+	else
+		for (i = 0; i < n; i++)
+		{ // basis: explicit width beats measured content width
+			ZCssApply(items[i], &ca);
+			bw = 0;
+			if (ca.width > 0)
+				bw = MinI64(ca.width, avail);
+			else if (ca.width < 0)
+				bw = avail * -ca.width / 100;
+			else
+			{
+				L2Measure(items[i], &kid, avail, &mw, &mh);
+				bw = MinI64(mw + 8, avail);
+			}
+			if (bw < 24)
+				bw = 24;
+			basis[i] = bw;
+		}
 
 	i = 0;
 	while (i < n)
@@ -337,11 +349,6 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	is_body = L2IsBody(node->tag);
 	is_flex = author->display == ZCSS_DISP_FLEX && author->flex_col != 1;
 	is_abs	= author->pos == 2 || author->pos == 3;
-	if (is_abs && author->off_l <= 0 && author->off_t <= 0 &&
-		author->off_r == ZCSS_OFF_UNSET)
-		is_abs = FALSE; // absolute/fixed with inset:0-style or no offsets is
-						// the standard SPA full-page wrapper: flow it normally,
-						// or the whole app paints overlapped at one y
 
 	GxRunFlush;
 	if (gx.x > GX_MARGIN + gx.indent)
@@ -428,8 +435,14 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 			x0 = 0;
 		gx.indent = x0 - GX_MARGIN;
 		gx.wrap_w = x0 + bw;
-		if (author->off_t > ZCSS_OFF_UNSET)
-			gx.y = 8 + author->off_t; // document top anchored (fixed ~ absolute)
+		// Anchor to the CURRENT flow position (not the document top): we do not
+		// track positioned ancestors, and abs/fixed elements sit near their DOM
+		// position in practice. This keeps full-page inset:0 wrappers from all
+		// stacking at y=8 (overlap) while still taking no flow height.
+		if (author->off_t > 0)
+			gx.y = saved_y + author->off_t;
+		// else: leave gx.y = saved_y (drawn where it appears; content that
+		// follows in source order paints on top, so backgrounds land behind)
 		gx.x = GX_MARGIN + gx.indent;
 	}
 	else

@@ -54,6 +54,7 @@ class CZStyle
 	I8	align;					// -1 unset, 0 left, 1 center, 2 right
 	I8	list_none;				// list-style: none
 	I8	flex_col;				// flex-direction: -1 unset, 0 row, 1 column
+	I8	grid_cols;				// grid-template-columns track count; -1 unset
 };
 
 class CZCssRule
@@ -129,6 +130,7 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	if (src->align	   >= 0) dst->align		= src->align;
 	if (src->list_none >= 0) dst->list_none = src->list_none;
 	if (src->flex_col  >= 0) dst->flex_col	= src->flex_col;
+	if (src->grid_cols >= 0) dst->grid_cols = src->grid_cols;
 	if (src->mr		   >= 0) dst->mr		= src->mr;
 	if (src->pr		   >= 0) dst->pr		= src->pr;
 	if (src->height	   >  0) dst->height	= src->height;
@@ -596,8 +598,15 @@ I64 ZCssPx(U8 *val)
 		return -1;
 	if (!StrNICompare(p, "pt", 2))
 		return ip * 4 / 3;
-	if (!StrNICompare(p, "em", 2) || !StrNICompare(p, "rem", 3))
+	if (!StrNICompare(p, "rem", 3))
 		return ip * 16 + frac * 16 / fdiv;
+	if (!StrNICompare(p, "em", 2))
+		return ip * 16 + frac * 16 / fdiv;
+	if (!StrNICompare(p, "vh", 2) || !StrNICompare(p, "vw", 2) ||
+		!StrNICompare(p, "vmin", 4) || !StrNICompare(p, "vmax", 4))
+		return -1;	// viewport units: leave the dimension auto. We cannot
+					// vertically center, so a 100vh hero as a real height would
+					// just be a screen of empty space with content at the top.
 	return ip;	// px or a bare number
 }
 
@@ -740,6 +749,53 @@ U0 ZCssFontSizeSet(U8 *val, CZStyle *out)
 	}
 	if (n >= 0)
 		out->fsize = ClampI64(n, 8, 48);
+}
+
+I64 ZCssGridCols(U8 *val)
+{ // count grid-template-columns tracks; repeat(N, ...) contributes N.
+  // "1fr 1fr 1fr" -> 3, "repeat(4,1fr)" -> 4, "200px 1fr" -> 2. Skips the
+  // "repeat(auto-fill/fit,...)" case (returns what it can, capped).
+	U8	*p = val;
+	I64	 count = 0, rep, d;
+
+	while (*p)
+	{
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (!*p)
+			break;
+		if (!StrNICompare(p, "repeat(", 7))
+		{
+			p += 7;
+			rep = Str2I64(p); // 0 if auto-fill/auto-fit: treat as one track
+			if (rep < 1)
+				rep = 1;
+			if (rep > 12)
+				rep = 12;
+			count += rep;
+			d = 1;
+			while (*p && d)
+			{
+				if (*p == '(')
+					d++;
+				else if (*p == ')')
+					d--;
+				if (d)
+					p++;
+			}
+			if (*p == ')')
+				p++;
+		}
+		else
+		{
+			count++;
+			while (*p && *p != ' ' && *p != '\t')
+				p++;
+		}
+	}
+	if (count > 12)
+		count = 12;
+	return count;
 }
 
 U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
@@ -1049,6 +1105,14 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 			out->flex_col = 1;
 		else
 			out->flex_col = 0;
+	}
+	else if (!StrICompare(name, "grid-template-columns") ||
+			 !StrICompare(name, "grid-template"))
+	{ // count the explicit column tracks so grids lay out in the right number
+	  // of columns instead of our width heuristic
+		n = ZCssGridCols(val);
+		if (1 <= n <= 12)
+			out->grid_cols = n;
 	}
 	else if (!StrICompare(name, "justify-content") ||
 			 !StrICompare(name, "place-content") ||
