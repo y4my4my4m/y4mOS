@@ -66,7 +66,7 @@ $ID,2$mkdir -p ~/.ssh && chmod 700 ~/.ssh
 echo 'ssh-ed25519 AAAA... y4mos@zealos' >> ~/.ssh/authorized_keys
 chmod 600 ~/.ssh/authorized_keys$ID,-2$
 
-To get the key text out of the VM, use the network clipboard: run $FG,2$SSHKeyShow;$FG$ then $FG,2$ClipCopy(...)$FG$ (see $LK,"Clip.ZC",A="FI:::/Home/Net/Programs/Clip/Clip.ZC"$).
+To get the key text out of the VM, start the clipboard bridge ($FG,2$ClipStart;$FG$ -- see $LK,"Clip.ZC",A="FI:::/Home/Net/Programs/Clip/Clip.ZC"$), then run $FG,2$SSHKeyShow;$FG$, select the printed key line, and press Ctrl+C.  It syncs straight to the host clipboard.
 
 $FG,3$5.3 Use it$FG$
 

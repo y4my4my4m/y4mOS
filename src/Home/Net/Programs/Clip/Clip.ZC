@@ -1,44 +1,178 @@
-// Network clipboard for YKD (QEMU guest <-> host). ZealOS has no SPICE guest
-// agent, so no native clipboard -- instead we bridge over HTTP. Run the host
-// daemon (clipd.py, same folder) on your Manjaro box; the guest reaches it at
-// 10.0.2.2 (QEMU user-net gateway). Needs the Net stack loaded.
+// Network clipboard bridge for YKD (QEMU guest <-> host). ZealOS has no SPICE
+// guest agent, so there is no built-in host clipboard sync. This bridges the
+// NATIVE ZealOS clipboard (sys_clip_doc, used by Ctrl+C / Ctrl+X / Ctrl+V) to
+// the host over HTTP: a background task keeps them in sync both ways, so once
+// it is running you just use Ctrl+C / Ctrl+V as normal and it reaches the host.
+//
+// Host side: run clipd.py (same folder) on your Manjaro box. The guest reaches
+// it at 10.0.2.2 (QEMU user-net gateway). Needs the Net stack loaded.
 //
 //   #include "C:/Home/Net/Programs/Clip/Clip"
-//   ClipPaste;                  // host clipboard -> typed into this window
-//   ClipCopy("some text");      // text -> host clipboard
+//   ClipStart;      // begin syncing; now Ctrl+C/Ctrl+V talk to the host
+//   ClipStop;       // stop syncing
 
-#define CLIP_URL "http://10.0.2.2:9999"
+#define CLIP_URL	"http://10.0.2.2:9999"
+#define CLIP_POLL_MS	500
 
-public U0 ClipCopy(U8 *text)
-{ // push text to the host clipboard
-	CHttpResponse *r = HttpPost(CLIP_URL, text, "text/plain");
-	if (r && r->status == 200)
-		"$$GREEN$$Copied %d bytes to the host clipboard.$$FG$$\n", StrLen(text);
-	else
-		"$$RED$$ClipCopy failed -- is clipd.py running on the host?$$FG$$\n";
-	if (r)
-		HttpResponseFree(r);
+Bool	clip_running = FALSE;
+U8	   *clip_last	= NULL;		// last text synced in either direction (anti-echo)
+
+Bool ClipChanged(U8 *now)
+{ // has the text changed vs the last synced value?
+	if (!clip_last)
+		return TRUE;
+	return StrCompare(now, clip_last) != 0;
 }
 
-public U0 ClipPaste()
-{ // fetch the host clipboard and inject it as keystrokes into THIS window,
-  // so it lands wherever the cursor is (command line, editor, etc.)
-	CHttpResponse *r = HttpGet(CLIP_URL);
-	I64	i;
-	U8	c;
+U0 ClipRemember(U8 *text)
+{ // take ownership of text as the new "last synced" value
+	if (clip_last)
+		Free(clip_last);
+	clip_last = text;
+}
 
+// --- host side (HTTP) ------------------------------------------------------
+
+U8 *ClipHostGet()
+{ // fetch host clipboard; MAlloc'd string or NULL
+	CHttpResponse	*r = HttpGet(CLIP_URL);
+	U8				*s;
 	if (!r || r->status != 200)
 	{
-		"$$RED$$ClipPaste failed -- is clipd.py running on the host?$$FG$$\n";
 		if (r) HttpResponseFree(r);
-		return;
+		return NULL;
 	}
-	for (i = 0; i < r->body_length; i++)
-	{
-		c = r->body[i];
-		if (c != '\r')				// drop CR; keep LF (acts as Enter)
-			MessagePost(Fs, MESSAGE_KEY_DOWN, c, 0);
-	}
-	"$$GREEN$$Pasted %d bytes from the host clipboard.$$FG$$\n", r->body_length;
+	s = MAlloc(r->body_length + 1);
+	MemCopy(s, r->body, r->body_length);
+	s[r->body_length] = 0;
 	HttpResponseFree(r);
+	return s;
+}
+
+Bool ClipHostSet(U8 *text)
+{
+	CHttpResponse	*r = HttpPost(CLIP_URL, text, "text/plain");
+	Bool			 ok = r && r->status == 200;
+	if (r) HttpResponseFree(r);
+	return ok;
+}
+
+// --- native ZealOS clipboard (sys_clip_doc) --------------------------------
+
+U8 *ClipDocGet()
+{ // concatenate the tag text of the clipboard entries. MAlloc'd, never NULL.
+  // (Multi-line copies may flatten -- fine for keys / commands / URLs.)
+	CDoc		*doc = sys_clip_doc;
+	Bool		 unlock = DocLock(doc);
+	CDocEntry	*e = doc->head.next;
+	U8			*buf = MAlloc(0x10000);
+	I64			 o = 0, l;
+
+	while (e != doc && o < 0xFF00)
+	{
+		if (e->de_flags & DOCEF_TAG && e->tag)
+		{
+			l = StrLen(e->tag);
+			if (o + l < 0xFF00)
+			{
+				MemCopy(buf + o, e->tag, l);
+				o += l;
+			}
+		}
+		e = e->next;
+	}
+	buf[o] = 0;
+	if (unlock)
+		DocUnlock(doc);
+	return buf;
+}
+
+U0 ClipDocSet(U8 *text)
+{ // replace the clipboard contents with text so Ctrl+V pastes it
+	CDoc	*doc = sys_clip_doc;
+	Bool	 unlock = DocLock(doc);
+	DocReset(doc, TRUE);				// clear (same as ClipDel)
+	DocPrint(doc, "%s", text);			// %s passes text literally
+	if (unlock)
+		DocUnlock(doc);
+}
+
+// --- sync task -------------------------------------------------------------
+
+U0 ClipSyncTask()
+{ // one direction per tick, guest copies take priority (no echo loop)
+	U8 *g, *h;
+
+	clip_running = TRUE;
+
+	// seed the ZealOS clipboard from the host once
+	h = ClipHostGet();
+	if (h && *h)
+	{
+		ClipDocSet(h);
+		ClipRemember(h);
+	}
+	else if (h)
+		Free(h);
+
+	while (clip_running)
+	{
+		g = ClipDocGet();
+		if (*g && ClipChanged(g))
+		{ // user copied something in ZealOS -> push to host
+			ClipHostSet(g);
+			ClipRemember(g);
+		}
+		else
+		{
+			Free(g);
+			h = ClipHostGet();
+			if (h && *h && ClipChanged(h))
+			{ // host clipboard changed -> make it the ZealOS clipboard
+				ClipDocSet(h);
+				ClipRemember(h);
+			}
+			else if (h)
+				Free(h);
+		}
+		Sleep(CLIP_POLL_MS);
+	}
+}
+
+public U0 ClipStart()
+{ /* Start the guest<->host clipboard bridge. After this, native Ctrl+C /
+	Ctrl+V sync with the host clipboard (run clipd.py on the host first). */
+	if (clip_running)
+	{ "Clipboard bridge already running.\n"; return; }
+	Spawn(&ClipSyncTask, NULL, "ClipSync");
+	"$$GREEN$$Clipboard bridge on -- Ctrl+C / Ctrl+V now sync with the host.$$FG$$\n";
+	"(Make sure clipd.py is running on the host.)\n";
+}
+
+public U0 ClipStop()
+{
+	clip_running = FALSE;
+	"Clipboard bridge stopping.\n";
+}
+
+// One-shot manual helpers (no background task needed):
+public U0 ClipPush()
+{ // ZealOS clipboard -> host, once
+	U8 *g = ClipDocGet();
+	if (ClipHostSet(g))	"$$GREEN$$Pushed %d bytes to the host.$$FG$$\n", StrLen(g);
+	else				"$$RED$$Push failed (is clipd.py running?).$$FG$$\n";
+	Free(g);
+}
+
+public U0 ClipPull()
+{ // host -> ZealOS clipboard, once
+	U8 *h = ClipHostGet();
+	if (h)
+	{
+		ClipDocSet(h);
+		"$$GREEN$$Pulled %d bytes from the host into the clipboard (Ctrl+V to paste).$$FG$$\n", StrLen(h);
+		Free(h);
+	}
+	else
+		"$$RED$$Pull failed (is clipd.py running?).$$FG$$\n";
 }
