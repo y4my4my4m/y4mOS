@@ -106,6 +106,7 @@ U32 SSHGetU32(U8 *b)
 // to a stall deadline, cancellable via net_abort (shared with TLS).
 
 Bool ssh_interactive = FALSE;	// TRUE = wait indefinitely (idle shell), no stall deadline
+Bool ssh_verbose = FALSE;		// TRUE = print handshake stages to this terminal
 
 I64 SSHReadN(CSSH *ssh, U8 *buf, I64 n)
 {
@@ -385,7 +386,10 @@ I64 SSHBuildKexInit(U8 *out)
 	CryptoRandBytes(out + o, 16);	// cookie
 	o += 16;
 	o = SSHPutStringZ(out, o, "curve25519-sha256");					// kex
-	o = SSHPutStringZ(out, o, "ssh-ed25519");						// host key
+	// advertise every common host-key type -- we don't verify it (v1), so this
+	// just has to overlap whatever key the server happens to have.
+	o = SSHPutStringZ(out, o,
+		"ssh-ed25519,rsa-sha2-512,rsa-sha2-256,ecdsa-sha2-nistp256,ssh-rsa");
 	o = SSHPutStringZ(out, o, "chacha20-poly1305@openssh.com");		// enc c2s
 	o = SSHPutStringZ(out, o, "chacha20-poly1305@openssh.com");		// enc s2c
 	o = SSHPutStringZ(out, o, "hmac-sha2-256");						// mac c2s
@@ -454,9 +458,11 @@ CSSH *SSHTransportConnect(U8 *hostname, U16 port)
 		NetErr("SSH: TCP/DNS connect to %s:%d failed.", hostname, port);
 		goto fail;
 	}
+	if (ssh_verbose)	"  [ssh] TCP connected.\n";
 
 	if (SSHExchangeVersions(ssh) < 0)
 		goto fail;
+	if (ssh_verbose)	"  [ssh] server version: %s\n", ssh->v_s;
 
 	// --- KEXINIT exchange -------------------------------------------------
 	i_c_len = SSHBuildKexInit(i_c);
@@ -470,6 +476,7 @@ CSSH *SSHTransportConnect(U8 *hostname, U16 port)
 		NetErr("SSH: expected KEXINIT, got msg %d.", i_s[0]);
 		goto fail;
 	}
+	if (ssh_verbose)	"  [ssh] KEXINIT exchanged (%d-byte server list).\n", i_s_len;
 
 	// --- ECDH: send Q_C, receive K_S || Q_S || sig ------------------------
 	CryptoRandBytes(priv, 32);		// X25519 clamps internally
@@ -482,12 +489,17 @@ CSSH *SSHTransportConnect(U8 *hostname, U16 port)
 		goto fail;
 
 	if (SSHRecvPlain(ssh, pl, &pl_len) < 0)
+	{
+		if (ssh_verbose)	"  [ssh] no ECDH reply (peer closed / stalled).\n";
 		goto fail;
+	}
 	if (pl_len < 1 || pl[0] != SSH_MSG_KEX_ECDH_REPLY)
 	{
+		if (ssh_verbose)	"  [ssh] ECDH: got msg %d, want 31 (msg 1 = DISCONNECT).\n", pl[0];
 		NetErr("SSH: expected KEX_ECDH_REPLY, got msg %d.", pl[0]);
 		goto fail;
 	}
+	if (ssh_verbose)	"  [ssh] ECDH reply received.\n";
 	// parse: byte(31) string(K_S) string(Q_S) string(sig)
 	{
 		I64 p = 1;
@@ -537,6 +549,7 @@ CSSH *SSHTransportConnect(U8 *hostname, U16 port)
 		NetErr("SSH: expected NEWKEYS, got msg %d.", pl[0]);
 		goto fail;
 	}
+	if (ssh_verbose)	"  [ssh] NEWKEYS done, keys derived. Channel encrypted.\n";
 
 	// --- derive cipher keys ----------------------------------------------
 	// enc c2s = K('C'), enc s2c = K('D'). chacha20-poly1305 splits each 64-byte
@@ -588,7 +601,9 @@ public U0 SSHTransportTest(U8 *hostname, U16 port=22)
 
 	"$$LTBLUE$$--- SSH transport test: %s:%d ---$$FG$$\n", hostname, port;
 
+	ssh_verbose = TRUE;					// print each handshake stage inline
 	ssh = SSHTransportConnect(hostname, port);
+	ssh_verbose = FALSE;
 	if (!ssh)
 	{
 		"$$RED$$Transport handshake FAILED.$$FG$$ See the Network Log.\n";

@@ -311,20 +311,21 @@ I64 SSHChannelPump(CSSHChan *chan, U8 *out, I64 *out_len)
 
 U0 SSHChannelClose(CSSHChan *chan)
 { // send EOF + CLOSE, best effort
+	U8	pl[8];
+	I64	o;
+
 	if (!chan)
 		return;
 	if (!chan->eof)
 	{
-		U8	pl[8];
-		I64	o = 0;
+		o = 0;
 		o = SSHPutByte(pl, o, SSH_MSG_CHANNEL_EOF);
 		o = SSHPutU32(pl, o, chan->remote_id);
 		SSHPacketSend(chan->ssh, pl, o);
 	}
 	if (!chan->closed)
 	{
-		U8	pl[8];
-		I64	o = 0;
+		o = 0;
 		o = SSHPutByte(pl, o, SSH_MSG_CHANNEL_CLOSE);
 		o = SSHPutU32(pl, o, chan->remote_id);
 		SSHPacketSend(chan->ssh, pl, o);

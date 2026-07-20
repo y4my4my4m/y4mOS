@@ -47,8 +47,9 @@ I64 SSHRingDrain(U8 *out, I64 max)
 }
 
 U0 SSHTermPrint(U8 *data, I64 len)
-{ // print channel bytes to the current doc, escaping DolDoc's '$' and dropping
-  // CR / NUL so text lands cleanly.
+{ // print channel bytes to the current doc. 0x24 is DolDoc's command char --
+  // double it so it renders literally. CR / NUL are dropped. (Source must not
+  // contain a bare 0x24, not even in a comment: the ZealC lexer eats it.)
 	U8	*buf = MAlloc(len * 2 + 1);
 	I64	 i, o = 0;
 	U8	 c;
@@ -58,8 +59,8 @@ U0 SSHTermPrint(U8 *data, I64 len)
 		c = data[i];
 		if (c != 0 && c != '\r')	// drop CR / NUL
 		{
-			if (c == '$')
-				buf[o++] = '$';		// DolDoc escape: "$$" renders one '$'
+			if (c == 0x24)			// DolDoc command char: emit it doubled
+				buf[o++] = 0x24;
 			buf[o++] = c;
 		}
 	}
