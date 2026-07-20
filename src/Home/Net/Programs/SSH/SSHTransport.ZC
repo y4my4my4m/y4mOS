@@ -157,16 +157,23 @@ U0 SSHNonce(U64 seq, U8 *out)
 		out[11 - i] = seq >> (i * 8) & 0xFF;
 }
 
-// Plaintext packets (pre-NEWKEYS "none" cipher): no MAC.
+// Plaintext packets (pre-NEWKEYS "none" cipher): no MAC. RFC 4253 rounds the
+// WHOLE frame -- including the 4-byte length field -- to a multiple of 8, so
+// the padding math differs from the AEAD path (where the length is separate).
 
 I64 SSHSendPlain(CSSH *ssh, U8 *payload, I64 payload_len)
 {
-	I64	 pad	= SSHPadLen(payload_len);
-	I64	 plen	= 1 + payload_len + pad;
-	I64	 total	= 4 + plen;
-	U8	*pkt	= MAlloc(total);
-	I64	 o		= 0;
+	I64	 pad	= 8 - ((5 + payload_len) % 8);	// 4 len + 1 padlen + payload
+	I64	 plen, total;
+	U8	*pkt;
+	I64	 o = 0;
 	I64	 sent;
+
+	if (pad < 4)
+		pad += 8;
+	plen  = 1 + payload_len + pad;
+	total = 4 + plen;
+	pkt   = MAlloc(total);
 
 	o = SSHPutU32(pkt, o, plen);
 	o = SSHPutByte(pkt, o, pad);
