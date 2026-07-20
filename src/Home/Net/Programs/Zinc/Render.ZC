@@ -577,11 +577,15 @@ U0 ZnUaStyle(U8 *tag, CZStyle *out)
 		out->underline = 1;
 	else if (!StrCompare(tag, "code") || !StrCompare(tag, "tt") ||
 			 !StrCompare(tag, "kbd")  || !StrCompare(tag, "samp"))
-		out->fg = 0xAA00AA;
+	{
+		out->fg	  = 0xAA00AA;
+		out->mono = 1;			// fixed-width family (scalable-font browser)
+	}
 	else if (!StrCompare(tag, "pre"))
 	{
-		out->fg	 = 0xAA00AA;
-		out->pre = 1;
+		out->fg	  = 0xAA00AA;
+		out->pre  = 1;
+		out->mono = 1;
 	}
 	else if (!StrCompare(tag, "mark"))
 	{

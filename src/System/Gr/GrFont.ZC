@@ -24,6 +24,7 @@ class CGrFont
 {
 	U8	*data;			//whole font file (owned, sys_task heap)
 	I64	 size;
+	I64	 id;			//registry slot (0 UI sans, 1 mono, ...): keys the cache
 	I64	 upm;			//units per em
 	I64	 nglyph;
 	I64	 loca_long;		//indexToLocFormat: 0 short, 1 long
@@ -40,7 +41,15 @@ class CGrGlyph
 	U8	*cov;			//w*h coverage, sys_task heap
 };
 
-public CGrFont	grf_ui_font;		//the one UI font (browser/widgets)
+//Font registry. grf_ui_font (id 0) is the default proportional UI font;
+//grf_mono_font (id 1) the fixed-width one (terminal/code look). Add more slots
+//here (serif, a bold weight) as new globals with fresh ids. JIT does NOT zero
+//globals, so nothing here may be trusted until GrFontInitInto writes it -
+//callers gate on grf_ready / a font's own .ok (which InitInto sets reliably).
+public CGrFont	grf_ui_font;
+public CGrFont	grf_mono_font;
+public Bool		grf_ready = FALSE;	//default UI font loaded ok (statically FALSE)
+Bool			grf_cache_ready = FALSE;
 CGrGlyph		grf_cache[GRF_CACHE];
 I64				grf_cache_n = 0;	//JIT zeroes nothing: explicit
 
@@ -636,7 +645,9 @@ grf_span_next:;
 
 CGrGlyph *GrFontGlyph(CGrFont *f, I64 gi, I64 size)
 {//Direct-mapped glyph cache: hit or rasterize-then-cache (evicting collisions).
-	I64		 key = (gi << 9) | (size & 0x1FF);
+//Key includes the font id: the same glyph index means different glyphs in
+//different fonts.
+	I64		 key = (f->id << 28) | (gi << 9) | (size & 0x1FF);
 	I64		 slot = (key & 0x7FFFFFFF) % GRF_CACHE;
 	CGrGlyph *e = &grf_cache[slot];
 
@@ -648,6 +659,14 @@ CGrGlyph *GrFontGlyph(CGrFont *f, I64 gi, I64 size)
 	e->key = key;
 
 	return e;
+}
+
+public CGrFont *GrFontPick(Bool mono)
+{//Resolve a font family to a loaded slot, with fallback: a requested monospace
+//that failed to load falls back to the UI sans font.
+	if (mono && grf_mono_font.ok)
+		return &grf_mono_font;
+	return &grf_ui_font;
 }
 
 public I64 GrFontAscent(CGrFont *f, I64 size)
@@ -786,33 +805,51 @@ public I64 GrFontText(CDC *dc, I64 x, I64 baseline_y, I64 size, I64 color,
 	return w;
 }
 
-public Bool GrFontInit(U8 *buf, I64 size)
-{//Install a .ttf (already read into 'buf') as the UI font grf_ui_font. The
-//buffer is copied onto the sys_task heap so the font outlives the caller.
-//FileRead lives in BlkDev (compiled AFTER Gr), so the CALLER reads the file
-//and hands us the bytes. Returns FALSE (and .ok stays FALSE) on any failure,
-//so callers cleanly fall back to the 8x8 bitmap font.
-	I64	 i;
+U0 GrFontCacheInit()
+{//One-time glyph-cache clear (all slots empty). Idempotent across font loads.
+	I64 i;
 
-	if (grf_ui_font.ok && grf_ui_font.data)
-		return TRUE;					//already loaded
-	if (!buf || size < 12)
-		return FALSE;
-	grf_ui_font.data = MAlloc(size, sys_task);
-	MemCopy(grf_ui_font.data, buf, size);
-	if (!GrFontOpen(grf_ui_font.data, size, &grf_ui_font))
-	{
-		Free(grf_ui_font.data);
-		grf_ui_font.data = NULL;
-		grf_ui_font.ok = FALSE;
-		return FALSE;
-	}
+	if (grf_cache_ready)
+		return;
 	for (i = 0; i < GRF_CACHE; i++)
 	{
 		grf_cache[i].key = -1;
 		grf_cache[i].cov = NULL;
 	}
 	grf_cache_n = 0;
+	grf_cache_ready = TRUE;
+}
+
+public Bool GrFontInitInto(CGrFont *f, I64 id, U8 *buf, I64 size)
+{//Install a .ttf (already read into 'buf') into font slot 'f' with registry
+//'id'. The bytes are copied onto the sys_task heap so the font outlives the
+//caller. FileRead lives in BlkDev (compiled AFTER Gr), so the CALLER reads the
+//file and hands us the bytes (buf may be NULL when the file was missing).
+//ALWAYS leaves f->ok reliably set (globals aren't JIT-zeroed), so callers can
+//trust f->ok to pick a fallback.
+	f->ok	= FALSE;					//reliable even if we bail below
+	f->data = NULL;
+	f->id	= id;
+	if (!buf || size < 12)
+		return FALSE;
+	f->data = MAlloc(size, sys_task);
+	MemCopy(f->data, buf, size);
+	if (!GrFontOpen(f->data, size, f))
+	{
+		Free(f->data);
+		f->data = NULL;
+		f->ok = FALSE;
+		return FALSE;
+	}
+	f->id = id;							//GrFontOpen doesn't touch id
+	GrFontCacheInit;
 
 	return TRUE;
+}
+
+public Bool GrFontInit(U8 *buf, I64 size)
+{//Back-compat: install the default UI font (slot 0). grf_ready mirrors success.
+	grf_ready = GrFontInitInto(&grf_ui_font, 0, buf, size);
+
+	return grf_ready;
 }

@@ -378,14 +378,15 @@ U0 GxRunFlush()
 
 	if (gx.run_len && zinc_ttf)
 	{
+		CGrFont *rf = GrFontPick(gx.run_style.mono == 1);
 		gx.run[gx.run_len] = 0;
 		px	= GxFontPx(&gx.run_style);
-		fdc = GrFontRenderDC(&grf_ui_font, px, GxRgbFg(&gx.run_style),
+		fdc = GrFontRenderDC(rf, px, GxRgbFg(&gx.run_style),
 							 GxRgbBg(&gx.run_style), gx.run);
 		if (fdc)
 		{//rendered ok: emit a run-DC op (else fall through to the 8x8 path)
 			op = GxOpAdd(GXO_TEXT, gx.run_x, gx.run_y, fdc->width,
-						 GrFontLineH(&grf_ui_font, px));
+						 GrFontLineH(rf, px));
 			if (op)
 			{
 				op->sc	 = fdc;		//owned; freed on reset (type != GXO_IMG)
@@ -463,12 +464,13 @@ U0 GxWord(U8 *word, I64 len, CZStyle *style, I64 scale)
 	if (len <= 0)
 		return;
 	if (zinc_ttf)
-	{//proportional advance widths from the font's own metrics
+	{//advance widths from the chosen font's own metrics (mono vs proportional)
+		CGrFont *wf = GrFontPick(style->mono == 1);
 		px	 = GxFontPx(style);
 		need = 0;
 		for (i = 0; i < len; i++)
-			need += GrFontAdvPx(&grf_ui_font, word[i], px);
-		cw = GrFontAdvPx(&grf_ui_font, ' ', px);
+			need += GrFontAdvPx(wf, word[i], px);
+		cw = GrFontAdvPx(wf, ' ', px);
 	}
 	else
 	{
@@ -513,7 +515,7 @@ U0 GxWord(U8 *word, I64 len, CZStyle *style, I64 scale)
 	//Line advance: the glyph line box is the floor; author line-height, when
 	//set, may raise it.
 	if (zinc_ttf)
-		glyph_h = GrFontLineH(&grf_ui_font, px);
+		glyph_h = GrFontLineH(GrFontPick(style->mono == 1), px);
 	else
 		glyph_h = FONT_HEIGHT * scale + GX_LINE_LEAD;
 	lh = glyph_h;
@@ -2800,18 +2802,22 @@ public U0 ZincGX(U8 *start_url=NULL)
 	zinc_defer_ext_js = TRUE; //external scripts load in the background here
 	zinc_js_queue_count = 0;  //stale entries died with any previous GX task
 
-	if (!grf_ui_font.ok)
-	{//Load the scalable UI font once (proportional, real px sizes). FileRead
-	//lives in BlkDev - available here in the browser. Failure => 8x8 fallback.
-		I64	 fsz;
+	if (!grf_ready)
+	{//Load the scalable fonts once (proportional UI sans + fixed-width mono).
+	//FileRead lives in BlkDev - available here in the browser. gate on
+	//grf_ready (statically FALSE), NOT grf_ui_font.ok (a global = JIT garbage
+	//until written). Any failure => that font's .ok stays FALSE => fallback.
+		I64	 fsz = 0, msz = 0;
 		U8	*fbuf = FileRead("::/System/Gr/UISANS.TTF", &fsz);
+		U8	*mbuf = FileRead("::/System/Gr/UIMONO.TTF", &msz);
+		GrFontInit(fbuf, fsz);							//slot 0, sets grf_ready
+		GrFontInitInto(&grf_mono_font, 1, mbuf, msz);	//slot 1 (may fail -> sans)
 		if (fbuf)
-		{
-			GrFontInit(fbuf, fsz);
 			Free(fbuf);
-		}
+		if (mbuf)
+			Free(mbuf);
 	}
-	zinc_ttf = grf_ui_font.ok;
+	zinc_ttf = grf_ready;
 
 	AutoComplete(OFF);
 	DocCursor(OFF);

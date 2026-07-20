@@ -57,6 +57,7 @@ class CZStyle
 	I8	grid_cols;				// grid-template-columns track count; -1 unset
 	I16 bg_img;					// background-image: zcss_bgimg index; -1 unset
 	I16 line_h;					// line-height in px; -1 normal/unset. Inherits.
+	I8	mono;					// font-family is monospace; -1 unset. Inherits.
 };
 
 class CZCssRule
@@ -111,6 +112,7 @@ U0 ZStyleReset(CZStyle *s)
 	s->grid_cols = -1;	// was missing: merge reads it, so garbage leaked in
 	s->bg_img = -1;
 	s->line_h = -1;
+	s->mono = -1;
 }
 
 U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
@@ -148,6 +150,7 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	if (src->pos	   >= 0) dst->pos		= src->pos;
 	if (src->bg_img   >= 0) dst->bg_img	= src->bg_img;
 	if (src->line_h   >= 0) dst->line_h	= src->line_h;
+	if (src->mono	   >= 0) dst->mono		= src->mono;
 }
 
 U0 ZStyleStripBox(CZStyle *s)
@@ -1067,6 +1070,15 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 	}
 	else if (!StrICompare(name, "font-size"))
 		ZCssFontSizeSet(val, out);
+	else if (!StrICompare(name, "font-family"))
+	{ // pick the monospace vs proportional family; specific faces ignored
+		if (StrIMatch("mono", val) || StrIMatch("courier", val) ||
+			StrIMatch("consol", val) || StrIMatch("menlo", val) ||
+			StrIMatch("monaco", val) || StrIMatch("fixed", val))
+			out->mono = 1;
+		else
+			out->mono = 0;
+	}
 	else if (!StrICompare(name, "font"))
 	{ // shorthand: pick out a weight and a size; family is ignored
 		p = val;
