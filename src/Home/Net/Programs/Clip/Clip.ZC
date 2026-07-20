@@ -4,14 +4,15 @@
 // the host over HTTP: a background task keeps them in sync both ways, so once
 // it is running you just use Ctrl+C / Ctrl+V as normal and it reaches the host.
 //
-// Host side: run clipd.py (same folder) on your Manjaro box. The guest reaches
-// it at 10.0.2.2 (QEMU user-net gateway). Needs the Net stack loaded.
+// Host side: run utils/clipd.py (in the repo root, NOT the ZealOS src tree) on
+// your Manjaro box. The guest reaches it at 10.0.2.2 (QEMU user-net gateway).
+// Needs the Net stack loaded.
 //
 //   #include "C:/Home/Net/Programs/Clip/Clip"
 //   ClipStart;      // begin syncing; now Ctrl+C/Ctrl+V talk to the host
 //   ClipStop;       // stop syncing
 
-#define CLIP_URL	"http://10.0.2.2:9999"
+#define CLIP_URL	"http://10.0.2.2:9999/"
 #define CLIP_POLL_MS	500
 
 Bool	clip_running = FALSE;
@@ -153,6 +154,32 @@ public U0 ClipStop()
 {
 	clip_running = FALSE;
 	"Clipboard bridge stopping.\n";
+}
+
+public U0 ClipTest()
+{ /* Diagnose the host bridge. Isolates the HTTP link from the clipboard: run
+	this, then check clipd.py's output on the host. */
+	CHttpResponse	*r;
+
+	"$$LTBLUE$$Bridge test -> %s$$FG$$\n", CLIP_URL;
+
+	r = HttpPost(CLIP_URL, "hello-from-zealos", "text/plain");
+	if (!r)
+		"$$RED$$POST: no response. Host unreachable -- clipd.py not running, wrong port, or firewall. Try Ping(0x0A000202) [10.0.2.2].$$FG$$\n";
+	else
+	{
+		if (r->status == 200)
+			"$$GREEN$$POST HTTP 200 -- check the host clipboard now, it should read: hello-from-zealos$$FG$$\n";
+		else
+			"$$RED$$POST HTTP %d -- daemon reached but the clipboard set failed (wl-copy/xclip missing on host?).$$FG$$\n", r->status;
+		HttpResponseFree(r);
+	}
+
+	r = HttpGet(CLIP_URL);
+	if (!r)
+	{ "$$RED$$GET: no response.$$FG$$\n"; return; }
+	"GET HTTP %d, %d bytes read from the host clipboard.\n", r->status, r->body_length;
+	HttpResponseFree(r);
 }
 
 // One-shot manual helpers (no background task needed):
