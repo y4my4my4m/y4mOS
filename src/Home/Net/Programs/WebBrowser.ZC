@@ -28,6 +28,7 @@ Cd(__DIR__);;
 #include "Zinc/HTML"
 #include "Zinc/CSS"
 #include "Zinc/JS"
+#include "Zinc/SVG"
 #include "Zinc/Render"
 
 #define ZINC_HISTORY	64

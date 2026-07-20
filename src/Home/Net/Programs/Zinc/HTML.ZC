@@ -436,9 +436,12 @@ Bool ZHtmlTagBlock(U8 *tag)
 }
 
 Bool ZHtmlTagRaw(U8 *tag)
-{ // content is raw text until the matching close tag
+{ // content is raw text until the matching close tag. svg is kept raw so the
+  // whole vector subtree survives verbatim in node->text for GrSVG to parse
+  // (the HTML DOM would otherwise mangle path/transform data).
 	return !StrCompare(tag, "script") || !StrCompare(tag, "style") ||
-		   !StrCompare(tag, "textarea") || !StrCompare(tag, "title");
+		   !StrCompare(tag, "textarea") || !StrCompare(tag, "title") ||
+		   !StrCompare(tag, "svg");
 }
 
 U0 ZHtmlFlushText(CZNode *parent, U8 *buf, I64 *n)
@@ -455,8 +458,10 @@ U0 ZHtmlFlushText(CZNode *parent, U8 *buf, I64 *n)
 }
 
 U8 *ZHtmlParseAttrs(U8 *p, CZNode *node)
-{ // parse attributes up to '>' (not consumed); entity-decodes values
-	U8	name[24], raw[1024], val[1024];
+{ // parse attributes up to '>' (not consumed); entity-decodes values. Buffers
+  // are generous so long values survive - notably data: URI images (a base64
+  // SVG logo can be ~9KB) that would otherwise truncate and fail to decode.
+	U8	name[24], raw[12288], val[12288];
 	I64	name_len, raw_len, val_len, quote;
 
 	while (*p && *p != '>')
@@ -489,7 +494,7 @@ U8 *ZHtmlParseAttrs(U8 *p, CZNode *node)
 					quote = *p++;
 					while (*p && *p != quote)
 					{
-						if (raw_len < 1023)
+						if (raw_len < 12287)
 							raw[raw_len++] = *p;
 						p++;
 					}
@@ -501,7 +506,7 @@ U8 *ZHtmlParseAttrs(U8 *p, CZNode *node)
 					while (*p && *p != '>' && *p != ' ' && *p != '\t' &&
 						   *p != '\r' && *p != '\n')
 					{
-						if (raw_len < 1023)
+						if (raw_len < 12287)
 							raw[raw_len++] = *p;
 						p++;
 					}
@@ -511,7 +516,7 @@ U8 *ZHtmlParseAttrs(U8 *p, CZNode *node)
 			if (name_len)
 			{
 				val_len = 0;
-				ZHtmlDecodeRun(raw, raw + raw_len, val, &val_len, 1020, TRUE);
+				ZHtmlDecodeRun(raw, raw + raw_len, val, &val_len, 12284, TRUE);
 				ZNodeAttrSet(node, name, val);
 			}
 		}
@@ -649,8 +654,9 @@ U0 ZHtmlParseInto(CZNode *parent_node, U8 *html)
 								scan++;
 						}
 						text_len = 0;
-						if (!StrCompare(tag, "script") || !StrCompare(tag, "style"))
-						{ // raw copy, no entity decode
+						if (!StrCompare(tag, "script") || !StrCompare(tag, "style") ||
+							!StrCompare(tag, "svg"))
+						{ // raw copy, no entity decode (svg path data must stay verbatim)
 							i = scan - p;
 							if (i > 0)
 							{

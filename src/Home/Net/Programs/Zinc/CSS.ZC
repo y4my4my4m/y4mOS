@@ -630,14 +630,41 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 	{
 		if (!StrNICompare(val, "none", 4))
 			out->display = ZCSS_DISP_NONE;
+		else if (!StrNICompare(val, "inline-block", 12))
+			out->display = ZCSS_DISP_BLOCK;
 		else if (!StrNICompare(val, "inline", 6))
 			out->display = ZCSS_DISP_INLINE;
 		else
-			out->display = ZCSS_DISP_BLOCK;
+			out->display = ZCSS_DISP_BLOCK; // block, flex, grid all flow as block
+	}
+	else if (!StrICompare(name, "justify-content") ||
+			 !StrICompare(name, "place-content") ||
+			 !StrICompare(name, "align-items") ||
+			 !StrICompare(name, "place-items") ||
+			 !StrICompare(name, "justify-items") ||
+			 !StrICompare(name, "text-align-last"))
+	{//No real flexbox, but map a centered flex container onto our text-align
+	 //centering (which inherits), so modern centered layouts stop hugging the
+	 //left edge. center wins; explicit start/end map to left/right.
+		if (StrFind("center", val))
+			out->align = 1;
+		else if (StrFind("end", val) || StrFind("right", val))
+			out->align = 2;
+		else if (StrFind("start", val) || StrFind("left", val))
+			out->align = 0;
 	}
 	else if (!StrICompare(name, "visibility"))
 	{
 		if (!StrNICompare(val, "hidden", 6))
+			out->display = ZCSS_DISP_NONE;
+	}
+	else if (!StrICompare(name, "clip") || !StrICompare(name, "clip-path"))
+	{//The "screen-reader only" idiom (clip:rect(0 0 0 0) / clip-path:inset(50%))
+	 //visually removes an element while keeping it for a11y. We have no clip, so
+	 //treat it as hidden - otherwise these off-screen labels (e.g. DuckDuckGo's
+	 //hidden <h1>) render as big stray text.
+		if (StrFind("rect(", val) || StrFind("inset(", val) ||
+			StrFind("circle(0", val) || StrFind("polygon(", val))
 			out->display = ZCSS_DISP_NONE;
 	}
 	else if (!StrICompare(name, "opacity"))

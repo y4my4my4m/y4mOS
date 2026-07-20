@@ -1,0 +1,1372 @@
+/*	Zinc SVG: a minimal vector-image renderer. Public Domain.
+
+	Renders the common SVG subset that web logos and icons use into a truecolor
+	CDC (transparent background, drawn with GrBlot), so inline <svg> and .svg
+	images show as real vectors in ZincGX instead of an "img" placeholder.
+
+	Supported:
+	  shapes  rect circle ellipse line polygon polyline path
+	  groups  <g transform=...> nesting, fill/stroke inheritance
+	  path d  M L H V C S Q T A Z (relative + absolute); curves and arcs are
+	          flattened to line segments
+	  fill    #rgb #rrggbb rgb()/rgba() named-color "none" "currentColor",
+	          filled with the nonzero-winding rule (so glyph counters/holes work)
+	  stroke  solid color + width (approximate, square nib)
+	  coords  viewBox scaling + transform translate/scale/rotate/matrix
+	Not done: gradients, patterns, <text>, clip/mask, opacity, dash arrays.
+
+	Entry points:
+	  SVGRenderToDC(inner, vbx,vby,vbw,vbh, tw,th, fill_hint, task) -> CDC*
+	  SVGReadBuf(buf, size, tw, th, task)                          -> CDC*
+	Both return NULL on failure so the caller can fall back to a placeholder.
+
+	No literal dollar signs allowed in this file (DolDoc source rule). */
+
+#define SVG_MAX_PTS		16384	// flattened points per <path> / shape
+#define SVG_MAX_XS		512		// edge crossings per scanline
+#define SVG_BEZ_SEGS	10		// line segments per bezier
+#define SVG_ARC_SEGS	18		// max segments across a full arc sweep
+#define SVG_GSTACK		24		// <g> nesting depth
+#define SVG_MAX_ELEMS	20000	// hard cap on elements drawn (anti-hang)
+#define SVG_PI			3.14159265358979323846
+
+// A 2x3 affine map: device_x = a*x + c*y + e,  device_y = b*x + d*y + f.
+class CSvgMat
+{
+	F64 a, b, c, d, e, f;
+};
+
+class CSvgCtx
+{
+	CDC		*dc;
+	I64		 w, h;					// device size
+
+	CSvgMat	 ctm;					// current transform (user -> device)
+	CSvgMat	 m;						// active transform for the element in hand
+	CSvgMat	 gstack[SVG_GSTACK];
+	I64		 gsp;
+
+	// inherited presentation, pushed/popped with <g>
+	U32		 fill;   Bool fill_on;
+	U32		 stroke; Bool stroke_on;
+	F64		 stroke_w;
+	Bool	 evenodd;				// fill-rule: TRUE = even-odd, FALSE = nonzero
+	U32		 gfill[SVG_GSTACK];   U8 gfill_on[SVG_GSTACK];
+	U32		 gstroke[SVG_GSTACK]; U8 gstroke_on[SVG_GSTACK];
+	F64		 gstroke_w[SVG_GSTACK]; U8 gevenodd[SVG_GSTACK];
+
+	// flattened path points (device coords) + subpath markers
+	F64		*px, *py;
+	U8		*newsub;
+	I64		 np;
+
+	// scratch edge list for the scanline fill
+	F64		*ex0, *ey0, *ex1, *ey1;
+
+	U32		 fill_hint;				// value for fill="currentColor"
+	I64		 elems;					// elements drawn so far
+};
+
+/* ---- small math helpers (avoid depending on exact library names) ---- */
+
+F64 SvgAbs(F64 v)
+{
+	if (v < 0.0)
+		return -v;
+	return v;
+}
+
+I64 SvgRound(F64 v)
+{ // F64 -> I64 via the ToI64 intrinsic (a postfix (I64) cast would be a no-op)
+	if (v >= 0.0)
+		return ToI64(v + 0.5);
+	return ToI64(v - 0.5);
+}
+
+F64 SvgAtan2(F64 y, F64 x)
+{ // built from ATan (IC_ATAN) so we do not rely on an ATan2 being present
+	if (x > 0.0)
+		return ATan(y / x);
+	if (x < 0.0)
+	{
+		if (y >= 0.0)
+			return ATan(y / x) + SVG_PI;
+		return ATan(y / x) - SVG_PI;
+	}
+	if (y > 0.0)
+		return SVG_PI / 2.0;
+	if (y < 0.0)
+		return -(SVG_PI / 2.0);
+	return 0.0;
+}
+
+/* ---- matrix ---- */
+
+U0 SvgMatIdentity(CSvgMat *m)
+{
+	m->a = 1.0; m->b = 0.0; m->c = 0.0;
+	m->d = 1.0; m->e = 0.0; m->f = 0.0;
+}
+
+U0 SvgMatCopy(CSvgMat *dst, CSvgMat *src)
+{
+	dst->a = src->a; dst->b = src->b; dst->c = src->c;
+	dst->d = src->d; dst->e = src->e; dst->f = src->f;
+}
+
+U0 SvgMatMul(CSvgMat *out, CSvgMat *p, CSvgMat *q)
+{ // out = p * q  (apply q to a point first, then p)
+	CSvgMat r;
+	r.a = p->a * q->a + p->c * q->b;
+	r.b = p->b * q->a + p->d * q->b;
+	r.c = p->a * q->c + p->c * q->d;
+	r.d = p->b * q->c + p->d * q->d;
+	r.e = p->a * q->e + p->c * q->f + p->e;
+	r.f = p->b * q->e + p->d * q->f + p->f;
+	SvgMatCopy(out, &r);
+}
+
+U0 SvgMatApply(CSvgMat *m, F64 x, F64 y, F64 *ox, F64 *oy)
+{
+	*ox = m->a * x + m->c * y + m->e;
+	*oy = m->b * x + m->d * y + m->f;
+}
+
+/* ---- pixel output ---- */
+
+U0 SvgPlot(CSvgCtx *ctx, I64 x, I64 y, U32 col)
+{
+	if (0 <= x < ctx->w && 0 <= y < ctx->h)
+		ctx->dc->body[y * ctx->dc->width_internal + x] = col & 0x00FFFFFF;
+}
+
+U0 SvgSpan(CSvgCtx *ctx, I64 x0, I64 x1, I64 y, U32 col)
+{ // fill an inclusive horizontal run at row y
+	I64 x;
+	U32 *row;
+	if (y < 0 || y >= ctx->h)
+		return;
+	if (x0 > x1)
+	{ x = x0; x0 = x1; x1 = x; }
+	if (x0 < 0)
+		x0 = 0;
+	if (x1 >= ctx->w)
+		x1 = ctx->w - 1;
+	row = ctx->dc->body + y * ctx->dc->width_internal;
+	for (x = x0; x <= x1; x++)
+		row[x] = col & 0x00FFFFFF;
+}
+
+/* ---- number + color parsing ---- */
+
+Bool SvgIsNumStart(U8 c)
+{
+	return c == '-' || c == '+' || c == '.' || '0' <= c <= '9';
+}
+
+F64 SvgNum(U8 **pp)
+{ // parse one SVG number, skipping leading spaces/commas; handles packed forms
+	U8	*p = *pp;
+	U8	 buf[64];
+	I64	 n = 0;
+	F64	 v;
+
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')
+		p++;
+	if (*p == '+' || *p == '-')
+	{ if (n < 62) buf[n++] = *p; p++; }
+	while ('0' <= *p <= '9')
+	{ if (n < 62) buf[n++] = *p; p++; }
+	if (*p == '.')
+	{
+		if (n < 62) buf[n++] = *p;
+		p++;
+		while ('0' <= *p <= '9')
+		{ if (n < 62) buf[n++] = *p; p++; }
+	}
+	if (*p == 'e' || *p == 'E')
+	{
+		if (n < 62) buf[n++] = *p;
+		p++;
+		if (*p == '+' || *p == '-')
+		{ if (n < 62) buf[n++] = *p; p++; }
+		while ('0' <= *p <= '9')
+		{ if (n < 62) buf[n++] = *p; p++; }
+	}
+	buf[n] = 0;
+	v = Str2F64(buf);
+	*pp = p;
+	return v;
+}
+
+Bool SvgMoreNums(U8 *p)
+{
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')
+		p++;
+	return SvgIsNumStart(*p);
+}
+
+I64 SvgHex1(U8 c)
+{
+	if ('0' <= c <= '9') return c - '0';
+	if ('a' <= c <= 'f') return c - 'a' + 10;
+	if ('A' <= c <= 'F') return c - 'A' + 10;
+	return 0;
+}
+
+Bool SvgNamedColor(U8 *s, U32 *out)
+{
+	if (!StrICompare(s, "black"))	{ *out = 0x000000; return TRUE; }
+	if (!StrICompare(s, "white"))	{ *out = 0xFFFFFF; return TRUE; }
+	if (!StrICompare(s, "red"))		{ *out = 0xFF0000; return TRUE; }
+	if (!StrICompare(s, "green"))	{ *out = 0x008000; return TRUE; }
+	if (!StrICompare(s, "lime"))	{ *out = 0x00FF00; return TRUE; }
+	if (!StrICompare(s, "blue"))	{ *out = 0x0000FF; return TRUE; }
+	if (!StrICompare(s, "navy"))	{ *out = 0x000080; return TRUE; }
+	if (!StrICompare(s, "yellow"))	{ *out = 0xFFFF00; return TRUE; }
+	if (!StrICompare(s, "orange"))	{ *out = 0xFFA500; return TRUE; }
+	if (!StrICompare(s, "gray") || !StrICompare(s, "grey"))
+									{ *out = 0x808080; return TRUE; }
+	if (!StrICompare(s, "silver"))	{ *out = 0xC0C0C0; return TRUE; }
+	if (!StrICompare(s, "teal"))	{ *out = 0x008080; return TRUE; }
+	if (!StrICompare(s, "purple"))	{ *out = 0x800080; return TRUE; }
+	if (!StrICompare(s, "cyan") || !StrICompare(s, "aqua"))
+									{ *out = 0x00FFFF; return TRUE; }
+	if (!StrICompare(s, "magenta"))	{ *out = 0xFF00FF; return TRUE; }
+	return FALSE;
+}
+
+Bool SvgParseColor(CSvgCtx *ctx, U8 *s, U32 *out)
+{ // FALSE = paint "none"/unparseable (no paint); TRUE sets *out to 0x00RRGGBB
+	I64 r, g, b;
+	U8 *p;
+
+	while (*s == ' ' || *s == '\t')
+		s++;
+	if (!*s || !StrICompare(s, "none") || !StrICompare(s, "transparent"))
+		return FALSE;
+	if (!StrICompare(s, "currentColor"))
+	{ *out = ctx->fill_hint & 0x00FFFFFF; return TRUE; }
+
+	if (*s == '#')
+	{
+		s++;
+		if (StrLen(s) >= 6)
+		{
+			r = SvgHex1(s[0]) * 16 + SvgHex1(s[1]);
+			g = SvgHex1(s[2]) * 16 + SvgHex1(s[3]);
+			b = SvgHex1(s[4]) * 16 + SvgHex1(s[5]);
+		}
+		else
+		{ // #rgb short form
+			r = SvgHex1(s[0]) * 17;
+			g = SvgHex1(s[1]) * 17;
+			b = SvgHex1(s[2]) * 17;
+		}
+		*out = (r << 16) | (g << 8) | b;
+		return TRUE;
+	}
+	if (!StrNICompare(s, "rgb", 3))
+	{
+		p = StrFind("(", s);
+		if (!p)
+			return FALSE;
+		p++;
+		r = SvgNum(&p);
+		g = SvgNum(&p);
+		b = SvgNum(&p);
+		if (r < 0) r = 0; if (r > 255) r = 255;
+		if (g < 0) g = 0; if (g > 255) g = 255;
+		if (b < 0) b = 0; if (b > 255) b = 255;
+		*out = (r << 16) | (g << 8) | b;
+		return TRUE;
+	}
+	return SvgNamedColor(s, out);
+}
+
+/* ---- attribute extraction from a raw tag body ---- */
+
+Bool SvgGetAttr(U8 *tag, U8 *name, U8 *out, I64 max)
+{ // find name="..." (or name='...') within the tag body; out is NUL-terminated
+	I64	 nl = StrLen(name), n;
+	U8	*p = tag, q;
+
+	while (*p)
+	{
+		// match name as a whole attribute token (preceded by space, followed by =)
+		if (!StrNICompare(p, name, nl) && (p == tag || p[-1] == ' ' ||
+			p[-1] == '\t' || p[-1] == '\n' || p[-1] == '\r'))
+		{
+			q = p[nl];
+			if (q == '=' || q == ' ' || q == '\t')
+			{
+				p += nl;
+				while (*p == ' ' || *p == '\t')
+					p++;
+				if (*p == '=') // HolyC has no 'continue'; just skip the non-'=' case
+				{
+					p++;
+					while (*p == ' ' || *p == '\t')
+						p++;
+					q = '"';
+					if (*p == '"' || *p == '\'')
+					{ q = *p; p++; }
+					n = 0;
+					while (*p && *p != q && n < max - 1)
+						out[n++] = *p++;
+					out[n] = 0;
+					return TRUE;
+				}
+			}
+		}
+		p++;
+	}
+	out[0] = 0;
+	return FALSE;
+}
+
+U8 *SvgGetAttrNew(U8 *tag, U8 *name)
+{ // MAlloc'd copy of an attribute value (for long ones: path d, poly points).
+  // Returns NULL if absent. Caller frees.
+	I64	 nl = StrLen(name), cap;
+	U8	*p = tag, *s, *out, q;
+
+	while (*p)
+	{
+		if (!StrNICompare(p, name, nl) && (p == tag || p[-1] == ' ' ||
+			p[-1] == '\t' || p[-1] == '\n' || p[-1] == '\r'))
+		{
+			q = p[nl];
+			if (q == '=' || q == ' ' || q == '\t')
+			{
+				p += nl;
+				while (*p == ' ' || *p == '\t')
+					p++;
+				if (*p == '=') // HolyC has no 'continue'; skip the non-'=' case
+				{
+					p++;
+					while (*p == ' ' || *p == '\t')
+						p++;
+					q = '"';
+					if (*p == '"' || *p == '\'')
+					{ q = *p; p++; }
+					s = p; cap = 0;
+					while (s[cap] && s[cap] != q)
+						cap++;
+					out = MAlloc(cap + 1);
+					MemCopy(out, p, cap);
+					out[cap] = 0;
+					return out;
+				}
+			}
+		}
+		p++;
+	}
+	return NULL;
+}
+
+/* ---- point emission + curve flattening (device space) ---- */
+
+U0 SvgEmit(CSvgCtx *ctx, F64 ux, F64 uy, Bool newsub)
+{
+	F64 dx, dy;
+	if (ctx->np >= SVG_MAX_PTS)
+		return;
+	SvgMatApply(&ctx->m, ux, uy, &dx, &dy);
+	ctx->px[ctx->np] = dx;
+	ctx->py[ctx->np] = dy;
+	ctx->newsub[ctx->np] = newsub;
+	ctx->np++;
+}
+
+U0 SvgCubic(CSvgCtx *ctx, F64 x0, F64 y0, F64 x1, F64 y1,
+			F64 x2, F64 y2, F64 x3, F64 y3)
+{ // flatten a cubic bezier; the start point is assumed already emitted
+	I64 i;
+	F64 t, u, x, y;
+	for (i = 1; i <= SVG_BEZ_SEGS; i++)
+	{
+		t = ToF64(i) / ToF64(SVG_BEZ_SEGS);
+		u = 1.0 - t;
+		x = u*u*u*x0 + 3.0*u*u*t*x1 + 3.0*u*t*t*x2 + t*t*t*x3;
+		y = u*u*u*y0 + 3.0*u*u*t*y1 + 3.0*u*t*t*y2 + t*t*t*y3;
+		SvgEmit(ctx, x, y, FALSE);
+	}
+}
+
+U0 SvgQuad(CSvgCtx *ctx, F64 x0, F64 y0, F64 x1, F64 y1, F64 x2, F64 y2)
+{
+	I64 i;
+	F64 t, u, x, y;
+	for (i = 1; i <= SVG_BEZ_SEGS; i++)
+	{
+		t = ToF64(i) / ToF64(SVG_BEZ_SEGS);
+		u = 1.0 - t;
+		x = u*u*x0 + 2.0*u*t*x1 + t*t*x2;
+		y = u*u*y0 + 2.0*u*t*y1 + t*t*y2;
+		SvgEmit(ctx, x, y, FALSE);
+	}
+}
+
+U0 SvgArc(CSvgCtx *ctx, F64 x0, F64 y0, F64 rx, F64 ry, F64 phi_deg,
+		  Bool large, Bool sweep, F64 x1, F64 y1)
+{ // SVG elliptical arc, endpoint parameterization (spec F.6.5), flattened
+	F64 phi, cph, sph, dx2, dy2, x1p, y1p, rx2, ry2, num, den, coef;
+	F64 cxp, cyp, cx, cy, ux, uy, vx, vy, theta1, dtheta, n1, n2, dot;
+	F64 t, ang, ca, sa, px, py, lam;
+	I64 i, segs;
+
+	if (rx == 0.0 || ry == 0.0)
+	{ SvgEmit(ctx, x1, y1, FALSE); return; }
+	rx = SvgAbs(rx);
+	ry = SvgAbs(ry);
+	phi = phi_deg * SVG_PI / 180.0;
+	cph = Cos(phi);
+	sph = Sin(phi);
+
+	dx2 = (x0 - x1) / 2.0;
+	dy2 = (y0 - y1) / 2.0;
+	x1p =  cph * dx2 + sph * dy2;
+	y1p = -sph * dx2 + cph * dy2;
+
+	rx2 = rx * rx;
+	ry2 = ry * ry;
+	lam = (x1p*x1p)/rx2 + (y1p*y1p)/ry2;
+	if (lam > 1.0)
+	{ // scale radii up so the endpoints are reachable
+		lam = Sqrt(lam);
+		rx = lam * rx; ry = lam * ry;
+		rx2 = rx * rx; ry2 = ry * ry;
+	}
+
+	num = rx2*ry2 - rx2*(y1p*y1p) - ry2*(x1p*x1p);
+	den = rx2*(y1p*y1p) + ry2*(x1p*x1p);
+	if (den == 0.0)
+	{ SvgEmit(ctx, x1, y1, FALSE); return; }
+	coef = num / den;
+	if (coef < 0.0)
+		coef = 0.0;
+	coef = Sqrt(coef);
+	if (large == sweep)
+		coef = -coef;
+	cxp =  coef * (rx * y1p / ry);
+	cyp = -coef * (ry * x1p / rx);
+
+	cx = cph * cxp - sph * cyp + (x0 + x1) / 2.0;
+	cy = sph * cxp + cph * cyp + (y0 + y1) / 2.0;
+
+	ux = (x1p - cxp) / rx;
+	uy = (y1p - cyp) / ry;
+	vx = (-x1p - cxp) / rx;
+	vy = (-y1p - cyp) / ry;
+
+	theta1 = SvgAtan2(uy, ux);
+	n1 = Sqrt(ux*ux + uy*uy);
+	n2 = Sqrt((ux*ux + uy*uy) * (vx*vx + vy*vy));
+	dot = ux*vx + uy*vy;
+	if (n2 == 0.0)
+		dtheta = 0.0;
+	else
+	{
+		coef = dot / n2;
+		if (coef < -1.0) coef = -1.0;
+		if (coef > 1.0) coef = 1.0;
+		dtheta = SvgAtan2(ux*vy - uy*vx, dot);
+	}
+	if (!sweep && dtheta > 0.0)
+		dtheta -= 2.0 * SVG_PI;
+	if (sweep && dtheta < 0.0)
+		dtheta += 2.0 * SVG_PI;
+
+	segs = SVG_ARC_SEGS;
+	no_warn n1;
+	for (i = 1; i <= segs; i++)
+	{
+		t = ToF64(i) / ToF64(segs);
+		ang = theta1 + dtheta * t;
+		ca = Cos(ang);
+		sa = Sin(ang);
+		px = cx + cph * (rx * ca) - sph * (ry * sa);
+		py = cy + sph * (rx * ca) + cph * (ry * sa);
+		SvgEmit(ctx, px, py, FALSE);
+	}
+}
+
+/* ---- nonzero-winding scanline fill of the current point set ---- */
+
+U0 SvgFillCurrent(CSvgCtx *ctx, U32 col)
+{
+	I64	 i, j, ne, y, ymin, ymax, nx, k;
+	F64	 yc, x, xa, xb, t;
+	F64	 xs[SVG_MAX_XS];
+	I64	 dir[SVG_MAX_XS];
+	I64	 sub_start;
+	F64	 fy, tmpx;
+	I64	 tmpd, wind, wprev;
+
+	if (ctx->np < 2)
+		return;
+
+	// build edge list: consecutive points inside a subpath, plus a closing edge
+	ne = 0;
+	sub_start = 0;
+	for (i = 0; i < ctx->np; i++)
+	{
+		if (i > 0 && ctx->newsub[i])
+		{ // close the subpath that just ended
+			if (i - 1 > sub_start && ne < SVG_MAX_PTS)
+			{
+				ctx->ex0[ne] = ctx->px[i - 1]; ctx->ey0[ne] = ctx->py[i - 1];
+				ctx->ex1[ne] = ctx->px[sub_start]; ctx->ey1[ne] = ctx->py[sub_start];
+				ne++;
+			}
+			sub_start = i;
+		}
+		if (i > 0 && !ctx->newsub[i] && ne < SVG_MAX_PTS)
+		{
+			ctx->ex0[ne] = ctx->px[i - 1]; ctx->ey0[ne] = ctx->py[i - 1];
+			ctx->ex1[ne] = ctx->px[i];     ctx->ey1[ne] = ctx->py[i];
+			ne++;
+		}
+	}
+	if (ctx->np - 1 > sub_start && ne < SVG_MAX_PTS)
+	{ // close the final subpath
+		ctx->ex0[ne] = ctx->px[ctx->np - 1]; ctx->ey0[ne] = ctx->py[ctx->np - 1];
+		ctx->ex1[ne] = ctx->px[sub_start];   ctx->ey1[ne] = ctx->py[sub_start];
+		ne++;
+	}
+	if (!ne)
+		return;
+
+	ymin = ctx->h; ymax = -1;
+	for (i = 0; i < ne; i++)
+	{
+		y = SvgRound(ctx->ey0[i]);
+		if (y < ymin) ymin = y;
+		if (y > ymax) ymax = y;
+		y = SvgRound(ctx->ey1[i]);
+		if (y < ymin) ymin = y;
+		if (y > ymax) ymax = y;
+	}
+	if (ymin < 0) ymin = 0;
+	if (ymax >= ctx->h) ymax = ctx->h - 1;
+
+	for (y = ymin; y <= ymax; y++)
+	{
+		fy = ToF64(y) + 0.5;
+		nx = 0;
+		for (i = 0; i < ne; i++)
+		{
+			xa = ctx->ey0[i]; xb = ctx->ey1[i];
+			if ((xa <= fy && fy < xb) || (xb <= fy && fy < xa))
+			{
+				t = (fy - ctx->ey0[i]) / (ctx->ey1[i] - ctx->ey0[i]);
+				x = ctx->ex0[i] + t * (ctx->ex1[i] - ctx->ex0[i]);
+				if (nx < SVG_MAX_XS)
+				{
+					xs[nx] = x;
+					if (ctx->ey1[i] > ctx->ey0[i])
+						dir[nx] = 1;
+					else
+						dir[nx] = -1;
+					nx++;
+				}
+			}
+		}
+		// insertion sort crossings by x (small nx)
+		for (i = 1; i < nx; i++)
+		{
+			tmpx = xs[i]; tmpd = dir[i];
+			j = i - 1;
+			while (j >= 0 && xs[j] > tmpx)
+			{ xs[j + 1] = xs[j]; dir[j + 1] = dir[j]; j--; }
+			xs[j + 1] = tmpx; dir[j + 1] = tmpd;
+		}
+		wind = 0;
+		xa = 0.0;
+		for (k = 0; k < nx; k++)
+		{
+			if (ctx->evenodd)
+			{ // fill between each pair of crossings (0-1, 2-3, ...)
+				if (k & 1)
+					SvgSpan(ctx, SvgRound(xa), SvgRound(xs[k]), y, col);
+				else
+					xa = xs[k];
+			}
+			else
+			{ // nonzero winding
+				wprev = wind;
+				wind += dir[k];
+				if (wprev == 0 && wind != 0)
+					xa = xs[k];
+				else if (wprev != 0 && wind == 0)
+					SvgSpan(ctx, SvgRound(xa), SvgRound(xs[k]), y, col);
+			}
+		}
+	}
+}
+
+U0 SvgStrokeCurrent(CSvgCtx *ctx, U32 col, F64 wdev)
+{ // draw each subpath edge as a line with a square nib (approximate)
+	I64 i, x0, y0, x1, y1, dx, dy, sx, sy, err, e2, rad, ox, oy;
+
+	rad = SvgRound(wdev / 2.0);
+	if (rad < 0)
+		rad = 0;
+	for (i = 1; i < ctx->np; i++)
+	{ // no edge across a subpath break (HolyC has no 'continue', so guard body)
+		if (!ctx->newsub[i])
+		{
+			x0 = SvgRound(ctx->px[i - 1]); y0 = SvgRound(ctx->py[i - 1]);
+			x1 = SvgRound(ctx->px[i]);     y1 = SvgRound(ctx->py[i]);
+			dx = x1 - x0; if (dx < 0) dx = -dx;
+			dy = y1 - y0; if (dy < 0) dy = -dy;
+			if (x0 < x1) sx = 1; else sx = -1;
+			if (y0 < y1) sy = 1; else sy = -1;
+			err = dx - dy;
+			while (TRUE)
+			{
+				for (oy = -rad; oy <= rad; oy++)
+					for (ox = -rad; ox <= rad; ox++)
+						SvgPlot(ctx, x0 + ox, y0 + oy, col);
+				if (x0 == x1 && y0 == y1)
+					break;
+				e2 = 2 * err;
+				if (e2 > -dy)
+				{ err -= dy; x0 += sx; }
+				if (e2 < dx)
+				{ err += dx; y0 += sy; }
+			}
+		}
+	}
+}
+
+/* ---- path data ---- */
+
+U0 SvgPaint(CSvgCtx *ctx, U32 fill, Bool fill_on, U32 stroke, Bool stroke_on,
+			F64 stroke_w)
+{
+	if (fill_on)
+		SvgFillCurrent(ctx, fill);
+	if (stroke_on)
+		SvgStrokeCurrent(ctx, stroke, stroke_w);
+}
+
+U0 SvgPath(CSvgCtx *ctx, U8 *d, U32 fill, Bool fill_on, U32 stroke,
+		   Bool stroke_on, F64 stroke_w)
+{
+	U8	*p = d, cmd, prev = 0;
+	F64	 cx = 0.0, cy = 0.0, sx = 0.0, sy = 0.0;   // current, subpath start
+	F64	 x1, y1, x2, y2, ex, ey, rx, ry, rot;
+	F64	 rcx = 0.0, rcy = 0.0;                      // reflected control point
+	Bool rel, large, sweep;
+
+	ctx->np = 0;
+	while (*p)
+	{
+		while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',')
+			p++;
+		if (!*p)
+			break;
+		if (('A' <= *p <= 'Z') || ('a' <= *p <= 'z'))
+		{ cmd = *p; p++; }
+		else
+			cmd = prev; // repeated command with new args
+		rel = ('a' <= cmd <= 'z');
+
+		switch (ToUpper(cmd))
+		{
+			case 'M':
+				ex = SvgNum(&p); ey = SvgNum(&p);
+				if (rel) { ex += cx; ey += cy; }
+				cx = ex; cy = ey; sx = cx; sy = cy;
+				SvgEmit(ctx, cx, cy, TRUE);
+				rcx = cx; rcy = cy;
+				// subsequent implicit pairs are lineto
+				while (SvgMoreNums(p))
+				{
+					ex = SvgNum(&p); ey = SvgNum(&p);
+					if (rel) { ex += cx; ey += cy; }
+					cx = ex; cy = ey;
+					SvgEmit(ctx, cx, cy, FALSE);
+					rcx = cx; rcy = cy;
+				}
+				break;
+			case 'L':
+				while (TRUE)
+				{
+					ex = SvgNum(&p); ey = SvgNum(&p);
+					if (rel) { ex += cx; ey += cy; }
+					cx = ex; cy = ey;
+					SvgEmit(ctx, cx, cy, FALSE);
+					rcx = cx; rcy = cy;
+					if (!SvgMoreNums(p)) break;
+				}
+				break;
+			case 'H':
+				while (TRUE)
+				{
+					ex = SvgNum(&p);
+					if (rel) ex += cx;
+					cx = ex;
+					SvgEmit(ctx, cx, cy, FALSE);
+					rcx = cx; rcy = cy;
+					if (!SvgMoreNums(p)) break;
+				}
+				break;
+			case 'V':
+				while (TRUE)
+				{
+					ey = SvgNum(&p);
+					if (rel) ey += cy;
+					cy = ey;
+					SvgEmit(ctx, cx, cy, FALSE);
+					rcx = cx; rcy = cy;
+					if (!SvgMoreNums(p)) break;
+				}
+				break;
+			case 'C':
+				while (TRUE)
+				{
+					x1 = SvgNum(&p); y1 = SvgNum(&p);
+					x2 = SvgNum(&p); y2 = SvgNum(&p);
+					ex = SvgNum(&p); ey = SvgNum(&p);
+					if (rel)
+					{ x1+=cx; y1+=cy; x2+=cx; y2+=cy; ex+=cx; ey+=cy; }
+					SvgCubic(ctx, cx, cy, x1, y1, x2, y2, ex, ey);
+					rcx = 2.0*ex - x2; rcy = 2.0*ey - y2;
+					cx = ex; cy = ey;
+					if (!SvgMoreNums(p)) break;
+				}
+				break;
+			case 'S':
+				while (TRUE)
+				{
+					if (ToUpper(prev) == 'C' || ToUpper(prev) == 'S')
+					{ x1 = rcx; y1 = rcy; }
+					else
+					{ x1 = cx; y1 = cy; }
+					x2 = SvgNum(&p); y2 = SvgNum(&p);
+					ex = SvgNum(&p); ey = SvgNum(&p);
+					if (rel) { x2+=cx; y2+=cy; ex+=cx; ey+=cy; }
+					SvgCubic(ctx, cx, cy, x1, y1, x2, y2, ex, ey);
+					rcx = 2.0*ex - x2; rcy = 2.0*ey - y2;
+					cx = ex; cy = ey;
+					prev = cmd;
+					if (!SvgMoreNums(p)) break;
+				}
+				break;
+			case 'Q':
+				while (TRUE)
+				{
+					x1 = SvgNum(&p); y1 = SvgNum(&p);
+					ex = SvgNum(&p); ey = SvgNum(&p);
+					if (rel) { x1+=cx; y1+=cy; ex+=cx; ey+=cy; }
+					SvgQuad(ctx, cx, cy, x1, y1, ex, ey);
+					rcx = 2.0*ex - x1; rcy = 2.0*ey - y1;
+					cx = ex; cy = ey;
+					if (!SvgMoreNums(p)) break;
+				}
+				break;
+			case 'T':
+				while (TRUE)
+				{
+					if (ToUpper(prev) == 'Q' || ToUpper(prev) == 'T')
+					{ x1 = rcx; y1 = rcy; }
+					else
+					{ x1 = cx; y1 = cy; }
+					ex = SvgNum(&p); ey = SvgNum(&p);
+					if (rel) { ex+=cx; ey+=cy; }
+					SvgQuad(ctx, cx, cy, x1, y1, ex, ey);
+					rcx = 2.0*ex - x1; rcy = 2.0*ey - y1;
+					cx = ex; cy = ey;
+					prev = cmd;
+					if (!SvgMoreNums(p)) break;
+				}
+				break;
+			case 'A':
+				while (TRUE)
+				{
+					rx = SvgNum(&p); ry = SvgNum(&p); rot = SvgNum(&p);
+					large = SvgNum(&p) != 0.0;
+					sweep = SvgNum(&p) != 0.0;
+					ex = SvgNum(&p); ey = SvgNum(&p);
+					if (rel) { ex+=cx; ey+=cy; }
+					SvgArc(ctx, cx, cy, rx, ry, rot, large, sweep, ex, ey);
+					cx = ex; cy = ey; rcx = cx; rcy = cy;
+					if (!SvgMoreNums(p)) break;
+				}
+				break;
+			case 'Z':
+				cx = sx; cy = sy;
+				rcx = cx; rcy = cy;
+				break;
+		}
+		prev = cmd;
+	}
+
+	SvgPaint(ctx, fill, fill_on, stroke, stroke_on, stroke_w);
+}
+
+/* ---- basic shapes ---- */
+
+U0 SvgShapeRect(CSvgCtx *ctx, F64 x, F64 y, F64 w, F64 h, U32 fill,
+				Bool fill_on, U32 stroke, Bool stroke_on, F64 sw)
+{
+	ctx->np = 0;
+	SvgEmit(ctx, x, y, TRUE);
+	SvgEmit(ctx, x + w, y, FALSE);
+	SvgEmit(ctx, x + w, y + h, FALSE);
+	SvgEmit(ctx, x, y + h, FALSE);
+	SvgPaint(ctx, fill, fill_on, stroke, stroke_on, sw);
+}
+
+U0 SvgShapeEllipse(CSvgCtx *ctx, F64 cx, F64 cy, F64 rx, F64 ry, U32 fill,
+				   Bool fill_on, U32 stroke, Bool stroke_on, F64 sw)
+{
+	I64 i, n = 48;
+	F64 ang;
+	ctx->np = 0;
+	for (i = 0; i < n; i++)
+	{
+		ang = 2.0 * SVG_PI * ToF64(i) / ToF64(n);
+		SvgEmit(ctx, cx + rx * Cos(ang), cy + ry * Sin(ang), i == 0);
+	}
+	SvgPaint(ctx, fill, fill_on, stroke, stroke_on, sw);
+}
+
+U0 SvgShapePoly(CSvgCtx *ctx, U8 *pts, Bool closed, U32 fill, Bool fill_on,
+				U32 stroke, Bool stroke_on, F64 sw)
+{
+	U8	*p = pts;
+	F64	 x, y;
+	Bool first = TRUE;
+	ctx->np = 0;
+	while (SvgMoreNums(p))
+	{
+		x = SvgNum(&p); y = SvgNum(&p);
+		SvgEmit(ctx, x, y, first);
+		first = FALSE;
+	}
+	if (fill_on && closed)
+		SvgFillCurrent(ctx, fill);
+	if (stroke_on)
+		SvgStrokeCurrent(ctx, stroke, sw);
+}
+
+U0 SvgShapeLine(CSvgCtx *ctx, F64 x1, F64 y1, F64 x2, F64 y2, U32 stroke,
+				Bool stroke_on, F64 sw)
+{
+	ctx->np = 0;
+	SvgEmit(ctx, x1, y1, TRUE);
+	SvgEmit(ctx, x2, y2, FALSE);
+	if (stroke_on)
+		SvgStrokeCurrent(ctx, stroke, sw);
+}
+
+/* ---- transform list ---- */
+
+U0 SvgApplyTransform(CSvgMat *m, U8 *s)
+{ // compose each transform in the list into m (m = m * T)
+	U8	*p = s;
+	F64	 a1, a2, a3, a4, a5, a6;
+	CSvgMat t;
+
+	while (*p)
+	{
+		while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n' || *p == '\r')
+			p++;
+		if (!*p)
+			break;
+		if (!StrNICompare(p, "translate", 9))
+		{
+			p = StrFind("(", p); if (!p) break; p++;
+			a1 = SvgNum(&p);
+			a2 = 0.0;
+			if (SvgMoreNums(p)) a2 = SvgNum(&p);
+			SvgMatIdentity(&t); t.e = a1; t.f = a2;
+			SvgMatMul(m, m, &t);
+		}
+		else if (!StrNICompare(p, "scale", 5))
+		{
+			p = StrFind("(", p); if (!p) break; p++;
+			a1 = SvgNum(&p);
+			a2 = a1;
+			if (SvgMoreNums(p)) a2 = SvgNum(&p);
+			SvgMatIdentity(&t); t.a = a1; t.d = a2;
+			SvgMatMul(m, m, &t);
+		}
+		else if (!StrNICompare(p, "rotate", 6))
+		{
+			p = StrFind("(", p); if (!p) break; p++;
+			a1 = SvgNum(&p) * SVG_PI / 180.0;
+			a2 = 0.0; a3 = 0.0;
+			if (SvgMoreNums(p)) { a2 = SvgNum(&p); a3 = SvgNum(&p); }
+			SvgMatIdentity(&t);
+			t.e = a2; t.f = a3; SvgMatMul(m, m, &t);      // translate(cx,cy)
+			SvgMatIdentity(&t);
+			t.a = Cos(a1); t.b = Sin(a1); t.c = -Sin(a1); t.d = Cos(a1);
+			SvgMatMul(m, m, &t);                          // rotate
+			SvgMatIdentity(&t);
+			t.e = -a2; t.f = -a3; SvgMatMul(m, m, &t);    // translate(-cx,-cy)
+		}
+		else if (!StrNICompare(p, "matrix", 6))
+		{
+			p = StrFind("(", p); if (!p) break; p++;
+			a1 = SvgNum(&p); a2 = SvgNum(&p); a3 = SvgNum(&p);
+			a4 = SvgNum(&p); a5 = SvgNum(&p); a6 = SvgNum(&p);
+			t.a = a1; t.b = a2; t.c = a3; t.d = a4; t.e = a5; t.f = a6;
+			SvgMatMul(m, m, &t);
+		}
+		else
+			p++;
+		p = StrFind(")", p);
+		if (!p)
+			break;
+		p++;
+	}
+}
+
+/* ---- element dispatch + XML walk ---- */
+
+F64 SvgAttrNum(U8 *tag, U8 *name, F64 dflt)
+{ // read a single numeric attribute, or dflt if absent
+	U8	 val[128], *q;
+	if (!SvgGetAttr(tag, name, val, sizeof(val)))
+		return dflt;
+	q = val;
+	return SvgNum(&q);
+}
+
+U0 SvgReadStyle(CSvgCtx *ctx, U8 *tag, U32 *fill, Bool *fill_on, U32 *stroke,
+				Bool *stroke_on, F64 *sw)
+{ // start from inherited style, override with this element's own attributes
+	U8 val[256];
+
+	*fill = ctx->fill; *fill_on = ctx->fill_on;
+	*stroke = ctx->stroke; *stroke_on = ctx->stroke_on;
+	*sw = ctx->stroke_w;
+
+	if (SvgGetAttr(tag, "fill", val, sizeof(val)))
+		*fill_on = SvgParseColor(ctx, val, fill);
+	if (SvgGetAttr(tag, "stroke", val, sizeof(val)))
+		*stroke_on = SvgParseColor(ctx, val, stroke);
+	if (SvgGetAttr(tag, "stroke-width", val, sizeof(val)))
+		*sw = SvgAttrNum(tag, "stroke-width", 1.0);
+}
+
+U0 SvgElement(CSvgCtx *ctx, U8 *name, U8 *tag)
+{
+	U8	 val[1024];
+	U32	 fill, stroke;
+	Bool fill_on, stroke_on, save_eo;
+	F64	 sw, x, y, w, h, cx, cy, rx, ry, x1, y1, x2, y2;
+	CSvgMat saved;
+
+	if (ctx->elems >= SVG_MAX_ELEMS)
+		return;
+	ctx->elems++;
+
+	// per-element transform is applied on top of the inherited ctm, locally
+	SvgMatCopy(&saved, &ctx->ctm);
+	SvgMatCopy(&ctx->m, &ctx->ctm);
+	if (SvgGetAttr(tag, "transform", val, sizeof(val)))
+		SvgApplyTransform(&ctx->m, val);
+
+	SvgReadStyle(ctx, tag, &fill, &fill_on, &stroke, &stroke_on, &sw);
+	save_eo = ctx->evenodd; // fill-rule is per-element, restored after paint
+	if (SvgGetAttr(tag, "fill-rule", val, sizeof(val)))
+		ctx->evenodd = !StrICompare(val, "evenodd");
+
+	if (!StrCompare(name, "path"))
+	{
+		U8 *d = SvgGetAttrNew(tag, "d"); // d can be many KB; never truncate it
+		if (d)
+		{
+			SvgPath(ctx, d, fill, fill_on, stroke, stroke_on, sw);
+			Free(d);
+		}
+	}
+	else if (!StrCompare(name, "rect"))
+	{
+		x = SvgAttrNum(tag, "x", 0.0);
+		y = SvgAttrNum(tag, "y", 0.0);
+		w = SvgAttrNum(tag, "width", 0.0);
+		h = SvgAttrNum(tag, "height", 0.0);
+		SvgShapeRect(ctx, x, y, w, h, fill, fill_on, stroke, stroke_on, sw);
+	}
+	else if (!StrCompare(name, "circle"))
+	{
+		cx = SvgAttrNum(tag, "cx", 0.0);
+		cy = SvgAttrNum(tag, "cy", 0.0);
+		rx = SvgAttrNum(tag, "r", 0.0);
+		SvgShapeEllipse(ctx, cx, cy, rx, rx, fill, fill_on, stroke, stroke_on, sw);
+	}
+	else if (!StrCompare(name, "ellipse"))
+	{
+		cx = SvgAttrNum(tag, "cx", 0.0);
+		cy = SvgAttrNum(tag, "cy", 0.0);
+		rx = SvgAttrNum(tag, "rx", 0.0);
+		ry = SvgAttrNum(tag, "ry", 0.0);
+		SvgShapeEllipse(ctx, cx, cy, rx, ry, fill, fill_on, stroke, stroke_on, sw);
+	}
+	else if (!StrCompare(name, "line"))
+	{
+		x1 = SvgAttrNum(tag, "x1", 0.0);
+		y1 = SvgAttrNum(tag, "y1", 0.0);
+		x2 = SvgAttrNum(tag, "x2", 0.0);
+		y2 = SvgAttrNum(tag, "y2", 0.0);
+		SvgShapeLine(ctx, x1, y1, x2, y2, stroke, stroke_on, sw);
+	}
+	else if (!StrCompare(name, "polygon") || !StrCompare(name, "polyline"))
+	{
+		U8 *pts = SvgGetAttrNew(tag, "points"); // may be long
+		if (pts)
+		{
+			SvgShapePoly(ctx, pts, !StrCompare(name, "polygon"),
+						 fill, fill_on, stroke, stroke_on, sw);
+			Free(pts);
+		}
+	}
+
+	SvgMatCopy(&ctx->ctm, &saved);
+	ctx->evenodd = save_eo;
+}
+
+U0 SvgGroupPush(CSvgCtx *ctx, U8 *tag)
+{
+	U8 val[512];
+	U32 c;
+	if (ctx->gsp >= SVG_GSTACK - 1)
+		return;
+	SvgMatCopy(&ctx->gstack[ctx->gsp], &ctx->ctm);
+	ctx->gfill[ctx->gsp] = ctx->fill;     ctx->gfill_on[ctx->gsp] = ctx->fill_on;
+	ctx->gstroke[ctx->gsp] = ctx->stroke; ctx->gstroke_on[ctx->gsp] = ctx->stroke_on;
+	ctx->gstroke_w[ctx->gsp] = ctx->stroke_w; ctx->gevenodd[ctx->gsp] = ctx->evenodd;
+	ctx->gsp++;
+
+	if (SvgGetAttr(tag, "fill-rule", val, sizeof(val)))
+		ctx->evenodd = !StrICompare(val, "evenodd");
+	if (SvgGetAttr(tag, "transform", val, sizeof(val)))
+		SvgApplyTransform(&ctx->ctm, val);
+	if (SvgGetAttr(tag, "fill", val, sizeof(val)))
+	{
+		ctx->fill_on = SvgParseColor(ctx, val, &c);
+		ctx->fill = c;
+	}
+	if (SvgGetAttr(tag, "stroke", val, sizeof(val)))
+	{
+		ctx->stroke_on = SvgParseColor(ctx, val, &c);
+		ctx->stroke = c;
+	}
+	if (SvgGetAttr(tag, "stroke-width", val, sizeof(val)))
+		ctx->stroke_w = SvgAttrNum(tag, "stroke-width", 1.0);
+}
+
+U0 SvgGroupPop(CSvgCtx *ctx)
+{
+	if (ctx->gsp <= 0)
+		return;
+	ctx->gsp--;
+	SvgMatCopy(&ctx->ctm, &ctx->gstack[ctx->gsp]);
+	ctx->fill = ctx->gfill[ctx->gsp];     ctx->fill_on = ctx->gfill_on[ctx->gsp];
+	ctx->stroke = ctx->gstroke[ctx->gsp]; ctx->stroke_on = ctx->gstroke_on[ctx->gsp];
+	ctx->stroke_w = ctx->gstroke_w[ctx->gsp]; ctx->evenodd = ctx->gevenodd[ctx->gsp];
+}
+
+Bool SvgSkipTag(U8 *name)
+{ // elements whose subtree we ignore (definitions, text, unsupported paint)
+	return !StrCompare(name, "defs") || !StrCompare(name, "clipPath") ||
+		   !StrCompare(name, "mask") || !StrCompare(name, "symbol") ||
+		   !StrCompare(name, "text") || !StrCompare(name, "style") ||
+		   !StrCompare(name, "title") || !StrCompare(name, "linearGradient") ||
+		   !StrCompare(name, "radialGradient") || !StrCompare(name, "filter");
+}
+
+U0 SvgWalk(CSvgCtx *ctx, U8 *xml)
+{
+	U8	*p = xml, *tagbeg, *tagend, *attr, *e;
+	U8	 name[32], close_lit[40];
+	I64	 nl, alen;
+	Bool self_close;
+
+	while (*p)
+	{ // HolyC has no 'continue'; the sw_next label at the loop end stands in
+		if (*p != '<')
+		{ p++; goto sw_next; }
+		p++;
+		if (*p == '/')
+		{ // close tag
+			p++;
+			if ((*p == 'g' || *p == 'G') && (p[1] == '>' || p[1] == ' '))
+				SvgGroupPop(ctx);
+			while (*p && *p != '>') p++;
+			if (*p) p++;
+			goto sw_next;
+		}
+		if (*p == '!' || *p == '?')
+		{ // comment / declaration
+			while (*p && *p != '>') p++;
+			if (*p) p++;
+			goto sw_next;
+		}
+		// element name
+		nl = 0;
+		while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' &&
+			   *p != '>' && *p != '/')
+		{ if (nl < 31) name[nl++] = *p; p++; }
+		name[nl] = 0;
+		// the attribute area runs from here to the closing '>'
+		tagbeg = p;
+		while (*p && *p != '>')
+			p++;
+		tagend = p;
+		if (*p) p++;
+
+		alen = tagend - tagbeg;
+		self_close = tagend > tagbeg && tagend[-1] == '/';
+		attr = MAlloc(alen + 2);
+		MemCopy(attr, tagbeg, alen);
+		attr[alen] = ' ';           // sentinel: gives attribute matching a boundary
+		attr[alen + 1] = 0;
+
+		if (!StrCompare(name, "g"))
+		{
+			SvgGroupPush(ctx, attr);
+			if (self_close)
+				SvgGroupPop(ctx);
+		}
+		else if (SvgSkipTag(name))
+		{ // jump past the whole subtree
+			if (!self_close)
+			{
+				StrPrint(close_lit, "</%s", name);
+				e = StrFind(close_lit, p);
+				if (e)
+				{
+					p = e + StrLen(close_lit);
+					while (*p && *p != '>') p++;
+					if (*p) p++;
+				}
+			}
+		}
+		else if (!StrCompare(name, "svg"))
+		{ /* nested/inner svg tag: ignore, keep current ctm */ }
+		else
+			SvgElement(ctx, name, attr);
+
+		Free(attr);
+sw_next:;
+	}
+}
+
+/* ---- public entry points ---- */
+
+CDC *SVGRenderToDC(U8 *inner, F64 vbx, F64 vby, F64 vbw, F64 vbh,
+				   I64 tw, I64 th, U32 fill_hint, CTask *task)
+{ // render an <svg> inner body into a tw x th transparent CDC. NULL on failure.
+	CSvgCtx	 ctx;
+	CDC		*dc;
+	I64		 i, npix;
+	F64		 sx, sy;
+
+	if (!inner || tw < 1 || th < 1 || tw > 2000 || th > 2000)
+		return NULL;
+	if (vbw <= 0.0 || vbh <= 0.0)
+		return NULL;
+
+	dc = DCNew(tw, th, task);
+	if (!dc)
+		return NULL;
+	npix = dc->width_internal * th;
+	for (i = 0; i < npix; i++)
+		dc->body[i] = PIXF_TRANSPARENT;
+
+	MemSet(&ctx, 0, sizeof(CSvgCtx));
+	ctx.dc = dc;
+	ctx.w = tw;
+	ctx.h = th;
+	ctx.fill_hint = fill_hint;
+	// default SVG presentation: fill black, no stroke, width 1
+	ctx.fill = fill_hint & 0x00FFFFFF; ctx.fill_on = TRUE;
+	ctx.stroke = 0x000000; ctx.stroke_on = FALSE;
+	ctx.stroke_w = 1.0;
+	ctx.gsp = 0;
+	ctx.elems = 0;
+
+	sx = ToF64(tw) / vbw;
+	sy = ToF64(th) / vbh;
+	SvgMatIdentity(&ctx.ctm);
+	ctx.ctm.a = sx; ctx.ctm.d = sy;
+	ctx.ctm.e = -vbx * sx; ctx.ctm.f = -vby * sy;
+
+	ctx.px = MAlloc(SVG_MAX_PTS * sizeof(F64), task);
+	ctx.py = MAlloc(SVG_MAX_PTS * sizeof(F64), task);
+	ctx.newsub = MAlloc(SVG_MAX_PTS, task);
+	ctx.ex0 = MAlloc(SVG_MAX_PTS * sizeof(F64), task);
+	ctx.ey0 = MAlloc(SVG_MAX_PTS * sizeof(F64), task);
+	ctx.ex1 = MAlloc(SVG_MAX_PTS * sizeof(F64), task);
+	ctx.ey1 = MAlloc(SVG_MAX_PTS * sizeof(F64), task);
+
+	SvgWalk(&ctx, inner);
+
+	Free(ctx.px); Free(ctx.py); Free(ctx.newsub);
+	Free(ctx.ex0); Free(ctx.ey0); Free(ctx.ex1); Free(ctx.ey1);
+
+	return dc;
+}
+
+Bool SVGParseViewBox(U8 *svg_tag, F64 *x, F64 *y, F64 *w, F64 *h)
+{
+	U8	 val[128], *q;
+	if (!SvgGetAttr(svg_tag, "viewBox", val, sizeof(val)))
+		return FALSE;
+	q = val;
+	*x = SvgNum(&q); *y = SvgNum(&q); *w = SvgNum(&q); *h = SvgNum(&q);
+	return *w > 0.0 && *h > 0.0;
+}
+
+CDC *SVGReadBuf(U8 *buf, I64 size, I64 tw, I64 th, CTask *task)
+{ // decode a standalone .svg (starts with <svg ...>) into a CDC. NULL on error.
+	U8	*p, *tagbeg, *inner, *close;
+	U8	 svg_tag[1024];
+	F64	 vbx = 0.0, vby = 0.0, vbw = 0.0, vbh = 0.0, nw, nh;
+	I64	 alen;
+	CDC	*dc;
+
+	no_warn size;
+	p = StrFind("<svg", buf);
+	if (!p)
+		return NULL;
+	p += 4;
+	tagbeg = p;
+	while (*p && *p != '>')
+		p++;
+	if (!*p)
+		return NULL;
+	alen = p - tagbeg;
+	if (alen > 1022) alen = 1022;
+	MemCopy(svg_tag, tagbeg, alen);
+	svg_tag[alen] = ' ';
+	svg_tag[alen + 1] = 0;
+	inner = p + 1;
+
+	close = StrFind("</svg", inner);
+	if (close)
+		*close = 0; // terminate the inner body (buf is caller's, ok to poke)
+
+	if (!SVGParseViewBox(svg_tag, &vbx, &vby, &vbw, &vbh))
+	{ // no viewBox: fall back to width/height as the user space
+		vbx = 0.0; vby = 0.0;
+		vbw = SvgAttrNum(svg_tag, "width", 0.0);
+		vbh = SvgAttrNum(svg_tag, "height", 0.0);
+	}
+	if (tw <= 0 || th <= 0)
+	{ // caller asked for the natural size (used by <img src=*.svg>)
+		nw = SvgAttrNum(svg_tag, "width", vbw);
+		nh = SvgAttrNum(svg_tag, "height", vbh);
+		if (nw <= 0.0) nw = vbw;
+		if (nh <= 0.0) nh = vbh;
+		if (nw <= 0.0 || nh <= 0.0) { nw = 64.0; nh = 64.0; }
+		if (nw > 512.0) { nh = nh * 512.0 / nw; nw = 512.0; }
+		if (nh > 512.0) { nw = nw * 512.0 / nh; nh = 512.0; }
+		tw = SvgRound(nw);
+		th = SvgRound(nh);
+	}
+	dc = SVGRenderToDC(inner, vbx, vby, vbw, vbh, tw, th, 0x000000, task);
+	if (close)
+		*close = '<'; // restore
+	return dc;
+}
+
+/* ---- data: URI images (base64 or url-encoded PNG/JPEG/SVG) ---- */
+
+I64 SvgB64Val(U8 c)
+{
+	if ('A' <= c <= 'Z') return c - 'A';
+	if ('a' <= c <= 'z') return c - 'a' + 26;
+	if ('0' <= c <= '9') return c - '0' + 52;
+	if (c == '+') return 62;
+	if (c == '/') return 63;
+	return -1;
+}
+
+I64 SvgB64Decode(U8 *src, U8 *out)
+{ // decode base64, ignoring whitespace/newlines and padding. Returns byte count.
+	I64	acc = 0, nb = 0, n = 0, v;
+
+	while (*src)
+	{
+		v = SvgB64Val(*src);
+		src++;
+		if (v >= 0)
+		{
+			acc = (acc << 6) | v;
+			nb += 6;
+			if (nb >= 8)
+			{
+				nb -= 8;
+				out[n++] = (acc >> nb) & 0xFF;
+			}
+		}
+	}
+	return n;
+}
+
+CDC *DataURIToDC(U8 *uri, CTask *task)
+{ // render a data: URI image into a CDC. Handles base64 and %-encoded payloads
+  // of PNG / JPEG / SVG. Returns NULL on failure.
+	U8	*comma, *payload, *b64m, *out, *b0, *p;
+	I64	 plen, dlen;
+	Bool is_b64;
+	CDC	*dc = NULL;
+
+	if (StrNICompare(uri, "data:", 5))
+		return NULL;
+	comma = StrFind(",", uri);
+	if (!comma)
+		return NULL;
+	b64m = StrFind("base64", uri);
+	is_b64 = b64m && b64m < comma;
+	payload = comma + 1;
+	plen = StrLen(payload);
+	if (plen < 4)
+		return NULL;
+	out = MAlloc(plen + 2);
+
+	if (is_b64)
+		dlen = SvgB64Decode(payload, out);
+	else
+	{ // percent-decoding (%XX -> byte, '+' -> space); common for inline svg
+		p = payload;
+		dlen = 0;
+		while (*p)
+		{
+			if (*p == '%' && p[1] && p[2])
+			{ out[dlen++] = SvgHex1(p[1]) * 16 + SvgHex1(p[2]); p += 3; }
+			else if (*p == '+')
+			{ out[dlen++] = ' '; p++; }
+			else
+			{ out[dlen++] = *p; p++; }
+		}
+	}
+	out[dlen] = 0;
+
+	if (dlen < 4)
+	{ Free(out); return NULL; }
+
+	if (out[1] == 'P' && out[2] == 'N' && out[3] == 'G')
+		dc = PNGReadBuf(out, dlen, 255, task);
+	else if (out[0] == 0xFF && out[1] == 0xD8)
+		dc = JPGReadBuf(out, dlen, task);
+	else
+	{
+		b0 = out;
+		while (*b0 == ' ' || *b0 == '\n' || *b0 == '\r' || *b0 == '\t')
+			b0++;
+		if (*b0 == '<' && StrFind("<svg", out))
+			dc = SVGReadBuf(out, dlen, 0, 0, task);
+	}
+	Free(out);
+	return dc;
+}

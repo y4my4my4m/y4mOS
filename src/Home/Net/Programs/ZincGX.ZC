@@ -559,15 +559,133 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 		GxNewline(4);
 		return;
 	}
+	if (!StrCompare(node->tag, "svg") && node->text)
+	{//Inline vector image: render the raw SVG once into a cached CDC (GrSVG).
+		U8		 skey[48];
+		U8		*sat;
+		CGxImg	*ge;
+		F64		 vx = 0.0, vy = 0.0, vw = 0.0, vh = 0.0, ssc;
+		I64		 sw = 0, sh = 0, savail, shint;
+
+		GxRunFlush;
+		if (gx.x <= GX_MARGIN + gx.indent && style.align > 0)
+			gx.line_align = style.align;
+
+		sat = ZNodeAttr(node, "width");
+		if (sat) sw = SvgNum(&sat);
+		sat = ZNodeAttr(node, "height");
+		if (sat) sh = SvgNum(&sat);
+		sat = ZNodeAttr(node, "viewBox");
+		if (sat)
+		{ vx = SvgNum(&sat); vy = SvgNum(&sat); vw = SvgNum(&sat); vh = SvgNum(&sat); }
+
+		if (sw <= 0 || sh <= 0)
+		{
+			if (vw > 0.0 && vh > 0.0) { sw = ToI64(vw); sh = ToI64(vh); }
+			else { sw = 24; sh = 24; }
+		}
+		if (vw <= 0.0 || vh <= 0.0)
+		{ vx = 0.0; vy = 0.0; vw = ToF64(sw); vh = ToF64(sh); }
+
+		savail = gx.wrap_w - gx.x - GX_MARGIN;
+		if (savail < 24)
+			savail = gx.wrap_w - GX_MARGIN * 2;
+		if (sw > savail && savail > 0)
+		{
+			ssc = ToF64(savail) / ToF64(sw);
+			sw = savail;
+			sh = ToI64(ToF64(sh) * ssc);
+		}
+		if (sh > 320)
+		{ ssc = 320.0 / ToF64(sh); sw = ToI64(ToF64(sw) * ssc); sh = 320; }
+		if (sw < 1) sw = 1;
+		if (sh < 1) sh = 1;
+
+		StrPrint(skey, "svg:%X:%d", node->text, sw);
+		ge = GxImgFind(skey);
+		if (!ge)
+		{
+			ge = GxImgGet(skey);
+			if (ge)
+			{
+				shint = gx.page_fg; // currentColor hint (light on our dark chrome)
+				if (shint < 0)
+					shint = 0xE8ECF4;
+				ge->fetched = TRUE;
+				ge->dc = SVGRenderToDC(node->text, vx, vy, vw, vh, sw, sh,
+									   shint, sys_task);
+			}
+		}
+		if (ge && ge->dc)
+		{
+			if (gx.x + sw > gx.wrap_w && gx.x > GX_MARGIN)
+				GxNewline(0);
+			op = GxOpAdd(GXO_IMG, gx.x, gx.y, sw, sh);
+			if (op)
+				op->sc = ge->dc;
+			gx.x += sw + FONT_WIDTH;
+			if (sh + GX_LINE_LEAD > gx.line_h)
+				gx.line_h = sh + GX_LINE_LEAD;
+			return;
+		}
+		// render failed: fall back to a label so nothing vanishes silently
+		attr = ZNodeAttr(node, "aria-label");
+		if (!attr)
+			attr = ZNodeAttr(node, "title");
+		if (attr && *attr)
+			GxText(attr, &style, 1, FALSE);
+		return;
+	}
 	if (!StrCompare(node->tag, "img"))
 	{
 		U8		*src = ZNodeAttr(node, "src"), *abs;
 		CGxImg	*ce;
 		I64		 iw, ih;
+		U8		 dkey[48];
 
 		GxRunFlush;
 		if (gx.x <= GX_MARGIN + gx.indent && style.align > 0)
 			gx.line_align = style.align;
+		if (src && !StrNICompare(src, "data:", 5))
+		{//Inline data: URI image (base64/%-encoded PNG/JPEG/SVG). Decode once,
+		//cache keyed by the src pointer (node attr storage is stable).
+			StrPrint(dkey, "data:%X", src);
+			ce = GxImgFind(dkey);
+			if (!ce)
+			{
+				ce = GxImgGet(dkey);
+				if (ce)
+				{
+					ce->fetched = TRUE;
+					ce->dc = DataURIToDC(src, sys_task);
+				}
+			}
+			if (ce && ce->dc)
+			{
+				iw = ce->dc->width;
+				ih = ce->dc->height;
+				if (iw > gx.wrap_w - gx.x - GX_MARGIN)
+				{
+					ih = ih * (gx.wrap_w - gx.x - GX_MARGIN) / iw;
+					iw = gx.wrap_w - gx.x - GX_MARGIN;
+				}
+				if (iw < 1) iw = 1;
+				if (ih < 1) ih = 1;
+				if (gx.x + iw > gx.wrap_w && gx.x > GX_MARGIN)
+					GxNewline(0);
+				op = GxOpAdd(GXO_IMG, gx.x, gx.y, iw, ih);
+				if (op)
+					op->sc = ce->dc;
+				gx.x += iw + FONT_WIDTH;
+				if (ih + GX_LINE_LEAD > gx.line_h)
+					gx.line_h = ih + GX_LINE_LEAD;
+				return;
+			}
+			attr = ZNodeAttr(node, "alt");
+			if (attr && *attr)
+				GxText(attr, &style, 1, FALSE);
+			return;
+		}
 		if (src && *src)
 		{
 			abs = ZincResolveLink(src); //MAlloc'ed absolute URL.
@@ -1064,9 +1182,50 @@ U0 GxDrawChrome(CDC *dc)
 	GrPrint(dc, w - 32, ty, "Go");
 }
 
+U0 GxRoundFill(CDC *dc, I64 x, I64 y, I64 w, I64 h, I64 r, U32 col)
+{//Fill a rounded rectangle in col; r clamped to half the smaller side. Corner
+//rows are inset by the quarter-circle so buttons/fields look like modern pills.
+	I64	 yy, dy, ins, sq;
+	F64	 rr;
+
+	if (w <= 0 || h <= 0)
+		return;
+	dc->color = col;
+	if (r < 1)
+	{ GrRect(dc, x, y, w, h); return; }
+	if (r > h / 2) r = h / 2;
+	if (r > w / 2) r = w / 2;
+	rr = ToF64(r);
+	for (yy = 0; yy < h; yy++)
+	{
+		dy = 0;
+		if (yy < r)
+			dy = r - yy;
+		else if (yy >= h - r)
+			dy = yy - h + 1 + r;
+		if (dy > 0)
+		{
+			sq = ToI64(Sqrt(rr * rr - ToF64(dy * dy)));
+			ins = r - sq;
+		}
+		else
+			ins = 0;
+		if (ins < 0)
+			ins = 0;
+		GrRect(dc, x + ins, y + yy, w - 2 * ins, 1);
+	}
+}
+
+U0 GxRoundRect(CDC *dc, I64 x, I64 y, I64 w, I64 h, I64 r, U32 fill, U32 border)
+{//1px rounded border with a rounded fill inside.
+	GxRoundFill(dc, x, y, w, h, r, border);
+	if (w > 2 && h > 2)
+		GxRoundFill(dc, x + 1, y + 1, w - 2, h - 2, r - 1, fill);
+}
+
 U0 GxDrawIt(CTask *task, CDC *dc)
 {
-	I64	 i, oy, view_top = GX_CHROME_H, mx, my;
+	I64	 i, oy, view_top = GX_CHROME_H, mx, my, wr;
 	I64	 view_h = task->pix_height - GX_CHROME_H - GX_STATUS_H, th, ty;
 	CGxOp *op;
 	U8	*hover = NULL;
@@ -1153,15 +1312,27 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 				break;
 			case GXO_WIDGET:
 				if (op->wkind == GXW_SUBMIT || op->wkind == GXW_BUTTON)
-					dc->color = de_theme.bttn;
+				{//Rounded button.
+					wr = MinI64(op->h / 2, 9);
+					GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
+								de_theme.bttn, de_theme.panel_edge);
+				}
+				else if (op->wkind == GXW_TEXT || op->wkind == GXW_AREA)
+				{//Rounded text field / search pill.
+					wr = MinI64(op->h / 2, 14);
+					GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
+								de_theme.win_bg, de_theme.panel_edge);
+				}
 				else
+				{//check / radio / select: keep the crisp square look.
 					dc->color = de_theme.win_bg;
-				GrRect(dc, op->x, oy, op->w, op->h);
-				dc->color = de_theme.panel_edge;
-				GrRect(dc, op->x, oy, op->w, 1);
-				GrRect(dc, op->x, oy + op->h - 1, op->w, 1);
-				GrRect(dc, op->x, oy, 1, op->h);
-				GrRect(dc, op->x + op->w - 1, oy, 1, op->h);
+					GrRect(dc, op->x, oy, op->w, op->h);
+					dc->color = de_theme.panel_edge;
+					GrRect(dc, op->x, oy, op->w, 1);
+					GrRect(dc, op->x, oy + op->h - 1, op->w, 1);
+					GrRect(dc, op->x, oy, 1, op->h);
+					GrRect(dc, op->x + op->w - 1, oy, 1, op->h);
+				}
 				if ((op->wkind == GXW_CHECK || op->wkind == GXW_RADIO) && op->node->checked)
 				{
 					dc->color = de_theme.accent;
@@ -1363,6 +1534,14 @@ U0 GxImgTask()
 					dc = PNGReadBuf(r->body, r->body_length, 255, sys_task);
 				else if (r->body[0] == 0xFF && r->body[1] == 0xD8)
 					dc = JPGReadBuf(r->body, r->body_length, sys_task);
+					else
+					{//Text beginning with '<' with an <svg root = vector image.
+						U8 *b0 = r->body;
+						while (*b0 == ' ' || *b0 == '\n' || *b0 == '\r' || *b0 == '\t')
+							b0++;
+						if (*b0 == '<' && StrFind("<svg", r->body))
+							dc = SVGReadBuf(r->body, r->body_length, 0, 0, sys_task);
+					}
 				if (dc)
 				{
 					iw = dc->width;
