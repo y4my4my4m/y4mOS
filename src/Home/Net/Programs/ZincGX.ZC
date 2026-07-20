@@ -861,6 +861,66 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 		//Single cell (or too narrow): fall through and flow normally.
 	}
 
+	if (author.display == ZCSS_DISP_FLEX && author.flex_col != 1)
+	{//flex-direction:row (or grid): lay direct element children as equal-width
+	//columns, wrapping to new rows. Not real flex sizing, but content flows
+	//horizontally instead of stacking - nav bars, button rows and card grids
+	//get their shape. Reuses the table-column machinery.
+		i = 0;
+		child = node->first_child;
+		while (child)
+		{
+			if (child->type == ZH_ELEM)
+				i++;
+			child = child->next;
+		}
+		GxRunFlush;
+		if (gx.x > GX_MARGIN + gx.indent)
+			GxNewline(0);
+		base  = GX_MARGIN + gx.indent;
+		avail = gx.wrap_w - base;
+		cells = MaxI64(1, MinI64(i, avail / 140)); // aim for ~140px columns
+		if (i >= 2 && cells >= 2 && avail / cells >= 60)
+		{
+			MemCopy(&kid, &style, sizeof(CZStyle));
+			ZStyleStripBox(&kid);
+			cw = avail / cells;
+			save_indent = gx.indent;
+			save_wrap	= gx.wrap_w;
+			y0	 = gx.y;
+			ymax = gx.y;
+			k	 = 0;
+			child = node->first_child;
+			while (child)
+			{
+				if (child->type == ZH_ELEM)
+				{
+					span = k % cells;			// column within the current row
+					if (span == 0 && k > 0)
+						y0 = ymax;				// wrap to a new row
+					gx.y	  = y0;
+					gx.indent = save_indent + span * cw;
+					gx.wrap_w = base + (span + 1) * cw - 6;
+					gx.x	  = GX_MARGIN + gx.indent;
+					gx.line_start_op = gx.op_count;
+					GxNode(child, &kid);
+					GxRunFlush;
+					GxLineAlign;
+					ymax = MaxI64(ymax, gx.y);
+					k++;
+				}
+				child = child->next;
+			}
+			gx.indent = save_indent;
+			gx.wrap_w = save_wrap;
+			gx.y	  = ymax;
+			gx.x	  = GX_MARGIN + gx.indent;
+			gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+			return;
+		}
+		//Too few children or too narrow: fall through to normal vertical flow.
+	}
+
 	is_body = !StrCompare(node->tag, "body") || !StrCompare(node->tag, "html") ||
 			  !StrCompare(node->tag, "#root");
 	is_list = !StrCompare(node->tag, "ul") || !StrCompare(node->tag, "ol");
@@ -868,8 +928,8 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 			   !StrCompare(node->tag, "th") || !StrCompare(node->tag, "center") ||
 			   !StrCompare(node->tag, "main") || !StrCompare(node->tag, "aside") ||
 			   !StrCompare(node->tag, "figure") || is_body;
-	if (author.display == ZCSS_DISP_BLOCK)
-		is_block = TRUE;
+	if (author.display == ZCSS_DISP_BLOCK || author.display == ZCSS_DISP_FLEX)
+		is_block = TRUE; // a flex column (or a row that didn't fit) flows as block
 	else if (author.display == ZCSS_DISP_INLINE)
 		is_block = FALSE;
 

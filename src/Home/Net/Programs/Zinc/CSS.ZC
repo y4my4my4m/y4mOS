@@ -26,6 +26,7 @@
 #define ZCSS_DISP_NONE		0
 #define ZCSS_DISP_BLOCK		1
 #define ZCSS_DISP_INLINE	2
+#define ZCSS_DISP_FLEX		3	// flex/grid: lay children in a row (approx)
 
 #define ZCSS_MAX_RULES		1024
 
@@ -43,6 +44,7 @@ class CZStyle
 	I8	pre;					// white-space: pre
 	I8	align;					// -1 unset, 0 left, 1 center, 2 right
 	I8	list_none;				// list-style: none
+	I8	flex_col;				// flex-direction: -1 unset, 0 row, 1 column
 };
 
 class CZCssRule
@@ -83,6 +85,7 @@ U0 ZStyleReset(CZStyle *s)
 	s->pre = -1;
 	s->align = -1;
 	s->list_none = -1;
+	s->flex_col = -1;
 }
 
 U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
@@ -106,6 +109,7 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	if (src->pre	   >= 0) dst->pre		= src->pre;
 	if (src->align	   >= 0) dst->align		= src->align;
 	if (src->list_none >= 0) dst->list_none = src->list_none;
+	if (src->flex_col  >= 0) dst->flex_col	= src->flex_col;
 }
 
 U0 ZStyleStripBox(CZStyle *s)
@@ -120,6 +124,7 @@ U0 ZStyleStripBox(CZStyle *s)
 	s->display = -1;
 	s->width = 0;
 	s->ml_auto = -1;
+	s->flex_col = -1;
 }
 
 U0 ZCssReset()
@@ -632,10 +637,22 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 			out->display = ZCSS_DISP_NONE;
 		else if (!StrNICompare(val, "inline-block", 12))
 			out->display = ZCSS_DISP_BLOCK;
+		else if (!StrNICompare(val, "inline-flex", 11) ||
+				 !StrNICompare(val, "inline-grid", 11))
+			out->display = ZCSS_DISP_FLEX;
 		else if (!StrNICompare(val, "inline", 6))
 			out->display = ZCSS_DISP_INLINE;
+		else if (!StrNICompare(val, "flex", 4) || !StrNICompare(val, "grid", 4))
+			out->display = ZCSS_DISP_FLEX; // rows of children (approx flex/grid)
 		else
-			out->display = ZCSS_DISP_BLOCK; // block, flex, grid all flow as block
+			out->display = ZCSS_DISP_BLOCK;
+	}
+	else if (!StrICompare(name, "flex-direction") || !StrICompare(name, "flex-flow"))
+	{
+		if (StrFind("column", val))
+			out->flex_col = 1;
+		else
+			out->flex_col = 0;
 	}
 	else if (!StrICompare(name, "justify-content") ||
 			 !StrICompare(name, "place-content") ||
