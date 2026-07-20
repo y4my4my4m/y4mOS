@@ -57,6 +57,8 @@ class CZStyle
 	I8	grid_cols;				// grid-template-columns track count; -1 unset
 	I16 bg_img;					// background-image: zcss_bgimg index; -1 unset
 	I16 grad;					// background linear-gradient: zcss_grad index; -1 unset
+	I32 sh_col;					// box-shadow color 0xRRGGBB; -1 unset
+	I16 sh_dx, sh_dy, sh_blur;	// box-shadow offset x/y + blur radius, px
 	I16 bg_px, bg_py;			// background-position x/y: signed px, or -(2000+pct); ZCSS_OFF_UNSET unset
 	I16 bg_sw, bg_sh;			// background-size w/h: 0 auto, >0 px, -1..-100 pct, -200 cover, -201 contain
 	I8	bg_repeat;				// background-repeat: -1 unset, 0 repeat, 1 no-repeat
@@ -116,6 +118,10 @@ U0 ZStyleReset(CZStyle *s)
 	s->grid_cols = -1;	// was missing: merge reads it, so garbage leaked in
 	s->bg_img = -1;
 	s->grad = -1;
+	s->sh_col = -1;
+	s->sh_dx = 0;
+	s->sh_dy = 0;
+	s->sh_blur = 0;
 	s->bg_px = ZCSS_OFF_UNSET;
 	s->bg_py = ZCSS_OFF_UNSET;
 	s->bg_sw = 0;
@@ -160,6 +166,13 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	if (src->pos	   >= 0) dst->pos		= src->pos;
 	if (src->bg_img   >= 0) dst->bg_img	= src->bg_img;
 	if (src->grad	   >= 0) dst->grad		= src->grad;
+	if (src->sh_col >= 0)
+	{
+		dst->sh_col	 = src->sh_col;
+		dst->sh_dx	 = src->sh_dx;
+		dst->sh_dy	 = src->sh_dy;
+		dst->sh_blur = src->sh_blur;
+	}
 	if (src->bg_px > ZCSS_OFF_UNSET) dst->bg_px = src->bg_px;
 	if (src->bg_py > ZCSS_OFF_UNSET) dst->bg_py = src->bg_py;
 	if (src->bg_sw)			 dst->bg_sw		= src->bg_sw;
@@ -195,6 +208,10 @@ U0 ZStyleStripBox(CZStyle *s)
 	s->grid_cols = -1;
 	s->bg_img = -1;		// a background image never inherits
 	s->grad = -1;		// nor a gradient
+	s->sh_col = -1;		// nor a shadow
+	s->sh_dx = 0;
+	s->sh_dy = 0;
+	s->sh_blur = 0;
 	s->bg_px = ZCSS_OFF_UNSET;
 	s->bg_py = ZCSS_OFF_UNSET;
 	s->bg_sw = 0;
@@ -1352,6 +1369,52 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 			out->bg_repeat = 3;
 		else
 			out->bg_repeat = 0;
+	}
+	else if (!StrICompare(name, "box-shadow"))
+	{
+		if (!StrFind("none", val) && !StrFind("inset", val))
+		{ // "<dx> <dy> <blur> [spread] <color>" - inset shadows are skipped
+			I64 li = 0, lvpx;
+
+			p = val;
+			while (*p)
+			{
+				while (*p == ' ' || *p == '\t' || *p == ',')
+					p++;
+				n = 0;
+				depth = 0;
+				while (*p && (depth || (*p != ' ' && *p != '\t' && *p != ',')))
+				{ // keep rgb()/hsl() commas together
+					if (*p == '(')
+						depth++;
+					else if (*p == ')' && depth)
+						depth--;
+					if (n < 63)
+						tok[n++] = *p;
+					p++;
+				}
+				tok[n] = 0;
+				if (!n)
+					break;
+				color = ZCssColor(tok);
+				if (color >= 0)
+					out->sh_col = color;
+				else
+				{
+					lvpx = ZCssPxSigned(tok);
+					if (lvpx != ZCSS_OFF_UNSET)
+					{
+						if (li == 0)
+							out->sh_dx = lvpx;
+						else if (li == 1)
+							out->sh_dy = lvpx;
+						else if (li == 2 && lvpx > 0)
+							out->sh_blur = lvpx;
+						li++;
+					}
+				}
+			}
+		}
 	}
 	else if (!StrICompare(name, "line-height"))
 	{

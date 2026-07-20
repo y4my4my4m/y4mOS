@@ -1,0 +1,262 @@
+// YKD native GIF decoder (GIF87a / GIF89a, FIRST frame only). Pure ZealC - no
+// ELF, no FFI. LZW-decompresses the first image into palette indices, expands
+// via the global/local colour table into a truecolor CDC. The transparent
+// colour index (from a Graphic Control Extension) becomes PIXF_TRANSPARENT so
+// GrBlot() sees through it. Animation beyond frame #1 is ignored (static view).
+// API mirrors PNGReadBuf / JPGReadBuf. GIF uses LZW, NOT DEFLATE, so none of the
+// Inflate.ZC machinery applies - this is a self-contained LZW.
+
+#help_index "Graphics/GIF"
+
+#define GIF_MAXDICT		4096
+#define GIF_MAXDIM		2000	// sanity cap; real web GIFs are far smaller
+
+I64 GifU16(U8 *p)
+{ // little-endian 16-bit
+	return p[0] | p[1] << 8;
+}
+
+I64 GifDeinterlaceRow(I64 y, I64 ih)
+{ // sequential decoded-row index y -> actual destination row for a 4-pass
+  // interlaced GIF.
+	I64 p1 = (ih + 7) / 8;	// pass 1: rows 0,8,16,...
+	I64 p2 = (ih + 3) / 8;	// pass 2: rows 4,12,20,...
+	I64 p3 = (ih + 1) / 4;	// pass 3: rows 2,6,10,...
+
+	if (y < p1)
+		return y * 8;
+	y -= p1;
+	if (y < p2)
+		return 4 + y * 8;
+	y -= p2;
+	if (y < p3)
+		return 2 + y * 4;
+	y -= p3;
+
+	return 1 + y * 2;		// pass 4: rows 1,3,5,...
+}
+
+I64 GifLZW(U8 *data, I64 data_len, I64 min_cs, U8 *out, I64 out_max, CTask *mt)
+{ // decode GIF LZW into index bytes. Returns the count written (<= out_max).
+	I32	*pfx = MAlloc(GIF_MAXDICT * sizeof(I32), mt);	// dict: prefix code
+	U8	*sfx = MAlloc(GIF_MAXDICT, mt);					// dict: suffix byte
+	U8	*stk = MAlloc(GIF_MAXDICT, mt);					// reversed-string scratch
+	I64	 clear = 1 << min_cs, end = clear + 1;
+	I64	 cs = min_cs + 1, next = clear + 2;
+	I64	 bitbuf = 0, bitcnt = 0, bp = 0;
+	I64	 code, prev = -1, first = 0, oc = 0, sp, i, in_code;
+
+	for (i = 0; i < clear; i++)
+	{
+		pfx[i] = -1;
+		sfx[i] = i;
+	}
+
+	while (oc < out_max)
+	{
+		if (!(oc & 8191))
+			Yield;						// big images: keep the decode task cooperative
+		while (bitcnt < cs && bp < data_len)
+		{
+			bitbuf |= data[bp++] << bitcnt;
+			bitcnt += 8;
+		}
+		if (bitcnt < cs)
+			break;						// out of data
+		code = bitbuf & ((1 << cs) - 1);
+		bitbuf = bitbuf >> cs;
+		bitcnt -= cs;
+
+		if (code == clear)
+		{
+			cs	 = min_cs + 1;
+			next = clear + 2;
+			prev = -1;
+		}
+		else if (code == end)
+			break;
+		else if (prev < 0)
+		{ // first code after a clear must be a literal
+			out[oc++] = code & 0xFF;
+			prev  = code;
+			first = code;
+		}
+		else
+		{
+			if (code < next)
+				in_code = code;
+			else
+				in_code = prev;			// KwKwK: emit prev's string + its first char
+
+			sp = 0;
+			i  = in_code;
+			while (i >= 0 && sp < GIF_MAXDICT)
+			{
+				stk[sp++] = sfx[i];
+				i = pfx[i];
+			}
+			if (sp < 1)
+				break;					// corrupt
+			first = stk[sp - 1];
+			while (sp > 0 && oc < out_max)
+				out[oc++] = stk[--sp];
+			if (code >= next && oc < out_max)
+				out[oc++] = first;		// the extra char for the KwKwK case
+
+			if (next < GIF_MAXDICT)
+			{
+				pfx[next] = prev;
+				sfx[next] = first;
+				next++;
+				if (next == (1 << cs) && cs < 12)
+					cs++;
+			}
+			prev = code;
+		}
+	}
+
+	Free(pfx);
+	Free(sfx);
+	Free(stk);
+
+	return oc;
+}
+
+public CDC *GIFReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
+{ // decode the first image of a GIF into a truecolor CDC. NULL on error.
+	U8	*p = buf, *gct = NULL, *act, *lzw, *idx, *pal;
+	CDC	*dc = NULL;
+	I64	 w, h, packed, gct_flag, gct_sz, c, label, len, lzw_len, npix, i, x, y, py;
+	I64	 left, top, iw, ih, ipacked, lct_flag, interlace, lct_sz, min_cs, srcrow;
+	I64	 trans_flag = 0, trans_idx = -1;
+	U32	*row;
+
+	if (size < 13 || buf[0] != 'G' || buf[1] != 'I' || buf[2] != 'F')
+		return NULL;
+	w = GifU16(buf + 6);
+	h = GifU16(buf + 8);
+	if (w < 1 || h < 1 || w > GIF_MAXDIM || h > GIF_MAXDIM)
+		return NULL;
+	packed	 = buf[10];
+	gct_flag = packed >> 7 & 1;
+	gct_sz	 = 2 << (packed & 7);
+	p = buf + 13;
+	if (gct_flag)
+	{
+		gct = p;
+		p	+= gct_sz * 3;
+	}
+
+	while (p < buf + size)
+	{
+		c = *p++;
+		if (c == 0x3B)					// trailer
+			break;
+		if (c == 0x21)
+		{ // extension
+			label = *p++;
+			if (label == 0xF9)
+			{ // graphic control extension: transparency
+				len = *p++;
+				if (len >= 4)
+				{
+					trans_flag = p[0] & 1;
+					trans_idx  = p[3];
+				}
+				p += len;
+			}
+			while (p < buf + size && (len = *p++) != 0)	// skip sub-blocks
+				p += len;
+		}
+		else if (c == 0x2C)
+		{ // image descriptor: decode this first image
+			left	 = GifU16(p);
+			top		 = GifU16(p + 2);
+			iw		 = GifU16(p + 4);
+			ih		 = GifU16(p + 6);
+			ipacked	 = p[8];
+			p		+= 9;
+			lct_flag  = ipacked >> 7 & 1;
+			interlace = ipacked >> 6 & 1;
+			lct_sz	  = 2 << (ipacked & 7);
+			act = gct;
+			if (lct_flag)
+			{
+				act = p;
+				p	+= lct_sz * 3;
+			}
+			if (!act || iw < 1 || ih < 1 || iw > GIF_MAXDIM || ih > GIF_MAXDIM)
+				return NULL;
+			min_cs = *p++;
+			if (min_cs < 1 || min_cs > 11)
+				return NULL;
+
+			// concatenate the LZW data sub-blocks into one buffer
+			lzw		= MAlloc(size, mem_task);
+			lzw_len = 0;
+			while (p < buf + size && (len = *p++) != 0)
+			{
+				if (lzw_len + len > size)
+					break;
+				MemCopy(lzw + lzw_len, p, len);
+				lzw_len += len;
+				p		+= len;
+			}
+
+			npix = iw * ih;
+			idx	 = MAlloc(npix, mem_task);
+			MemSet(idx, 0, npix);
+			GifLZW(lzw, lzw_len, min_cs, idx, npix, mem_task);
+			Free(lzw);
+
+			// build the canvas (logical screen size), transparent, place image
+			dc = DCNew(w, h, mem_task);
+			MemSetU32(dc->body, PIXF_TRANSPARENT, dc->width_internal * dc->height);
+			for (y = 0; y < ih; y++)
+			{
+				if (interlace)
+					py = GifDeinterlaceRow(y, ih);
+				else
+					py = y;
+				if (top + py < h)
+				{
+					row	   = dc->body + (top + py) * dc->width_internal;
+					srcrow = y * iw;
+					for (x = 0; x < iw; x++)
+					{
+						if (left + x < w)
+						{
+							i = idx[srcrow + x];
+							if (!(trans_flag && i == trans_idx))
+							{
+								pal			 = act + i * 3;
+								row[left + x] = pal[0] << 16 | pal[1] << 8 | pal[2];
+							}
+						}
+					}
+				}
+			}
+
+			Free(idx);
+			return dc;					// first frame only
+		}
+		else
+			break;						// unknown block type
+	}
+
+	return dc;
+}
+
+public CDC *GIFRead(U8 *filename, CTask *mem_task=NULL)
+{ // decode a .GIF file into a truecolor CDC. NULL on error.
+	I64	 size;
+	U8	*buf = FileRead(filename, &size);
+	CDC	*dc;
+
+	if (!buf)
+		return NULL;
+	dc = GIFReadBuf(buf, size, mem_task);
+	Free(buf);
+
+	return dc;
+}

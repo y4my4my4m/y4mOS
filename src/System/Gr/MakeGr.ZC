@@ -17,6 +17,7 @@ Cd(__DIR__);;
 #include "Inflate" // shared DEFLATE/zlib inflater; GrPNG + HTTP gzip + git use it
 #include "GrPNG"
 #include "GrJPG"
+#include "GrGIF"
 #include "GrFont"
 #include "ScreenCast"
 
