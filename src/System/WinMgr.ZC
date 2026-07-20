@@ -492,7 +492,7 @@ U0 WinMgrTask(I64)
 	CDoc		*doc;
 	CDocEntry	*doc_e;
 	I64			 x, y, z, message_code, my_mouse_z = 0, left, top, old_flags = RFlagsGet;
-	Bool		 has_border;
+	Bool		 has_border, was_focused;
 	CCtrl		*c;
 
 	WinHorz(0, TEXT_COLS - 1);
@@ -781,6 +781,7 @@ wmt_start:
 			{
 				if (!old_mouse.lb && mouse.lb)
 				{
+					was_focused = task == sys_focus_task;
 					if (doc = WinCursorPosSet(task, mouse.pos.x, mouse.pos.y))
 					{
 						DocLock(doc);
@@ -795,6 +796,13 @@ wmt_start:
 						}
 						DocUnlock(doc);
 						old_mouse.lb = TRUE;
+						//y4mOS: a click that FOCUSES a window used to be
+						//swallowed here (edge consumed, no message queued).
+						//Forward it so click-to-focus also delivers the click.
+						if (!was_focused && task == sys_focus_task)
+							TaskMessage(task, 0, MESSAGE_MS_L_DOWN,
+										mouse.pos.x - task->pix_left - task->scroll_x,
+										mouse.pos.y - task->pix_top - task->scroll_y, 0);
 						goto wmt_start;
 					}
 				}

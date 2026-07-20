@@ -581,6 +581,36 @@ I64 GxDefSpace(U8 *tag)
 
 I64 gx_font_sizes[7] = {10, 13, 16, 19, 24, 32, 40}; //<font size=1..7>
 
+I64 GxCellWant(CZNode *node, I64 depth)
+{//Rough intrinsic width of a table cell's content, for auto-sized columns.
+	CZNode	*c;
+	I64		 w = 0;
+
+	if (!node || depth > 6)
+		return 0;
+	if (node->type == ZH_TEXT)
+	{
+		if (node->text)
+			return StrLen(node->text) * FONT_WIDTH;
+		return 0;
+	}
+	if (!StrCompare(node->tag, "img") || !StrCompare(node->tag, "svg"))
+		return 84;
+	if (!StrCompare(node->tag, "input") || !StrCompare(node->tag, "select") ||
+		!StrCompare(node->tag, "button") || !StrCompare(node->tag, "textarea"))
+		return 120;
+	if (!StrCompare(node->tag, "br"))
+		return 0;
+	c = node->first_child;
+	while (c)
+	{
+		w += GxCellWant(c, depth + 1);
+		c = c->next;
+	}
+
+	return w;
+}
+
 U0 GxNode(CZNode *node, CZStyle *inherited)
 {
 	CZStyle	 style, author, kid;
@@ -922,8 +952,13 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 	}
 
 	if (!StrCompare(node->tag, "tr"))
-	{//Table row: lay the td/th children out as side-by-side columns.
-	//cells counts column UNITS: a colspan=N cell takes N units of width.
+	{//Table row: lay the td/th children out as side-by-side columns, sized by
+	//their content like a real table (equal thirds squeezed HN's title cell
+	//while its "1." rank cell hogged a third of the page).
+	//Units: a colspan=N cell takes N column units.
+		I64		 want[18], col_x[18], sum_want, big_i, u, cell_box;
+		CZStyle	 cellau;
+
 		cells = 0;
 		child = node->first_child;
 		while (child)
@@ -944,16 +979,14 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 			GxNewline(0);
 		base = GX_MARGIN + gx.indent;
 		avail = gx.wrap_w - base;
-		if (cells >= 2 && avail / cells >= 60)
+		if (2 <= cells <= 16 && avail / cells >= 24)
 		{
 			MemCopy(&kid, &style, sizeof(CZStyle));
 			ZStyleStripBox(&kid);
-			save_indent = gx.indent;
-			save_wrap	= gx.wrap_w;
-			cw	 = avail / cells;
-			y0	 = gx.y;
-			ymax = y0;
-			k	 = 0;
+			kid.align = 0;	//cells do NOT inherit <center>: a centered table
+							//keeps left text; td align= / CSS set their own.
+			//Pass 1: intrinsic width per column unit.
+			u = 0;
 			child = node->first_child;
 			while (child)
 			{
@@ -964,14 +997,72 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 					attr = ZNodeAttr(child, "colspan");
 					if (attr)
 						span = ClampI64(Str2I64(attr), 1, 8);
+					cw = MinI64(GxCellWant(child, 0) + 14, avail);
+					for (k = 0; k < span && u < 16; k++)
+						want[u++] = cw / span;
+				}
+				child = child->next;
+			}
+			sum_want = 0;
+			for (k = 0; k < u; k++)
+				sum_want += want[k];
+			if (sum_want <= avail)
+			{//Natural fit: the widest column absorbs the slack.
+				big_i = 0;
+				for (k = 1; k < u; k++)
+					if (want[k] > want[big_i])
+						big_i = k;
+				want[big_i] += avail - sum_want;
+			}
+			else
+			{//Overfull: scale down proportionally, 24px floor.
+				for (k = 0; k < u; k++)
+					want[k] = MaxI64(24, avail * want[k] / MaxI64(1, sum_want));
+			}
+			col_x[0] = 0;
+			for (k = 0; k < u; k++)
+				col_x[k + 1] = col_x[k] + want[k];
+			save_indent = gx.indent;
+			save_wrap	= gx.wrap_w;
+			y0	 = gx.y;
+			ymax = y0;
+			k	 = 0;
+			child = node->first_child;
+			while (child)
+			{
+				if (child->type == ZH_ELEM && k < u &&
+					(!StrCompare(child->tag, "td") || !StrCompare(child->tag, "th")))
+				{
+					span = 1;
+					attr = ZNodeAttr(child, "colspan");
+					if (attr)
+						span = ClampI64(Str2I64(attr), 1, 8);
 					gx.y	  = y0;
-					gx.indent = save_indent + k * cw;
-					gx.wrap_w = base + (k + span) * cw - 6;
+					gx.indent = save_indent + col_x[k];
+					gx.wrap_w = base + col_x[MinI64(k + span, u)] - 6;
 					gx.x	  = GX_MARGIN + gx.indent;
 					gx.line_start_op = gx.op_count;
+					ZCssApply(child, &cellau);
+					cell_box = -1;
+					if (cellau.bg >= 0)
+					{//td bgcolor / CSS cell background: box behind content
+					//(hacker news' orange header bar is one of these).
+						op = GxOpAdd(GXO_BOX, gx.x - 2, y0 - 1,
+									 gx.wrap_w - gx.x + 4, 8);
+						if (op)
+						{
+							cell_box = gx.op_count - 1;
+							op->has_bg = TRUE;
+							op->fg = GxPenBg(cellau.bg, de_theme.win_bg);
+						}
+						gx.line_start_op = gx.op_count;
+					}
 					GxNode(child, &kid);
 					GxRunFlush;
 					GxLineAlign;
+					if (cell_box >= 0)
+						gx.ops[cell_box].h =
+							MaxI64(8, gx.y + gx.line_h + 2 - y0);
 					ymax = MaxI64(ymax, gx.y);
 					k += span;
 				}
@@ -1224,6 +1315,36 @@ CZNode *GxFindTag(CZNode *node, U8 *tag)
 	return NULL;
 }
 
+I64 GxBgProbe(CZNode *node, I64 depth)
+{//First background color on a top-of-page CONTAINER (body > center > table
+//pattern: hacker news paints its whole page via <table bgcolor>). -1 if none.
+	CZNode	*c;
+	CZStyle	 a;
+	I64		 r;
+
+	if (!node || depth > 3)
+		return -1;
+	if (node->type == ZH_ELEM &&
+		(!StrCompare(node->tag, "center") || !StrCompare(node->tag, "table") ||
+		 !StrCompare(node->tag, "div") || !StrCompare(node->tag, "main") ||
+		 !StrCompare(node->tag, "section") || !StrCompare(node->tag, "article")))
+	{
+		ZCssApply(node, &a);
+		if (a.bg >= 0)
+			return a.bg;
+	}
+	c = node->first_child;
+	while (c)
+	{
+		r = GxBgProbe(c, depth + 1);
+		if (r >= 0)
+			return r;
+		c = c->next;
+	}
+
+	return -1;
+}
+
 U0 GxPageStyle()
 {//Resolve the page background/text color from html+body CSS and legacy attrs.
 	CZNode	*el;
@@ -1264,6 +1385,10 @@ U0 GxPageStyle()
 			if (c >= 0)
 				gx.page_fg = c;
 		}
+		if (gx.page_bg < 0)
+			//No bg on html/body: adopt the main wrapper's (body>center>table
+			//bgcolor pages paint the page that way).
+			gx.page_bg = GxBgProbe(el, 0);
 	}
 	gx.page_has_bg = gx.page_bg >= 0;
 	if (gx.page_has_bg)
@@ -1282,6 +1407,36 @@ U0 GxPageStyle()
 //Layout v2: box-model engine (flex, position, 4-side box) built on the v1
 //inline flow above. Provides L2Node + the zinc_layout2/Layout2() toggle.
 #include "Zinc/Layout"
+
+U0 GxBgImgAttach()
+{//Post-layout: give every CSS-background box its picture. Box heights are
+//final only now. Cached images attach immediately (scaled to the box, owned
+//by the op - GxOpsReset frees non-GXO_IMG sc); new URLs queue for GxImgTask,
+//whose img_dirty relayout brings them in.
+	I64		 i, bw, bh;
+	CGxOp	*op;
+	CGxImg	*ce;
+
+	for (i = 0; i < gx.op_count; i++)
+	{
+		op = &gx.ops[i];
+		if (op->type != GXO_BOX || !op->img_url || op->sc)
+			goto gx_bg_next;
+		ce = GxImgGet(op->img_url);
+		if (ce && !ce->fetched && !StrNICompare(op->img_url, "data:", 5))
+		{//Inline data: URI backgrounds decode right here, no network.
+			ce->fetched = TRUE;
+			ce->dc = DataURIToDC(op->img_url, sys_task);
+		}
+		if (ce && ce->dc && op->w > 2 && op->h > 2)
+		{
+			bw = MinI64(op->w, 1024);
+			bh = MinI64(op->h, 1024);
+			op->sc = DEDCScaleNew(ce->dc, bw, bh, sys_task);
+		}
+gx_bg_next:;
+	}
+}
 
 U0 GxImgViewLayout()
 {//Direct image view: one centered GXO_IMG op. Fit-to-window by default;
@@ -1369,6 +1524,7 @@ U0 GxLayout()
 	}
 	GxRunFlush;
 	GxLineAlign;
+	GxBgImgAttach; //box heights are final: attach/queue CSS background images
 	gx.doc_h = gx.y + gx.line_h + 16;
 	if (gx.scroll > gx.doc_h)
 		gx.scroll = 0;
@@ -1567,6 +1723,8 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 					else if (op->ul)
 						GxRoundRect(dc, op->x, oy, op->w, op->h, op->wkind,
 									wr, op->bg);
+					if (op->sc)
+						GrBlot(dc, op->x, oy, op->sc); //CSS background image
 					break;
 				}
 				if (op->has_bg)
@@ -1574,6 +1732,8 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 					dc->color = op->fg;
 					GrRect(dc, op->x, oy, op->w, op->h);
 				}
+				if (op->sc)
+					GrBlot(dc, op->x, oy, op->sc); //CSS background image
 				if (op->ul)
 				{
 					dc->color = op->bg;

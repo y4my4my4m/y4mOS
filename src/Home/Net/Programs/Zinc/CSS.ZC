@@ -55,6 +55,7 @@ class CZStyle
 	I8	list_none;				// list-style: none
 	I8	flex_col;				// flex-direction: -1 unset, 0 row, 1 column
 	I8	grid_cols;				// grid-template-columns track count; -1 unset
+	I16 bg_img;					// background-image: zcss_bgimg index; -1 unset
 };
 
 class CZCssRule
@@ -106,6 +107,8 @@ U0 ZStyleReset(CZStyle *s)
 	s->radius = -1;
 	s->grow = -1;
 	s->pos = -1;
+	s->grid_cols = -1;	// was missing: merge reads it, so garbage leaked in
+	s->bg_img = -1;
 }
 
 U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
@@ -141,6 +144,7 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	if (src->radius   >= 0) dst->radius	= src->radius;
 	if (src->grow	   >= 0) dst->grow		= src->grow;
 	if (src->pos	   >= 0) dst->pos		= src->pos;
+	if (src->bg_img   >= 0) dst->bg_img	= src->bg_img;
 }
 
 U0 ZStyleStripBox(CZStyle *s)
@@ -166,6 +170,8 @@ U0 ZStyleStripBox(CZStyle *s)
 	s->radius = -1;
 	s->grow = -1;
 	s->pos = -1;
+	s->grid_cols = -1;
+	s->bg_img = -1;		// a background image never inherits
 }
 
 /* ---- CSS custom properties (variables) ----
@@ -184,6 +190,48 @@ I64 zcss_var_count = 0; // reset per page; JIT does not zero plain globals
 // html{font-size:62.5%} makes 1rem = 10px so "5.46rem" sizes are decimal-
 // friendly. Set at rule-add time from an html/:root font-size; reset per page.
 public I64 zcss_rem_px = 16;
+
+/* ---- background-image URL interning ----
+   CZStyle is a fixed-size struct that gets snapshot-copied everywhere, so it
+   stores an index into this per-page table instead of a string. */
+#define ZCSS_BGIMG_MAX	128
+public U8	zcss_bgimg[ZCSS_BGIMG_MAX][192];
+I64			zcss_bgimg_count = 0; // reset per page; JIT zeroes nothing
+
+I64 ZCssBgImgAdd(U8 *url)
+{ // intern a background-image URL; -1 if full/unusable
+	I64 i;
+
+	if (!url || !*url || StrLen(url) > 190)
+		return -1;
+	for (i = 0; i < zcss_bgimg_count; i++)
+		if (!StrCompare(zcss_bgimg[i], url))
+			return i;
+	if (zcss_bgimg_count >= ZCSS_BGIMG_MAX)
+		return -1;
+	StrCopy(zcss_bgimg[zcss_bgimg_count], url);
+
+	return zcss_bgimg_count++;
+}
+
+Bool ZCssUrlExtract(U8 *val, U8 *out, I64 max)
+{ // payload of the first url(...) in val, quotes stripped. FALSE if none.
+	U8	*p = val;
+	I64	 n = 0;
+
+	while (*p && StrNICompare(p, "url(", 4))
+		p++;
+	if (!*p)
+		return FALSE;
+	p += 4;
+	while (*p == ' ' || *p == '"' || *p == 39)
+		p++;
+	while (*p && *p != ')' && *p != '"' && *p != 39 && n < max - 1)
+		out[n++] = *p++;
+	out[n] = 0;
+
+	return n > 0;
+}
 
 U8 *ZCssVarGet(U8 *name)
 {
@@ -316,6 +364,7 @@ U0 ZCssReset()
 {
 	zcss_rule_count = 0;
 	zcss_var_count = 0;
+	zcss_bgimg_count = 0;
 	zcss_rem_px = 16; // page may rebase via html{font-size:%}
 	zh_dom_gen++; // stylesheet set changed: invalidate memoized styles
 }
@@ -325,20 +374,24 @@ U0 ZCssReset()
 //Rules embed no pointers (fixed char arrays), so a flat copy is complete.
 
 public U8 *ZCssStateSave()
-{ // snapshot rules+vars into one MAlloc'd blob; ZCssStateLoad consumes it
+{ // snapshot rules+vars+bgimg urls into one blob; ZCssStateLoad consumes it
 	I64	 rsz = zcss_rule_count * sizeof(CZCssRule);
 	I64	 nsz = zcss_var_count * 40, vsz = zcss_var_count * 144;
-	U8	*b = MAlloc(24 + rsz + nsz + vsz), *p = b + 24;
+	I64	 bsz = zcss_bgimg_count * 192;
+	U8	*b = MAlloc(32 + rsz + nsz + vsz + bsz), *p = b + 32;
 	I64	*hdr = b;
 
 	hdr[0] = zcss_rule_count;
 	hdr[1] = zcss_var_count;
 	hdr[2] = zcss_rem_px; // inline style= attrs parse lazily at layout time
+	hdr[3] = zcss_bgimg_count;
 	MemCopy(p, zcss_rules, rsz);
 	p += rsz;
 	MemCopy(p, zcss_var_name, nsz);
 	p += nsz;
 	MemCopy(p, zcss_var_val, vsz);
+	p += vsz;
+	MemCopy(p, zcss_bgimg, bsz);
 
 	return b;
 }
@@ -346,22 +399,26 @@ public U8 *ZCssStateSave()
 public U0 ZCssStateLoad(U8 *b)
 { // restore a ZCssStateSave blob into the live arrays and free it
 	I64	*hdr = b;
-	I64	 rsz, nsz, vsz;
-	U8	*p = b + 24;
+	I64	 rsz, nsz, vsz, bsz;
+	U8	*p = b + 32;
 
 	if (!b)
 		return;
 	zcss_rule_count = ClampI64(hdr[0], 0, ZCSS_MAX_RULES);
 	zcss_var_count	= ClampI64(hdr[1], 0, ZCSS_VAR_MAX);
 	zcss_rem_px		= ClampI64(hdr[2], 4, 64);
+	zcss_bgimg_count = ClampI64(hdr[3], 0, ZCSS_BGIMG_MAX);
 	rsz = zcss_rule_count * sizeof(CZCssRule);
 	nsz = zcss_var_count * 40;
 	vsz = zcss_var_count * 144;
+	bsz = zcss_bgimg_count * 192;
 	MemCopy(zcss_rules, p, rsz);
 	p += rsz;
 	MemCopy(zcss_var_name, p, nsz);
 	p += nsz;
 	MemCopy(zcss_var_val, p, vsz);
+	p += vsz;
+	MemCopy(zcss_bgimg, p, bsz);
 	zh_dom_gen++; // restored sheet set: invalidate memoized styles
 	Free(b);
 }
@@ -880,7 +937,7 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 {
 	I64	 color, n, depth;
 	U8	*p, tok[64];
-	U8	 vbuf[512];
+	U8	 vbuf[512], ubuf[192];
 
 	if (name[0] == '-' && name[1] == '-')
 	{ // custom property definition: store, no direct style effect
@@ -932,6 +989,21 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 		}
 		if (color >= 0)
 			out->bg = color;
+		if (!StrICompare(name, "background") && ZCssUrlExtract(val, ubuf, 192))
+		{ // shorthand can also carry the image: background:url(x) #fff ...
+			n = ZCssBgImgAdd(ubuf);
+			if (n >= 0)
+				out->bg_img = n;
+		}
+	}
+	else if (!StrICompare(name, "background-image"))
+	{
+		if (ZCssUrlExtract(val, ubuf, 192))
+		{ // gradients etc have no url() and are ignored (color stays)
+			n = ZCssBgImgAdd(ubuf);
+			if (n >= 0)
+				out->bg_img = n;
+		}
 	}
 	else if (!StrICompare(name, "font-weight"))
 	{
@@ -1328,6 +1400,7 @@ U0 ZCssSimpleParse(U8 *p, U8 *end, U8 *tag, U8 *cls, U8 *id)
 	I64	 n;
 	Bool in_class, in_id;
 	U8	 token[32];
+	U8	*cp;
 
 	tag[0] = 0;
 	cls[0] = 0;
@@ -1343,6 +1416,13 @@ U0 ZCssSimpleParse(U8 *p, U8 *end, U8 *tag, U8 *cls, U8 *id)
 			p++;
 		}
 		tag[n] = 0;
+		//Pseudo-classes: a:link / a:visited style like the base element, so
+		//strip the suffix (hacker news colors its links via a:link). The
+		//interactive/generated ones (:hover, ::before, :not, ...) keep the
+		//colon in the tag = the rule simply never matches, which is right.
+		cp = StrFind(":", tag);
+		if (cp && (!StrICompare(cp, ":link") || !StrICompare(cp, ":visited")))
+			*cp = 0;
 	}
 	else if (p < end && *p == '*')
 		p++;
@@ -1679,7 +1759,7 @@ U0 ZCssApply(CZNode *node, CZStyle *out)
   // (measure passes, image arrivals, scripts) and the rule walk dominates.
 	I64	 i, j, m = 0;
 	I64	 m_idx[ZCSS_MAX_MATCH], m_spec[ZCSS_MAX_MATCH];
-	U8	*inline_style;
+	U8	*inline_style, *attr;
 
 	if (node->style_cache && node->style_gen == zh_dom_gen)
 	{
@@ -1688,6 +1768,50 @@ U0 ZCssApply(CZNode *node, CZStyle *out)
 	}
 
 	ZStyleReset(out);
+
+	//HTML presentational attributes (bgcolor / color / align / width): the
+	//weakest layer, below author CSS. The 90s web (hacker news, plain
+	//tables) styles itself entirely with these.
+	if (node->type == ZH_ELEM)
+	{
+		attr = ZNodeAttr(node, "bgcolor");
+		if (attr)
+		{
+			j = ZCssColor(attr);
+			if (j >= 0)
+				out->bg = j;
+		}
+		attr = ZNodeAttr(node, "color");
+		if (attr)
+		{
+			j = ZCssColor(attr);
+			if (j >= 0)
+				out->fg = j;
+		}
+		attr = ZNodeAttr(node, "align");
+		if (attr)
+		{
+			if (!StrICompare(attr, "center"))
+				out->align = 1;
+			else if (!StrICompare(attr, "right"))
+				out->align = 2;
+			else if (!StrICompare(attr, "left"))
+				out->align = 0;
+		}
+		attr = ZNodeAttr(node, "width");
+		if (attr && '0' <= attr[0] <= '9')
+		{ // bare number = px in HTML attrs; "85%" like CSS percent width
+			j = ZCssPct(attr);
+			if (1 <= j <= 99)
+				out->width = -j;
+			else
+			{
+				j = ZCssPx(attr);
+				if (0 < j <= 4000)
+					out->width = j;
+			}
+		}
+	}
 
 	for (i = 0; i < zcss_rule_count; i++)
 	{

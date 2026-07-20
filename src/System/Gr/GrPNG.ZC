@@ -61,8 +61,17 @@
 
 #define UPNG_LUM 0
 #define UPNG_RGB 2
+#define UPNG_INDEXED 3
 #define UPNG_LUMA 4
 #define UPNG_RGBA 6
+
+//Palette (colortype 3) formats: decoded scanlines hold palette indices which
+//upng_expand_palette converts to RGBA8 right after decode. Logos/icons on the
+//web (e.g. wikipedia's globe) are nearly always palette PNGs.
+#define UPNG_INDEXED1 13
+#define UPNG_INDEXED2 14
+#define UPNG_INDEXED4 15
+#define UPNG_INDEXED8 16
 
 class upng_source {
   U8 *buffer;
@@ -82,6 +91,8 @@ class upng_t {
   U64 error_line;
   I64 state;
   upng_source source;
+  U8 pal[1024];   //PLTE as RGBA (tRNS fills alpha; default opaque).
+  I64 pal_count;
 };
 
 class huffman_tree {
@@ -100,6 +111,8 @@ U64 upng_get_components(upng_t *upng) {
     return 1;
   case UPNG_RGB:
     return 3;
+  case UPNG_INDEXED:
+    return 1;   //one palette index per pixel
   case UPNG_LUMA:
     return 2;
   case UPNG_RGBA:
@@ -809,6 +822,19 @@ I64 determine_format(upng_t *upng) {
     default:
       return UPNG_BADFORMAT;
     }
+  case UPNG_INDEXED:
+    switch (upng->color_depth) {
+    case 1:
+      return UPNG_INDEXED1;
+    case 2:
+      return UPNG_INDEXED2;
+    case 4:
+      return UPNG_INDEXED4;
+    case 8:
+      return UPNG_INDEXED8;
+    default:
+      return UPNG_BADFORMAT;
+    }
   case UPNG_RGBA:
     switch (upng->color_depth) {
     case 8:
@@ -908,6 +934,55 @@ I64 upng_header(upng_t *upng) {
   upng->state = UPNG_HEADER;
   return upng->error;
 }
+U0 upng_expand_palette(upng_t *upng) {
+  //Convert decoded palette indices to RGBA8 in a fresh buffer, then present
+  //as a plain RGBA8 image so every downstream path stays untouched.
+  U64 w = upng->width, h = upng->height, depth = upng->color_depth;
+  U64 row_bytes = (w * depth + 7) / 8;
+  U64 x, y, idx;
+  U8 *out, *src, *dst;
+
+  out = MAlloc(w * h * 4)(U8 *);
+  if (out == NULL) {
+    upng->error = UPNG_ENOMEM;
+    return;
+  }
+  for (y = 0; y < h; y++) {
+    src = upng->buffer + y * row_bytes;
+    dst = out + y * w * 4;
+    for (x = 0; x < w; x++) {
+      switch (depth) {
+      case 8:
+        idx = src[x];
+        break;
+      case 4:
+        idx = src[x >> 1] >> (4 - 4 * (x & 1)) & 0xF;
+        break;
+      case 2:
+        idx = src[x >> 2] >> (6 - 2 * (x & 3)) & 3;
+        break;
+      case 1:
+        idx = src[x >> 3] >> (7 - (x & 7)) & 1;
+        break;
+      default:
+        idx = 0;
+      }
+      if (idx >= upng->pal_count)
+        idx = 0;
+      dst[x * 4] = upng->pal[idx * 4];
+      dst[x * 4 + 1] = upng->pal[idx * 4 + 1];
+      dst[x * 4 + 2] = upng->pal[idx * 4 + 2];
+      dst[x * 4 + 3] = upng->pal[idx * 4 + 3];
+    }
+  }
+  Free(upng->buffer);
+  upng->buffer = out;
+  upng->size = w * h * 4;
+  upng->color_type = UPNG_RGBA;
+  upng->color_depth = 8;
+  upng->format = UPNG_RGBA8;
+}
+
 I64 upng_decode(upng_t *upng) {
   U8 *chunk;
   U8 *compressed;
@@ -917,6 +992,7 @@ I64 upng_decode(upng_t *upng) {
   I64 error;
   U64 length;
   U8 *data;
+  I64 pj;
 
   if (upng->error != UPNG_EOK) {
     return upng->error;
@@ -1007,6 +1083,31 @@ I64 upng_decode(upng_t *upng) {
                 (((((chunk) + 4)[1]) & 0xFF) << 16) |
                 (((((chunk) + 4)[2]) & 0xFF) << 8) |
                 ((((chunk) + 4)[3]) & 0xFF)) ==
+               (((('P') & 0xFF) << 24) | ((('L') & 0xFF) << 16) |
+                ((('T') & 0xFF) << 8) | (('E') & 0xFF))) {
+      upng->pal_count = length / 3;
+      if (upng->pal_count > 256)
+        upng->pal_count = 256;
+      for (pj = 0; pj < upng->pal_count; pj++) {
+        upng->pal[pj * 4] = data[pj * 3];
+        upng->pal[pj * 4 + 1] = data[pj * 3 + 1];
+        upng->pal[pj * 4 + 2] = data[pj * 3 + 2];
+        upng->pal[pj * 4 + 3] = 0xFF;
+      }
+    } else if (((((((chunk) + 4)[0]) & 0xFF) << 24) |
+                (((((chunk) + 4)[1]) & 0xFF) << 16) |
+                (((((chunk) + 4)[2]) & 0xFF) << 8) |
+                ((((chunk) + 4)[3]) & 0xFF)) ==
+               (((('t') & 0xFF) << 24) | ((('R') & 0xFF) << 16) |
+                ((('N') & 0xFF) << 8) | (('S') & 0xFF))) {
+      if (upng->color_type == UPNG_INDEXED) {
+        for (pj = 0; pj < length && pj < upng->pal_count; pj++)
+          upng->pal[pj * 4 + 3] = data[pj];
+      }
+    } else if (((((((chunk) + 4)[0]) & 0xFF) << 24) |
+                (((((chunk) + 4)[1]) & 0xFF) << 16) |
+                (((((chunk) + 4)[2]) & 0xFF) << 8) |
+                ((((chunk) + 4)[3]) & 0xFF)) ==
                (((('I') & 0xFF) << 24) | ((('E') & 0xFF) << 16) |
                 ((('N') & 0xFF) << 8) | (('D') & 0xFF))) {
       break;
@@ -1048,6 +1149,8 @@ I64 upng_decode(upng_t *upng) {
   }
   post_process_scanlines(upng, upng->buffer, inflated, upng);
   Free(inflated);
+  if (upng->error == UPNG_EOK && upng->color_type == UPNG_INDEXED)
+    upng_expand_palette(upng); //indices -> RGBA8; downstream sees plain RGBA
   if (upng->error != UPNG_EOK) {
     Free(upng->buffer);
     upng->buffer = NULL;
@@ -1076,6 +1179,7 @@ upng_t *upng_new() {
   upng->source.buffer = NULL;
   upng->source.size = 0;
   upng->source.owning = 0;
+  upng->pal_count = 0;
   return upng;
 }
 upng_t *upng_new_from_bytes(U8 *buffer, U64 size) {

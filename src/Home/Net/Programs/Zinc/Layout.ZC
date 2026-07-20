@@ -401,7 +401,7 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	pr_eff = MaxI64(0, style->pr);
 	if (!StrCompare(node->tag, "blockquote") && style->ml < 0)
 		ml_eff = 24;
-	boxed = author->bg >= 0 || author->border >= 0;
+	boxed = author->bg >= 0 || author->border >= 0 || author->bg_img >= 0;
 	pt_eff = author->pt;
 	pb_eff = author->pb;
 	if (pt_eff < 0)
@@ -506,6 +506,10 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 			op->bg = GxPenBg(author->border, de_theme.panel_edge);
 			if (author->radius > 0)
 				op->wkind = author->radius; //wkind = corner radius for GXO_BOX
+			if (author->bg_img >= 0 && author->bg_img < zcss_bgimg_count)
+				//Absolute URL rides on the op; GxBgImgAttach (post-layout)
+				//resolves it against the shared image cache + fetch task.
+				op->img_url = ZincResolveLink(zcss_bgimg[author->bg_img]);
 		}
 		gx.line_start_op = gx.op_count;
 		kid.bg = -1; // the box already painted it
