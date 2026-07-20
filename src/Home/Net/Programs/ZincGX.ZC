@@ -62,7 +62,8 @@ class CGxOp
 	I64				 radius;	//GXO_WIDGET: border-radius px (-1 = unset).
 	Bool			 bold, ul, has_bg;
 	I16				 bg_px, bg_py, bg_sw, bg_sh;	//GXO_BOX: CSS background-position/size (CSS.ZC encoding).
-	I8				 bg_rep;						//GXO_BOX: background-repeat (-1 unset / 0 repeat / 1 no-repeat).
+	I8				 bg_rep;						//GXO_BOX: background-repeat (-1 unset / 0 repeat / 1 no-repeat / 2 x / 3 y).
+	I16				 grad;							//GXO_BOX: CSS linear-gradient index (-1 = none).
 };
 
 //Decoded-image cache, keyed by absolute URL. Persists across relayout so we
@@ -324,6 +325,7 @@ CGxOp *GxOpAdd(I64 type, I64 x, I64 y, I64 w, I64 h)
 	op->type = type;
 	op->x = x;	op->y = y;
 	op->w = w;	op->h = h;
+	op->grad = -1; // gradient: none unless the box emit sets it (0 is a valid index)
 	return op;
 }
 
@@ -1624,8 +1626,20 @@ CDC *GxBgSpriteDC(CDC *src, I64 bw, I64 bh, I64 e_px, I64 e_py, I64 e_sw, I64 e_
 				if (sx < 0 || sx >= iw || sy < 0 || sy >= ih)
 					goto gx_sprite_skip;
 			}
+			else if (rep == 2)
+			{//repeat-x: tile horizontally, gap vertically
+				if (sy < 0 || sy >= ih)
+					goto gx_sprite_skip;
+				sx = ((sx % iw) + iw) % iw;
+			}
+			else if (rep == 3)
+			{//repeat-y: tile vertically, gap horizontally
+				if (sx < 0 || sx >= iw)
+					goto gx_sprite_skip;
+				sy = ((sy % ih) + ih) % ih;
+			}
 			else
-			{//repeat (default): tile
+			{//repeat (default): tile both
 				sx = ((sx % iw) + iw) % iw;
 				sy = ((sy % ih) + ih) % ih;
 			}
@@ -1647,6 +1661,86 @@ gx_sprite_skip:;
 	return dst;
 }
 
+CDC *GxGradientDC(I64 gi, I64 bw, I64 bh)
+{//Render zcss_grad[gi] into a bw x bh DC (owned, sys_task): a linear gradient
+//along the CSS angle, colours interpolated between the stops.
+	CDC		*dst;
+	CZGrad	*g = &zcss_grad[gi];
+	F64		 ar, dxf, dyf, proj, pmin, pmax, span, c00, c10, c01, c11;
+	I64		 dx, dy, i, k, ns, tpct, p0, p1, col0, col1, rr, gg, bb, f;
+	I64		 sp[ZCSS_GRAD_STOPS];
+	U32		*db;
+
+	ns = g->nstops;
+	if (ns < 2)
+		return NULL;
+	for (i = 0; i < ns; i++)
+	{ // resolve stop positions; auto-distribute the unset ones across 0..100
+		if (g->pos[i] >= 0)
+			sp[i] = g->pos[i];
+		else
+			sp[i] = i * 100 / (ns - 1);
+	}
+	for (i = 1; i < ns; i++)
+		if (sp[i] < sp[i - 1])
+			sp[i] = sp[i - 1];
+
+	ar	= g->angle * pi / 180.0;
+	dxf	= Sin(ar);
+	dyf	= -Cos(ar);
+	c00	= 0;
+	c10	= bw * dxf;
+	c01	= bh * dyf;
+	c11	= bw * dxf + bh * dyf;
+	pmin = c00;
+	pmax = c00;
+	if (c10 < pmin) pmin = c10;
+	if (c10 > pmax) pmax = c10;
+	if (c01 < pmin) pmin = c01;
+	if (c01 > pmax) pmax = c01;
+	if (c11 < pmin) pmin = c11;
+	if (c11 > pmax) pmax = c11;
+	span = pmax - pmin;
+	if (span < 1.0)
+		span = 1.0;
+
+	dst = DCNew(bw, bh, sys_task);
+	for (dy = 0; dy < bh; dy++)
+	{
+		db = dst->body + dy * dst->width_internal;
+		for (dx = 0; dx < bw; dx++)
+		{
+			proj = dx * dxf + dy * dyf;
+			tpct = ToI64((proj - pmin) * 100.0 / span);
+			if (tpct < 0)
+				tpct = 0;
+			if (tpct > 100)
+				tpct = 100;
+			k = 0;
+			while (k < ns - 2 && sp[k + 1] < tpct)
+				k++;
+			p0	 = sp[k];
+			p1	 = sp[k + 1];
+			col0 = g->col[k];
+			col1 = g->col[k + 1];
+			if (p1 <= p0)
+				f = 0;
+			else
+				f = (tpct - p0) * 256 / (p1 - p0);
+			if (f < 0)
+				f = 0;
+			if (f > 256)
+				f = 256;
+			rr = ((col0 >> 16 & 0xFF) * (256 - f) + (col1 >> 16 & 0xFF) * f) / 256;
+			gg = ((col0 >> 8  & 0xFF) * (256 - f) + (col1 >> 8  & 0xFF) * f) / 256;
+			bb = ((col0       & 0xFF) * (256 - f) + (col1       & 0xFF) * f) / 256;
+			db[dx] = rr << 16 | gg << 8 | bb;
+		}
+	}
+
+	return dst;
+}
+
 U0 GxBgImgAttach()
 {//Post-layout: give every CSS-background box its picture. Box heights are
 //final only now. Cached images attach immediately (scaled to the box, owned
@@ -1659,26 +1753,35 @@ U0 GxBgImgAttach()
 	for (i = 0; i < gx.op_count; i++)
 	{
 		op = &gx.ops[i];
-		if (op->type != GXO_BOX || !op->img_url || op->sc)
+		if (op->type != GXO_BOX || op->sc)
 			goto gx_bg_next;
-		ce = GxImgGet(op->img_url);
-		if (ce && !ce->fetched && !StrNICompare(op->img_url, "data:", 5))
-		{//Inline data: URI backgrounds decode right here, no network.
-			ce->fetched = TRUE;
-			ce->dc = DataURIToDC(op->img_url, sys_task);
-		}
-		if (ce && ce->dc && op->w > 2 && op->h > 2)
+		if (op->img_url)
 		{
+			ce = GxImgGet(op->img_url);
+			if (ce && !ce->fetched && !StrNICompare(op->img_url, "data:", 5))
+			{//Inline data: URI backgrounds decode right here, no network.
+				ce->fetched = TRUE;
+				ce->dc = DataURIToDC(op->img_url, sys_task);
+			}
+			if (ce && ce->dc && op->w > 2 && op->h > 2)
+			{
+				bw = MinI64(op->w, 1024);
+				bh = MinI64(op->h, 1024);
+				if (op->bg_px != ZCSS_OFF_UNSET || op->bg_py != ZCSS_OFF_UNSET ||
+					op->bg_sw != 0 || op->bg_sh != 0 || op->bg_rep >= 1)
+					//Sprite/positioned/sized/repeat-x/y/no-repeat: crop a sub-rect.
+					op->sc = GxBgSpriteDC(ce->dc, bw, bh, op->bg_px, op->bg_py,
+										  op->bg_sw, op->bg_sh, op->bg_rep);
+				else
+					//Plain background image: keep the stretch-to-box default.
+					op->sc = DEDCScaleNew(ce->dc, bw, bh, sys_task);
+			}
+		}
+		else if (op->grad >= 0 && op->w > 2 && op->h > 2)
+		{//CSS linear-gradient background.
 			bw = MinI64(op->w, 1024);
 			bh = MinI64(op->h, 1024);
-			if (op->bg_px != ZCSS_OFF_UNSET || op->bg_py != ZCSS_OFF_UNSET ||
-				op->bg_sw != 0 || op->bg_sh != 0 || op->bg_rep == 1)
-				//Sprite/positioned/sized/no-repeat: crop a sub-rect.
-				op->sc = GxBgSpriteDC(ce->dc, bw, bh, op->bg_px, op->bg_py,
-									  op->bg_sw, op->bg_sh, op->bg_rep);
-			else
-				//Plain background image: keep the stretch-to-box default.
-				op->sc = DEDCScaleNew(ce->dc, bw, bh, sys_task);
+			op->sc = GxGradientDC(op->grad, bw, bh);
 		}
 gx_bg_next:;
 	}

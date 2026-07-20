@@ -402,7 +402,8 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	pr_eff = MaxI64(0, style->pr);
 	if (!StrCompare(node->tag, "blockquote") && style->ml < 0)
 		ml_eff = 24;
-	boxed = author->bg >= 0 || author->border >= 0 || author->bg_img >= 0;
+	boxed = author->bg >= 0 || author->border >= 0 || author->bg_img >= 0 ||
+			author->grad >= 0;
 	// Fixed-size background sprite / icon (e.g. a 16x11 country flag): the element
 	// IS the sprite cell, so the box must be exactly its CSS width/height, not a
 	// full-line block (else the sub-rect blit paints a whole atlas row).
@@ -510,6 +511,7 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 			op->fg = GxPenBg(author->bg, de_theme.win_bg);
 			op->ul = author->border >= 0;
 			op->bg = GxPenBg(author->border, de_theme.panel_edge);
+			op->grad = author->grad;
 			if (author->radius > 0)
 				op->wkind = author->radius; //wkind = corner radius for GXO_BOX
 			if (author->bg_img >= 0 && author->bg_img < zcss_bgimg_count)

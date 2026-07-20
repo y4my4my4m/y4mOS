@@ -56,6 +56,7 @@ class CZStyle
 	I8	flex_col;				// flex-direction: -1 unset, 0 row, 1 column
 	I8	grid_cols;				// grid-template-columns track count; -1 unset
 	I16 bg_img;					// background-image: zcss_bgimg index; -1 unset
+	I16 grad;					// background linear-gradient: zcss_grad index; -1 unset
 	I16 bg_px, bg_py;			// background-position x/y: signed px, or -(2000+pct); ZCSS_OFF_UNSET unset
 	I16 bg_sw, bg_sh;			// background-size w/h: 0 auto, >0 px, -1..-100 pct, -200 cover, -201 contain
 	I8	bg_repeat;				// background-repeat: -1 unset, 0 repeat, 1 no-repeat
@@ -114,6 +115,7 @@ U0 ZStyleReset(CZStyle *s)
 	s->pos = -1;
 	s->grid_cols = -1;	// was missing: merge reads it, so garbage leaked in
 	s->bg_img = -1;
+	s->grad = -1;
 	s->bg_px = ZCSS_OFF_UNSET;
 	s->bg_py = ZCSS_OFF_UNSET;
 	s->bg_sw = 0;
@@ -157,6 +159,7 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	if (src->grow	   >= 0) dst->grow		= src->grow;
 	if (src->pos	   >= 0) dst->pos		= src->pos;
 	if (src->bg_img   >= 0) dst->bg_img	= src->bg_img;
+	if (src->grad	   >= 0) dst->grad		= src->grad;
 	if (src->bg_px > ZCSS_OFF_UNSET) dst->bg_px = src->bg_px;
 	if (src->bg_py > ZCSS_OFF_UNSET) dst->bg_py = src->bg_py;
 	if (src->bg_sw)			 dst->bg_sw		= src->bg_sw;
@@ -191,6 +194,7 @@ U0 ZStyleStripBox(CZStyle *s)
 	s->pos = -1;
 	s->grid_cols = -1;
 	s->bg_img = -1;		// a background image never inherits
+	s->grad = -1;		// nor a gradient
 	s->bg_px = ZCSS_OFF_UNSET;
 	s->bg_py = ZCSS_OFF_UNSET;
 	s->bg_sw = 0;
@@ -389,6 +393,7 @@ U0 ZCssReset()
 	zcss_rule_count = 0;
 	zcss_var_count = 0;
 	zcss_bgimg_count = 0;
+	zcss_grad_count = 0;
 	zcss_rem_px = 16; // page may rebase via html{font-size:%}
 	zh_dom_gen++; // stylesheet set changed: invalidate memoized styles
 }
@@ -957,6 +962,133 @@ I64 ZCssGridCols(U8 *val)
 	return count;
 }
 
+/* ---- linear-gradient backgrounds ----
+   Parsed into a per-page interned table (CZStyle stores an index). radial-
+   gradient is approximated as a vertical linear so its colors still show. */
+#define ZCSS_GRAD_MAX	64
+#define ZCSS_GRAD_STOPS	6
+
+public class CZGrad
+{
+	I16	angle;					// deg, CSS convention: 0=to top, 90=right, 180=bottom
+	I16	nstops;
+	I32	col[ZCSS_GRAD_STOPS];	// 0xRRGGBB
+	I16	pos[ZCSS_GRAD_STOPS];	// 0..100 along the line; -1 = auto-distribute
+};
+
+public CZGrad	zcss_grad[ZCSS_GRAD_MAX];
+I64				zcss_grad_count = 0; // reset per page; JIT zeroes nothing
+
+I64 ZCssGradSide(U8 *tok)
+{ // "to right" / "to bottom" etc -> CSS angle degrees; -1 if not a side
+	if (StrFind("bottom", tok) && StrFind("right", tok))	return 135;
+	if (StrFind("bottom", tok) && StrFind("left", tok))		return 225;
+	if (StrFind("top", tok) && StrFind("right", tok))		return 45;
+	if (StrFind("top", tok) && StrFind("left", tok))		return 315;
+	if (StrFind("right", tok))	return 90;
+	if (StrFind("left", tok))	return 270;
+	if (StrFind("top", tok))	return 0;
+	if (StrFind("bottom", tok))	return 180;
+
+	return -1;
+}
+
+I64 ZCssParseGradient(U8 *val)
+{ // parse the first linear-gradient(...) in val -> interned index, or -1.
+  // handles [<Ndeg> | to <side>,] color [pos%], color [pos%], ...
+	U8		*p, *lp, tok[128];
+	I64		 n, depth, ang, c, first, pos, s2, pp;
+	CZGrad	*g;
+
+	p = StrFind("linear-gradient", val);
+	if (!p)
+		p = StrFind("radial-gradient", val); // approx as a vertical linear
+	if (!p)
+		return -1;
+	lp = StrFind("(", p);
+	if (!lp || zcss_grad_count >= ZCSS_GRAD_MAX)
+		return -1;
+	lp++;
+	g = &zcss_grad[zcss_grad_count];
+	g->angle  = 180; // default: to bottom
+	g->nstops = 0;
+	first = TRUE;
+
+	while (*lp && *lp != ')' && g->nstops < ZCSS_GRAD_STOPS)
+	{ // split on top-level commas (rgb()/hsl() commas are inside parens)
+		while (*lp == ' ' || *lp == '\t' || *lp == ',')
+			lp++;
+		n = 0;
+		depth = 0;
+		while (*lp && (depth || (*lp != ',' && *lp != ')')))
+		{
+			if (*lp == '(')
+				depth++;
+			else if (*lp == ')')
+				depth--;
+			if (n < 127)
+				tok[n++] = *lp;
+			lp++;
+		}
+		tok[n] = 0;
+		while (n > 0 && tok[n - 1] == ' ')
+			tok[--n] = 0;
+		if (n)
+		{
+			ang = -1;
+			if (first)
+			{ // optional direction as the first arg
+				if (StrFind("deg", tok))
+				{
+					ang = Str2I64(tok) % 360;
+					if (ang < 0)
+						ang += 360;
+					g->angle = ang;
+				}
+				else
+				{
+					ang = ZCssGradSide(tok);
+					if (ang >= 0)
+						g->angle = ang;
+				}
+			}
+			first = FALSE;
+			if (ang < 0)
+			{ // a color stop: "color [pos%]" - split a trailing percent off
+				pos = -1;
+				s2 = n;
+				while (s2 > 0 && tok[s2 - 1] != ' ')
+					s2--;
+				if (s2 > 0)
+				{
+					pp = ZCssPct(tok + s2);
+					if (pp >= 0)
+					{
+						pos = ClampI64(pp, 0, 100);
+						tok[s2 - 1] = 0;
+						while (s2 > 1 && tok[s2 - 2] == ' ')
+						{
+							tok[s2 - 2] = 0;
+							s2--;
+						}
+					}
+				}
+				c = ZCssColor(tok);
+				if (c >= 0)
+				{
+					g->col[g->nstops] = c;
+					g->pos[g->nstops] = pos;
+					g->nstops++;
+				}
+			}
+		}
+	}
+	if (g->nstops < 2)
+		return -1;
+
+	return zcss_grad_count++;
+}
+
 I64 ZCssPxSigned(U8 *val)
 { // like ZCssPx but PRESERVES negative px (background-position needs -Npx);
   // ZCSS_OFF_UNSET if unparsable, percent, or a unit we skip.
@@ -1183,14 +1315,26 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 		}
 		if (!StrICompare(name, "background") && StrFind("no-repeat", val))
 			out->bg_repeat = 1; // shorthand repeat keyword (position/size stay longhand)
+		if (!StrICompare(name, "background") && StrFind("gradient", val))
+		{ // background: linear-gradient(...) shorthand
+			n = ZCssParseGradient(val);
+			if (n >= 0)
+				out->grad = n;
+		}
 	}
 	else if (!StrICompare(name, "background-image"))
 	{
 		if (ZCssUrlExtract(val, ubuf, 192))
-		{ // gradients etc have no url() and are ignored (color stays)
+		{
 			n = ZCssBgImgAdd(ubuf);
 			if (n >= 0)
 				out->bg_img = n;
+		}
+		else if (StrFind("gradient", val))
+		{ // linear-gradient(...) / radial-gradient(...) -> interned gradient
+			n = ZCssParseGradient(val);
+			if (n >= 0)
+				out->grad = n;
 		}
 	}
 	else if (!StrICompare(name, "background-position"))
@@ -1201,6 +1345,10 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 	{
 		if (StrFind("no-repeat", val))
 			out->bg_repeat = 1;
+		else if (StrFind("repeat-x", val))
+			out->bg_repeat = 2;
+		else if (StrFind("repeat-y", val))
+			out->bg_repeat = 3;
 		else
 			out->bg_repeat = 0;
 	}
