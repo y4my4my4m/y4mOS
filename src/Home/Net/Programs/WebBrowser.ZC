@@ -104,15 +104,16 @@ U8 *zinc_testpage =
 
 // Minimal document.write probes to isolate WHERE values corrupt: a bare string
 // literal, a two-string concat, and a bare number. Expected: "hi ab 42".
-// Minimal corrupt case + control. Script 1: string+NUMBER concat (corrupts).
-// Script 2: string+string control (works). The [BAD ...] probe marker printed
-// by document.write pins where the value went bad (see js_dbg_* in JS.ZC).
+// Quick JS sanity page: string/number coercion, array, function, ternary.
 U8 *zinc_hipage =
-	"<html><body><h1>probe</h1>"
-	"<script>document.write('n' + 4);</script>"
-	"<p>ctl:</p>"
-	"<script>document.write('x' + 'y');</script>"
-	"<p>expected: n4 then xy; a [BAD ...] marker shows the corruption breadcrumbs</p>"
+	"<html><body><h1>JS sanity</h1><script>"
+	"document.write('<p>concat: ' + 'A' + 'B' + '</p>');"
+	"document.write('<p>num: ' + (2+2) + ' ' + 1.5 + '</p>');"
+	"var a=[1,2,3];a.push(4);document.write('<p>arr: ' + a.join('-') + '</p>');"
+	"function add(x,y){ return x+y; }"
+	"document.write('<p>fn: ' + add(2,3) + ' cond: ' + (1<2?'ok':'bad') + '</p>');"
+	"</script>"
+	"<p>expected: AB / 4 1.5 / 1-2-3-4 / 5 ok</p>"
 	"<p><a href=\"zinc:welcome\">back to welcome</a></p>"
 	"</body></html>";
 

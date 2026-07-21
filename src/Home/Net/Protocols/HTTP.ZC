@@ -327,6 +327,52 @@ http_ck_next:;
 	return MStrPrint("Cookie: %s\r\n", buf);
 }
 
+public U8 *HttpDocCookieGet(CHttpUrl *url)
+{ // bare "a=b; c=d" for document.cookie reads (no header prefix). MAlloc'ed.
+	U8	buf[2048];
+	I64 i;
+
+	buf[0] = 0;
+	HttpCookieLock;
+	for (i = 0; i < http_cookie_count; i++)
+	{
+		if (!HttpCookieDomainMatch(http_cookies[i].domain, url->host))
+			goto hdc_next;
+		if (StrNCompare(url->path, http_cookies[i].path,
+						StrLen(http_cookies[i].path)))
+			goto hdc_next;
+		if (StrLen(buf) > 1900)
+			goto hdc_next;
+		if (buf[0])
+			CatPrint(buf, "; ");
+		CatPrint(buf, "%s=%s", http_cookies[i].name, http_cookies[i].value);
+hdc_next:;
+	}
+	HttpCookieUnlock;
+
+	return StrNew(buf);
+}
+
+public U0 HttpDocCookieSet(CHttpUrl *url, U8 *s)
+{ // document.cookie = "name=value; path=/; ..." -> store name=value for the host
+	U8	name[128], value[512];
+	I64 i = 0, j = 0;
+
+	while (s[i] == ' ')
+		i++;
+	while (s[i] && s[i] != '=' && s[i] != ';' && j < 126)
+		name[j++] = s[i++];
+	name[j] = 0;
+	if (s[i] != '=' || !j)
+		return;
+	i++;
+	j = 0;
+	while (s[i] && s[i] != ';' && j < 510)
+		value[j++] = s[i++];
+	value[j] = 0;
+	HttpCookieStore(url->host, "/", name, value, FALSE);
+}
+
 public U0 HttpCookiesClear()
 {
 	HttpCookieLock;
@@ -794,7 +840,8 @@ http_fresh:
 			content_type = "application/x-www-form-urlencoded";
 		request = MStrPrint("%s %s HTTP/1.1\r\n"
 							"Host: %s\r\n"
-							"User-Agent: ZealOS-Zinc/1.0\r\n"
+							"User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+							"(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n"
 							"Accept: text/html, text/plain, */*\r\n"
 							"Accept-Encoding: gzip\r\n"
 							"%s"
@@ -808,7 +855,8 @@ http_fresh:
 	else
 		request = MStrPrint("%s %s HTTP/1.1\r\n"
 							"Host: %s\r\n"
-							"User-Agent: ZealOS-Zinc/1.0\r\n"
+							"User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+							"(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n"
 							"Accept: text/html, text/plain, */*\r\n"
 							"Accept-Encoding: gzip\r\n"
 							"%s"

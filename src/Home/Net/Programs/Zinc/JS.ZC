@@ -1349,7 +1349,33 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 	{
 		node = JsParseExpr(ji); // ( a, b ) sequence, and (0, fn)() idiom
 		if (!JsEatPunct(ji, ')'))
-			JsErr(ji, "expected )");
+		{ // desync RECOVERY: balanced-skip to this group's ) instead of a hard
+		  // abort, and log the window so the offending construct is identifiable.
+			StrPrint(embuf, "paren@%d:", ji->pos);
+			for (emk = ji->pos - 4; emk <= ji->pos + 2 && StrLen(embuf) < 84; emk++)
+			{
+				if (emk >= 0)
+				{
+					JsTokDesc(ji, emk, emtk);
+					CatPrint(embuf, " %s", emtk);
+				}
+			}
+			for (emk = 0; embuf[emk]; emk++)
+				if (embuf[emk] == 0x24)
+					embuf[emk] = '?';
+			if (++js_soft_errs <= 12)
+				NetLog("JS: %s", embuf);
+			emk = 1;
+			while (emk > 0 && JsTok(ji)->type != JT_EOF)
+			{
+				if (JsIsPunct(ji, '(') || JsIsPunct(ji, '[') || JsIsPunct(ji, '{'))
+					emk++;
+				else if (JsIsPunct(ji, ')') || JsIsPunct(ji, ']') ||
+						 JsIsPunct(ji, '}'))
+					emk--;
+				ji->pos++;
+			}
+		}
 		return node;
 	}
 	if (JsEatPunct(ji, '['))
@@ -1490,17 +1516,28 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 		return node;
 	}
 
-	JsTokDesc(ji, ji->pos, emtk);
-	JsTokDesc(ji, ji->pos - 1, numkey); // context: what came just before
-	StrPrint(embuf, "unexpected '%s' after '%s' (tok %d)", emtk, numkey, ji->pos);
-	for (emk = 0; embuf[emk]; emk++)
-		if (embuf[emk] == 0x24)
-			embuf[emk] = '?'; // dollars are live DolDoc commands in the log
 	// SOFT error: skip the token and keep parsing. One unrecognized construct
 	// must not kill a 400KB bundle - the damage stays local to this expression
 	// (callers treat the NULL as an empty node; JsRun's anti-stall advances).
-	if (++js_soft_errs <= 8)
-		NetLog("JS: skip %s", embuf);
+	// Log a WINDOW of surrounding tokens so the exact construct is identifiable.
+	StrPrint(embuf, "skip@%d:", ji->pos);
+	emk = ji->pos - 4;
+	if (emk < 0)
+		emk = 0;
+	while (emk <= ji->pos + 3 && StrLen(embuf) < 84)
+	{
+		JsTokDesc(ji, emk, emtk);
+		if (emk == ji->pos)
+			CatPrint(embuf, " >%s<", emtk);
+		else
+			CatPrint(embuf, " %s", emtk);
+		emk++;
+	}
+	for (emk = 0; embuf[emk]; emk++)
+		if (embuf[emk] == 0x24)
+			embuf[emk] = '?'; // dollars are live DolDoc commands in the log
+	if (++js_soft_errs <= 12)
+		NetLog("JS: %s", embuf);
 	ji->pos++;
 
 	return NULL;
@@ -2562,6 +2599,23 @@ U0 JsTextContentSet(CJsInterp *ji, CZNode *node, U8 *s)
 	ji->dom_dirty = TRUE;
 }
 
+U8 *JsCookieGet(CJsInterp *ji)
+{ // document.cookie read -> bare "a=b; c=d" for this page's host. MAlloc'ed.
+	CHttpUrl u;
+
+	if (ji->url && HttpUrlParse(ji->url, &u) >= 0)
+		return HttpDocCookieGet(&u);
+	return StrNew("");
+}
+
+U0 JsCookieSet(CJsInterp *ji, U8 *s)
+{ // document.cookie = "n=v; ..." -> store in the HTTP jar for this page's host
+	CHttpUrl u;
+
+	if (ji->url && HttpUrlParse(ji->url, &u) >= 0)
+		HttpDocCookieSet(&u, s);
+}
+
 CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 {
 	CJsVal *v;
@@ -2662,6 +2716,13 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				return ji->loc_obj;
 			if (!StrCompare(name, "URL"))
 				return JsStrV(ji, ji->url);
+			if (!StrCompare(name, "cookie"))
+			{ // wired to the HTTP cookie jar so JS-set cookies ride later requests
+				attr = JsCookieGet(ji);
+				v	 = JsStrV(ji, attr);
+				Free(attr);
+				return v;
+			}
 			if (!StrCompare(name, "write") || !StrCompare(name, "writeln"))
 				return JsNativeV(ji, JSN_DOC_WRITE);
 			if (!StrCompare(name, "getElementById"))
@@ -2950,6 +3011,8 @@ U0 JsMemberSet(CJsInterp *ji, CJsVal *obj, U8 *name, CJsVal *val)
 					ji->dom_dirty = TRUE;
 				}
 			}
+			else if (!StrCompare(name, "cookie"))
+				JsCookieSet(ji, JsToStr(ji, val)); // -> HTTP jar for this host
 			return;
 		case JSO_LOCATION:
 			if (!StrCompare(name, "href"))
@@ -6409,10 +6472,20 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsEnvDeclare(ji, ji->genv, "history", math);
 
 	math = JsValNew(ji, JV_OBJ); // navigator
-	JsPropSet(ji, math, "userAgent", JsStrV(ji, "Mozilla/5.0 (ZealOS) ZincGX/1.0"));
+	JsPropSet(ji, math, "userAgent", JsStrV(ji, "Mozilla/5.0 (X11; Linux x86_64) "
+			  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"));
 	JsPropSet(ji, math, "language",  JsStrV(ji, "en-US"));
-	JsPropSet(ji, math, "platform",  JsStrV(ji, "ZealOS"));
+	JsPropSet(ji, math, "platform",  JsStrV(ji, "Linux x86_64"));
 	JsPropSet(ji, math, "onLine",	 JsBoolV(ji, TRUE));
+	// props feature-detection scripts commonly probe (Google's JS-enabled check)
+	JsPropSet(ji, math, "appName",		JsStrV(ji, "Netscape"));
+	JsPropSet(ji, math, "appVersion",	JsStrV(ji, "5.0 (X11)"));
+	JsPropSet(ji, math, "vendor",		JsStrV(ji, "Google Inc."));
+	JsPropSet(ji, math, "product",		JsStrV(ji, "Gecko"));
+	JsPropSet(ji, math, "cookieEnabled", JsBoolV(ji, TRUE));
+	JsPropSet(ji, math, "doNotTrack",	JsNullV(ji));
+	JsPropSet(ji, math, "maxTouchPoints", JsNumV(ji, 0));
+	JsPropSet(ji, math, "hardwareConcurrency", JsNumV(ji, 4));
 	JsEnvDeclare(ji, ji->genv, "navigator", math);
 
 	math = JsValNew(ji, JV_OBJ); // reuse the local for the JSON namespace
