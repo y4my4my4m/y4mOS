@@ -574,10 +574,8 @@ U0 GxWord(U8 *word, I64 len, CZStyle *style, I64 scale)
 	{//advance widths from the chosen font's own metrics (mono vs proportional)
 		CGrFont *wf = GrFontPick(style->mono == 1);
 		px	 = GxFontPx(style);
-		need = 0;
-		for (i = 0; i < len; i++)
-			need += GrFontAdvPx(wf, word[i], px);
-		cw = GrFontAdvPx(wf, ' ', px);
+		need = GrFontRunW(wf, px, word, len); //UTF-8 aware (CJK counts as 1)
+		cw	 = GrFontAdvPx(wf, ' ', px);
 	}
 	else
 	{
@@ -3213,15 +3211,19 @@ public U0 ZincGX(U8 *start_url=NULL)
 	//FileRead lives in BlkDev - available here in the browser. gate on
 	//grf_ready (statically FALSE), NOT grf_ui_font.ok (a global = JIT garbage
 	//until written). Any failure => that font's .ok stays FALSE => fallback.
-		I64	 fsz = 0, msz = 0;
+		I64	 fsz = 0, msz = 0, csz = 0;
 		U8	*fbuf = FileRead("::/System/Gr/UISANS.TTF", &fsz);
 		U8	*mbuf = FileRead("::/System/Gr/UIMONO.TTF", &msz);
+		U8	*cbuf = FileRead("::/System/Gr/CJK.TTF", &csz);
 		GrFontInit(fbuf, fsz);							//slot 0, sets grf_ready
 		GrFontInitInto(&grf_mono_font, 1, mbuf, msz);	//slot 1 (may fail -> sans)
+		GrFontInitInto(&grf_cjk, 2, cbuf, csz);			//slot 2 (missing -> no CJK)
 		if (fbuf)
 			Free(fbuf);
 		if (mbuf)
 			Free(mbuf);
+		if (cbuf)
+			Free(cbuf);
 	}
 	zinc_ttf = grf_ready;
 

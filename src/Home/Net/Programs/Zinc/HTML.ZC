@@ -296,7 +296,35 @@ U0 ZDecPutCodePoint(U8 *out, I64 *n, I64 max, I64 cp)
 	else if (cp == 0xF1)						ZDecPut(out, n, max, "n");
 	else if (0xF2 <= cp <= 0xF6)				ZDecPut(out, n, max, "o");
 	else if (0xF9 <= cp <= 0xFC)				ZDecPut(out, n, max, "u");
-	else										ZDecPut(out, n, max, "?");
+	else
+	{ // No ASCII approximation (CJK, etc.): re-emit the RAW UTF-8 bytes so the
+	  // browser's font layer (GrFont's grf_cjk fallback) can render the real
+	  // glyph. This keeps multibyte text inside Zinc's own byte pipeline - the
+	  // ZealOS core / DolDoc never sees it, so nothing else has to become UTF-8.
+		U8	u[5];
+		I64	k = 0;
+
+		if (cp < 0x800)
+		{
+			u[k++] = 0xC0 | (cp >> 6);
+			u[k++] = 0x80 | (cp & 0x3F);
+		}
+		else if (cp < 0x10000)
+		{
+			u[k++] = 0xE0 | (cp >> 12);
+			u[k++] = 0x80 | ((cp >> 6) & 0x3F);
+			u[k++] = 0x80 | (cp & 0x3F);
+		}
+		else
+		{
+			u[k++] = 0xF0 | (cp >> 18);
+			u[k++] = 0x80 | ((cp >> 12) & 0x3F);
+			u[k++] = 0x80 | ((cp >> 6) & 0x3F);
+			u[k++] = 0x80 | (cp & 0x3F);
+		}
+		u[k] = 0;
+		ZDecPut(out, n, max, u);
+	}
 }
 
 #define ZH_ENTITY_COUNT 24

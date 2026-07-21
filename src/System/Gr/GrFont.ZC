@@ -48,6 +48,10 @@ class CGrGlyph
 //callers gate on grf_ready / a font's own .ok (which InitInto sets reliably).
 public CGrFont	grf_ui_font;
 public CGrFont	grf_mono_font;
+public CGrFont	grf_cjk;			//id 2: CJK fallback (Japanese/Chinese/Korean).
+									//Loaded only by the browser; the primary UI/mono
+									//fonts stay Latin-only. A codepoint the primary
+									//lacks (>=0x80, .notdef) is looked up here.
 public Bool		grf_ready = FALSE;	//default UI font loaded ok (statically FALSE)
 Bool			grf_cache_ready = FALSE;
 CGrGlyph		grf_cache[GRF_CACHE];
@@ -689,18 +693,95 @@ public I64 GrFontAdvPx(CGrFont *f, I64 cp, I64 size)
 	return GrFontAdv(f, GrFontGI(f, cp)) * size / f->upm;
 }
 
+public I64 GrfUtf8(U8 *p, I64 *cp)
+{//Decode one UTF-8 code point at p; return bytes consumed (1..4). A stray/invalid
+//byte decodes AS ITSELF (1 byte) so plain 8-bit (CP437/DolDoc) text still works.
+//&& short-circuits, so a truncated sequence near the NUL never reads past it.
+	I64 c = p[0];
+
+	if (c < 0x80)
+	{
+		*cp = c;
+		return 1;
+	}
+	if ((c & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80)
+	{
+		*cp = ((c & 0x1F) << 6) | (p[1] & 0x3F);
+		return 2;
+	}
+	if ((c & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80)
+	{
+		*cp = ((c & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+		return 3;
+	}
+	if ((c & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 &&
+		(p[3] & 0xC0) == 0x80)
+	{
+		*cp = ((c & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) |
+			  (p[3] & 0x3F);
+		return 4;
+	}
+	*cp = c;
+	return 1;
+}
+
+CGrFont *GrfCpFont(CGrFont *f, I64 cp, I64 *gi_out)
+{//Pick the font that actually carries cp: primary first, then the CJK fallback.
+//ASCII always stays on the primary (even .notdef) so Latin never shifts fonts.
+	I64 gi = GrFontGI(f, cp);
+
+	if (gi || cp < 0x80)
+	{
+		*gi_out = gi;
+		return f;
+	}
+	if (grf_cjk.ok)
+	{
+		gi = GrFontGI(&grf_cjk, cp);
+		if (gi)
+		{
+			*gi_out = gi;
+			return &grf_cjk;
+		}
+	}
+	*gi_out = 0;	//nobody has it: primary's .notdef box
+	return f;
+}
+
+public I64 GrFontRunW(CGrFont *f, I64 size, U8 *str, I64 len)
+{//Pixel advance of the first len BYTES of str, UTF-8 aware with CJK fallback.
+//len bounds a non-terminated slice (word-wrap measurement). Multibyte runs never
+//contain a space, so a word boundary never splits a sequence.
+	I64 w = 0, gi, cp, i = 0, n;
+	CGrFont *uf;
+
+	if (!f->ok || !str)
+		return 0;
+	while (i < len)
+	{
+		n  = GrfUtf8(str + i, &cp);
+		uf = GrfCpFont(f, cp, &gi);
+		w += GrFontAdv(uf, gi) * size / uf->upm;
+		i += n;
+	}
+
+	return w;
+}
+
 public I64 GrFontWidth(CGrFont *f, I64 size, U8 *str)
-{//Total advance width of str at size px.
-	I64 w = 0, gi;
+{//Total advance width of NUL-terminated str at size px (UTF-8 + CJK fallback).
+	I64 w = 0, gi, cp, n;
+	CGrFont *uf;
 	U8 *p = str;
 
 	if (!f->ok || !str)
 		return 0;
 	while (*p)
 	{
-		gi = GrFontGI(f, *p);
-		w += GrFontAdv(f, gi) * size / f->upm;
-		p++;
+		n  = GrfUtf8(p, &cp);
+		uf = GrfCpFont(f, cp, &gi);
+		w += GrFontAdv(uf, gi) * size / uf->upm;
+		p += n;
 	}
 
 	return w;
@@ -756,7 +837,8 @@ public CDC *GrFontRenderDC(CGrFont *f, I64 size, I64 color, I64 bg, U8 *str)
 //bg < 0: transparent background (only the glyph pixels are opaque).
 	CDC		*dc;
 	CGrGlyph *g;
-	I64		 W, H, asc, penx, gi;
+	CGrFont	*uf;
+	I64		 W, H, asc, penx, gi, cp, n;
 	U8		*p = str;
 
 	if (!f->ok || !str || !*str)
@@ -779,11 +861,12 @@ public CDC *GrFontRenderDC(CGrFont *f, I64 size, I64 color, I64 bg, U8 *str)
 	penx = 0;
 	while (*p)
 	{
-		gi = GrFontGI(f, *p);
-		g  = GrFontGlyph(f, gi, size);
+		n  = GrfUtf8(p, &cp);
+		uf = GrfCpFont(f, cp, &gi);
+		g  = GrFontGlyph(uf, gi, size);
 		GrfBlitGlyph(dc, penx + g->ox, asc + g->oy, g, color);
 		penx += g->adv;
-		p++;
+		p += n;
 	}
 
 	return dc;

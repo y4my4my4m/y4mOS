@@ -194,6 +194,13 @@
 #define JSN_DATE_GETMIN		157
 #define JSN_DATE_GETSEC		158
 #define JSN_DATE_TOISO		159
+#define JSN_AUDIO_CTOR		160	// new Audio(url)
+#define JSN_AUDIO_PLAY		161
+#define JSN_AUDIO_PAUSE		162
+#define JSN_FN_CALL			163	// fn.call(thisArg, ...args)
+#define JSN_FN_APPLY		164	// fn.apply(thisArg, argsArray)
+#define JSN_FN_BIND			165	// fn.bind(thisArg) -> bound native
+#define JSN_FN_BOUND		166	// the bound function produced by bind
 
 /* token types */
 #define JT_EOF		0
@@ -397,6 +404,7 @@ class CJsInterp
 /* forward declarations for the recursive parser/evaluator */
 extern CJsNode *JsParseAssign(CJsInterp *ji);
 extern CJsNode *JsParseExpr(CJsInterp *ji); // comma-sequence of assignments
+extern CJsNode *JsParseClass(CJsInterp *ji); // "class" eaten; stmt AND expression
 extern CJsNode *JsParseStmt(CJsInterp *ji);
 extern CJsNode *JsParseFunc(CJsInterp *ji, Bool need_name);
 extern U0 JsMicroDrain(CJsInterp *ji); // JN_AWAIT (in JsEval) drains before unwrap
@@ -1098,6 +1106,84 @@ CJsNode *JsParseArgs(CJsInterp *ji)
 	return head;
 }
 
+CJsNode *JsParseClass(CJsInterp *ji)
+{ // "class" already eaten. class [Name] [extends E] { members }. Callable from
+  // BOTH statement and expression positions (minified code uses class exprs).
+	CJsNode *node = JsNode(ji, JN_CLASS), *item, *mtail = NULL;
+	CJsTok	*t;
+
+	t = JsTok(ji);
+	if (t->type == JT_IDENT && StrCompare(t->str, "extends"))
+	{ // optional class name (but not the `extends` keyword)
+		node->str = t->str;
+		ji->pos++;
+	}
+	if (JsEatKw(ji, "extends"))
+		node->c = JsParseAssign(ji); // parsed, superclass ignored (no real super)
+	if (!JsEatPunct(ji, '{'))
+		return node;
+	while (!JsIsPunct(ji, '}') && JsTok(ji)->type != JT_EOF && !ji->has_err)
+	{
+		if (JsEatPunct(ji, ';'))
+		{ /* stray semicolons between members */ }
+		else
+		{
+			// skip modifier keywords (static/async/get/set) when another member
+			// token follows, else the modifier IS the member name.
+			while (JsTok(ji)->type == JT_IDENT &&
+				   (!StrCompare(JsTok(ji)->str, "static") ||
+					!StrCompare(JsTok(ji)->str, "async") ||
+					!StrCompare(JsTok(ji)->str, "get") ||
+					!StrCompare(JsTok(ji)->str, "set")) &&
+				   (ji->toks[ji->pos + 1].type == JT_IDENT ||
+					ji->toks[ji->pos + 1].type == JT_STR ||
+					(ji->toks[ji->pos + 1].type == JT_PUNCT &&
+					 (ji->toks[ji->pos + 1].punct == '[' ||
+					  ji->toks[ji->pos + 1].punct == '*'))))
+				ji->pos++;
+			JsEatPunct(ji, '*'); // generator method
+			item = JsNode(ji, JN_PROP);
+			if (JsEatPunct(ji, '['))
+			{ // computed member name [expr]() - name discarded
+				JsParseAssign(ji);
+				if (!JsEatPunct(ji, ']'))
+					JsErr(ji, "expected ] in class member");
+				item->str = "_computed";
+			}
+			else
+			{
+				t = JsTok(ji);
+				if (t->type != JT_IDENT && t->type != JT_STR && t->type != JT_NUM)
+				{
+					JsErr(ji, "bad class member");
+					break;
+				}
+				ji->pos++;
+				if (t->type == JT_NUM)
+					item->str = "_num";
+				else
+					item->str = t->str;
+			}
+			if (JsIsPunct(ji, '('))
+				item->a = JsParseFunc(ji, FALSE); // method (params){body}
+			else
+			{ // class field: name = expr;  (or just name;)
+				if (JsEatPunct(ji, '='))
+					item->a = JsParseAssign(ji);
+				JsEatPunct(ji, ';');
+			}
+			if (mtail)
+				mtail->next = item;
+			else
+				node->a = item;
+			mtail = item;
+		}
+	}
+	JsEatPunct(ji, '}');
+
+	return node;
+}
+
 U0 JsTokDesc(CJsInterp *ji, I64 idx, U8 *out)
 { // short printable form of one token, for parse diagnostics. out >= 16 bytes.
 	CJsTok *t;
@@ -1156,6 +1242,11 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 	}
 	if (t->type == JT_IDENT)
 	{
+		if (JsIsKw(ji, "class"))
+		{ // class expression: const X = class {..}; {k: class{}}
+			ji->pos++;
+			return JsParseClass(ji);
+		}
 		if (JsIsKw(ji, "function"))
 		{
 			ji->pos++;
@@ -1187,6 +1278,25 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 		ji->pos++;
 		node = JsNode(ji, JN_IDENT);
 		node->str = t->str;
+		return node;
+	}
+	if (JsIsKw(ji, "super"))
+	{ // super(...) constructor call -> no-op; super.x / super.m() -> this.x/m()
+		ji->pos++;
+		if (JsEatPunct(ji, '('))
+		{
+			JsParseArgs(ji); // parse + discard args, eats ')'
+			return JsNode(ji, JN_UNDEFLIT);
+		}
+		node = JsNode(ji, JN_IDENT);
+		node->str = "this";
+		return node;
+	}
+	if (JsIsKw(ji, "this"))
+	{ // ensure `this` is a primary even though it's not otherwise a keyword
+		ji->pos++;
+		node = JsNode(ji, JN_IDENT);
+		node->str = "this";
 		return node;
 	}
 	if (JsEatPunct(ji, '('))
@@ -1221,7 +1331,19 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 			}
 			while (JsEatPunct(ji, ','));
 			if (!JsEatPunct(ji, ']'))
-				JsErr(ji, "expected ]");
+			{ // desync RECOVERY: balanced-skip to this array's close so the whole
+			  // script survives (a hard parse error would kill the entire bundle).
+				emk = 1;
+				while (emk > 0 && JsTok(ji)->type != JT_EOF)
+				{
+					if (JsIsPunct(ji, '{') || JsIsPunct(ji, '[') || JsIsPunct(ji, '('))
+						emk++;
+					else if (JsIsPunct(ji, '}') || JsIsPunct(ji, ']') ||
+							 JsIsPunct(ji, ')'))
+						emk--;
+					ji->pos++;
+				}
+			}
 		}
 		return node;
 	}
@@ -1235,6 +1357,19 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 			{
 				if (JsIsPunct(ji, '}'))
 					break; // tolerate a trailing comma: {a: 1,}
+				// skip method modifiers get/set/async + generator '*' (only when a
+				// key follows - else get/set/async is itself the property name)
+				while (JsTok(ji)->type == JT_IDENT &&
+					   (!StrCompare(JsTok(ji)->str, "get") ||
+						!StrCompare(JsTok(ji)->str, "set") ||
+						!StrCompare(JsTok(ji)->str, "async")) &&
+					   (ji->toks[ji->pos + 1].type == JT_IDENT ||
+						ji->toks[ji->pos + 1].type == JT_STR ||
+						(ji->toks[ji->pos + 1].type == JT_PUNCT &&
+						 (ji->toks[ji->pos + 1].punct == '[' ||
+						  ji->toks[ji->pos + 1].punct == '*'))))
+					ji->pos++;
+				JsEatPunct(ji, '*'); // generator method shorthand
 				if (JsEatPunct(ji, JP_SPREAD))
 				{ // {...src}: props shallow-merged at eval
 					item = JsNode(ji, JN_SPREAD);
@@ -1292,7 +1427,19 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 			}
 			while (JsEatPunct(ji, ','));
 			if (!JsEatPunct(ji, '}'))
-				JsErr(ji, "expected }");
+			{ // desync RECOVERY: balanced-skip to this object's close so the whole
+			  // script survives (a hard parse error would kill the entire bundle).
+				emk = 1;
+				while (emk > 0 && JsTok(ji)->type != JT_EOF)
+				{
+					if (JsIsPunct(ji, '{') || JsIsPunct(ji, '[') || JsIsPunct(ji, '('))
+						emk++;
+					else if (JsIsPunct(ji, '}') || JsIsPunct(ji, ']') ||
+							 JsIsPunct(ji, ')'))
+						emk--;
+					ji->pos++;
+				}
+			}
 		}
 		return node;
 	}
@@ -1589,6 +1736,28 @@ CJsNode *JsParseAssign(CJsInterp *ji)
 	I64		 op = -1, k, j;
 	Bool	 arrow = FALSE, plist = FALSE;
 
+	if (JsIsKw(ji, "yield"))
+	{ // generators run eagerly (no suspension): yield x just produces x
+		ji->pos++;
+		JsEatPunct(ji, '*'); // yield* delegate
+		node = JsNode(ji, JN_UN);
+		node->op = 'y';
+		if (!JsIsPunct(ji, ';') && !JsIsPunct(ji, ')') && !JsIsPunct(ji, '}') &&
+			!JsIsPunct(ji, ',') && !JsIsPunct(ji, ']') && JsTok(ji)->type != JT_EOF)
+			node->a = JsParseAssign(ji);
+		return node;
+	}
+
+	// async arrow: skip a leading `async` before an arrow shape so the detector
+	// below sees `(..) =>` / `x =>` directly (async is transparent - our fetch is
+	// synchronous, so the sync-body semantics are already correct).
+	if (JsIsKw(ji, "async") && ji->pos + 2 < ji->tok_count &&
+		(ji->toks[ji->pos + 1].punct == '(' ||
+		 (ji->toks[ji->pos + 1].type == JT_IDENT &&
+		  ji->toks[ji->pos + 2].type == JT_PUNCT &&
+		  ji->toks[ji->pos + 2].punct == JP_ARROW)))
+		ji->pos++;
+
 	// arrow functions: name => body  |  ( a, b ) => body
 	k = ji->pos;
 	if (k + 1 < ji->tok_count &&
@@ -1676,9 +1845,11 @@ CJsNode *JsParseAssign(CJsInterp *ji)
 	if (op >= 0)
 	{
 		if (node->type != JN_IDENT && node->type != JN_MEMBER &&
-			node->type != JN_INDEX)
-		{
-			JsErr(ji, "bad assignment target");
+			node->type != JN_INDEX && node->type != JN_ARRLIT &&
+			node->type != JN_OBJLIT)
+		{ // unbindable target: accept but drop (parse-completeness over erroring)
+			ji->pos++;
+			JsParseAssign(ji);
 			return node;
 		}
 		ji->pos++;
@@ -1718,10 +1889,14 @@ CJsNode *JsParseBlock(CJsInterp *ji)
 }
 
 CJsNode *JsParseFunc(CJsInterp *ji, Bool need_name)
-{ // "function" already eaten
+{ // "function" already eaten (or a method: name+params follow directly)
 	CJsNode *node = JsNode(ji, JN_FUNC), *param, *tail = NULL;
-	CJsTok	*t = JsTok(ji);
+	CJsTok	*t;
+	I64		 dep;
+	Bool	 is_rest;
 
+	JsEatPunct(ji, '*'); // generator function*: parsed as a normal function
+	t = JsTok(ji);
 	if (t->type == JT_IDENT)
 	{
 		node->str = t->str;
@@ -1742,24 +1917,46 @@ CJsNode *JsParseFunc(CJsInterp *ji, Bool need_name)
 	{
 		do
 		{
-			Bool is_rest = JsEatPunct(ji, JP_SPREAD); // function f(a, ...rest)
-
-			t = JsTok(ji);
-			if (t->type != JT_IDENT)
-			{
-				JsErr(ji, "bad parameter");
-				return node;
+			if (JsIsPunct(ji, ')'))
+				break; // trailing comma
+			is_rest = JsEatPunct(ji, JP_SPREAD); // function f(a, ...rest)
+			if (JsIsPunct(ji, '{') || JsIsPunct(ji, '['))
+			{ // destructured param {a,b} / [x,y]: skip the pattern (its names bind
+			  // undefined - parse-completeness over full destructuring binding).
+				dep = 0;
+				do
+				{
+					if (JsIsPunct(ji, '{') || JsIsPunct(ji, '['))
+						dep++;
+					else if (JsIsPunct(ji, '}') || JsIsPunct(ji, ']'))
+						dep--;
+					ji->pos++;
+				}
+				while (dep > 0 && JsTok(ji)->type != JT_EOF);
+				if (JsEatPunct(ji, '='))
+					JsParseAssign(ji); // pattern default, discarded
 			}
-			ji->pos++;
-			param = JsNode(ji, JN_IDENT);
-			param->str = t->str;
-			if (is_rest)
-				param->op = 1; // rest marker; JsCall collects the tail args
-			if (tail)
-				tail->next = param;
 			else
-				node->a = param;
-			tail = param;
+			{
+				t = JsTok(ji);
+				if (t->type != JT_IDENT)
+				{
+					JsErr(ji, "bad parameter");
+					return node;
+				}
+				ji->pos++;
+				param = JsNode(ji, JN_IDENT);
+				param->str = t->str;
+				if (is_rest)
+					param->op = 1; // rest marker; JsCall collects the tail args
+				else if (JsEatPunct(ji, '='))
+					param->a = JsParseAssign(ji); // default value (op stays 0)
+				if (tail)
+					tail->next = param;
+				else
+					node->a = param;
+				tail = param;
+			}
 		}
 		while (JsEatPunct(ji, ','));
 		if (!JsEatPunct(ji, ')'))
@@ -1798,6 +1995,22 @@ CJsNode *JsParseExpr(CJsInterp *ji)
 	return seq;
 }
 
+U0 JsSkipPattern(CJsInterp *ji)
+{ // skip a balanced {..} or [..] destructuring pattern we don't bind. Assumes
+  // the current token is the opening brace/bracket.
+	I64 dep = 0;
+
+	do
+	{
+		if (JsIsPunct(ji, '{') || JsIsPunct(ji, '['))
+			dep++;
+		else if (JsIsPunct(ji, '}') || JsIsPunct(ji, ']'))
+			dep--;
+		ji->pos++;
+	}
+	while (dep > 0 && JsTok(ji)->type != JT_EOF && !ji->has_err);
+}
+
 CJsNode *JsParseVar(CJsInterp *ji)
 { // var/let/const already eaten
 	CJsNode *node = JsNode(ji, JN_VAR), *decl, *tail = NULL, *item, *ptail;
@@ -1815,24 +2028,68 @@ CJsNode *JsParseVar(CJsInterp *ji)
 			ji->pos++;
 			ptail = NULL;
 			do
-			{
-				t = JsTok(ji);
-				if (t->type != JT_IDENT)
-				{
-					JsErr(ji, "bad destructuring pattern");
-					return node;
-				}
-				ji->pos++;
+			{ // tolerant: bind the simple elements, skip what we can't, never
+			  // error (a parse error would kill the whole script).
+			  // item->op: 0 normal, 2 rest (...x), 3 hole/skip (bind nothing)
+				if (JsIsPunct(ji, '}') || JsIsPunct(ji, ']'))
+					break;
 				item = JsNode(ji, JN_IDENT);
-				item->str = t->str;
-				if (decl->op == 0 && JsEatPunct(ji, ':'))
-				{ // {prop: alias}
+				if (JsIsPunct(ji, ','))
+					item->op = 3; // array hole [, x]
+				else if (JsEatPunct(ji, JP_SPREAD))
+				{ // ...rest
+					item->op = 2;
 					t = JsTok(ji);
 					if (t->type == JT_IDENT)
 					{
-						item->a = JsNode(ji, JN_IDENT);
-						item->a->str = t->str;
+						item->str = t->str;
 						ji->pos++;
+					}
+					else
+						item->op = 3;
+				}
+				else if (JsIsPunct(ji, '{') || JsIsPunct(ji, '['))
+				{ // nested pattern in an array slot: skip, bind nothing
+					JsSkipPattern(ji);
+					item->op = 3;
+					if (JsEatPunct(ji, '='))
+						JsParseAssign(ji); // discard default
+				}
+				else
+				{
+					t = JsTok(ji);
+					if (t->type != JT_IDENT && t->type != JT_STR && t->type != JT_NUM)
+					{ // unknown element: skip one token, bind nothing
+						ji->pos++;
+						item->op = 3;
+					}
+					else
+					{
+						ji->pos++;
+						if (t->type == JT_NUM)
+							item->op = 3; // numeric key: skip binding (rare)
+						else
+							item->str = t->str;
+						if (decl->op == 0 && JsEatPunct(ji, ':'))
+						{ // {key: target} - target is an ident or a nested pattern
+							if (JsIsPunct(ji, '{') || JsIsPunct(ji, '['))
+							{
+								JsSkipPattern(ji);
+								item->op = 3;
+							}
+							else
+							{
+								t = JsTok(ji);
+								if (t->type == JT_IDENT)
+								{
+									item->a = JsNode(ji, JN_IDENT);
+									item->a->str = t->str;
+									ji->pos++;
+								}
+							}
+						}
+						if (JsEatPunct(ji, '='))
+							item->c = JsParseAssign(ji); // default value
 					}
 				}
 				if (ptail)
@@ -1925,54 +2182,7 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 		return node;
 	}
 	if (JsEatKw(ji, "class"))
-	{ // class X { constructor(..){..} method(..){..} } - extends is parsed
-	  // but ignored (no super)
-		node = JsNode(ji, JN_CLASS);
-		t = JsTok(ji);
-		if (t->type == JT_IDENT)
-		{
-			node->str = t->str;
-			ji->pos++;
-		}
-		if (JsEatKw(ji, "extends"))
-			node->c = JsParseAssign(ji);
-		mtail = NULL;
-		if (JsEatPunct(ji, '{'))
-		{
-			while (!JsIsPunct(ji, '}') && JsTok(ji)->type != JT_EOF &&
-				   !ji->has_err)
-			{
-				if (JsEatPunct(ji, ';'))
-				{ /* stray semicolons between members */ }
-				else
-				{
-					t = JsTok(ji);
-					if (t->type != JT_IDENT)
-					{
-						JsErr(ji, "bad class member");
-						break;
-					}
-					ji->pos++;
-					if (!StrCompare(t->str, "static") &&
-						JsTok(ji)->type == JT_IDENT)
-					{ // treat static methods like instance ones
-						t = JsTok(ji);
-						ji->pos++;
-					}
-					item = JsNode(ji, JN_PROP);
-					item->str = t->str;
-					item->a = JsParseFunc(ji, FALSE); // (params) { body }
-					if (mtail)
-						mtail->next = item;
-					else
-						node->a = item;
-					mtail = item;
-				}
-			}
-			JsEatPunct(ji, '}');
-		}
-		return node;
-	}
+		return JsParseClass(ji);
 	if (JsEatKw(ji, "if"))
 	{
 		node = JsNode(ji, JN_IF);
@@ -2351,6 +2561,21 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				return JsStrV(ji, "@@iterator");
 			if (obj->native_id == JSN_PROMISE_CTOR && !StrCompare(name, "resolve"))
 				return JsNativeV(ji, JSN_PROMISE_SRESOLVE);
+			v = JsPropGet(obj, name); // bound-fn slots (_t/_this) live here
+			if (v)
+				return v;
+			if (!StrCompare(name, "call"))	return JsNativeV(ji, JSN_FN_CALL);
+			if (!StrCompare(name, "apply"))	return JsNativeV(ji, JSN_FN_APPLY);
+			if (!StrCompare(name, "bind"))	return JsNativeV(ji, JSN_FN_BIND);
+			return JsUndefV(ji);
+		case JV_FUNC:
+			if (!StrCompare(name, "call"))	return JsNativeV(ji, JSN_FN_CALL);
+			if (!StrCompare(name, "apply"))	return JsNativeV(ji, JSN_FN_APPLY);
+			if (!StrCompare(name, "bind"))	return JsNativeV(ji, JSN_FN_BIND);
+			if (!StrCompare(name, "length"))	return JsNumV(ji, 0);
+			v = JsPropGet(obj, name); // fn.prototype and assigned static props
+			if (v)
+				return v;
 			return JsUndefV(ji);
 		case JV_OBJ:
 			break;
@@ -2823,8 +3048,9 @@ CJsVal *JsEvalBin(CJsInterp *ji, I64 op, CJsVal *a, CJsVal *b)
 
 U0 JsAssignTo(CJsInterp *ji, CJsNode *target, CJsVal *val)
 {
-	CJsVal *obj, *idx;
-	I64		i;
+	CJsVal	*obj, *idx, *sub;
+	CJsNode	*el;
+	I64		 i;
 
 	if (!target)
 		return;
@@ -2852,6 +3078,44 @@ U0 JsAssignTo(CJsInterp *ji, CJsNode *target, CJsVal *val)
 			}
 			else if (obj->type == JV_OBJ)
 				JsMemberSet(ji, obj, JsToStr(ji, idx), val);
+			break;
+		case JN_ARRLIT:
+			// array destructuring assignment: [a, b] = val
+			el = target->a;
+			i = 0;
+			while (el)
+			{
+				if (el->type != JN_SPREAD)
+				{
+					sub = JsUndefV(ji);
+					if (val && val->type == JV_ARR && i < val->count)
+						sub = val->items[i];
+					JsAssignTo(ji, el, sub);
+				}
+				el = el->next;
+				i++;
+			}
+			break;
+		case JN_OBJLIT:
+			// object destructuring assignment: ({a, b: c} = val)
+			el = target->a;
+			while (el)
+			{
+				if (el->type == JN_PROP && el->str)
+				{
+					sub = JsUndefV(ji);
+					if (val && val->type == JV_OBJ)
+					{
+						obj = JsPropGet(val, el->str);
+						if (obj)
+							sub = obj;
+					}
+					// {a} -> el->a is IDENT a; {a: c} -> el->a is IDENT c
+					if (el->a)
+						JsAssignTo(ji, el->a, sub);
+				}
+				el = el->next;
+			}
 			break;
 	}
 }
@@ -3064,6 +3328,8 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 				return JsBoolV(ji, TRUE);
 			}
 			v = JsEval(ji, node->a);
+			if (op == 'y') // yield x -> x (eager generator approximation)
+				return v;
 			if (op == 'v') // void x
 				return JsUndefV(ji);
 			if (op == 'p') // unary +
@@ -3223,24 +3489,50 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 					k = 0;
 					while (item)
 					{
-						sv = JsUndefV(ji);
-						if (v && child->op == 1)
-						{
-							if (v->type == JV_ARR && k < v->count)
-								sv = v->items[k];
+						if (item->op == 3)
+						{ // hole / unbindable element: consume an array slot only
+							if (child->op == 1)
+								k++;
 						}
-						else if (v && v->type == JV_OBJ)
-						{
-							cur = JsPropGet(v, item->str);
-							if (cur)
-								sv = cur;
-						}
-						if (item->a)
-							JsEnvDeclare(ji, ji->env, item->a->str, sv);
-						else
+						else if (item->op == 2)
+						{ // ...rest
+							if (child->op == 1)
+							{ // array rest -> remaining items
+								sv = JsArrV(ji);
+								if (v && v->type == JV_ARR)
+									while (k < v->count)
+									{
+										JsArrPush(ji, sv, v->items[k]);
+										k++;
+									}
+							}
+							else
+								sv = JsValNew(ji, JV_OBJ); // object rest: approx empty
 							JsEnvDeclare(ji, ji->env, item->str, sv);
+						}
+						else
+						{
+							sv = JsUndefV(ji);
+							if (v && child->op == 1)
+							{
+								if (v->type == JV_ARR && k < v->count)
+									sv = v->items[k];
+							}
+							else if (v && v->type == JV_OBJ)
+							{
+								cur = JsPropGet(v, item->str);
+								if (cur)
+									sv = cur;
+							}
+							if (sv->type == JV_UNDEF && item->c)
+								sv = JsEval(ji, item->c); // default value
+							if (item->a)
+								JsEnvDeclare(ji, ji->env, item->a->str, sv);
+							else
+								JsEnvDeclare(ji, ji->env, item->str, sv);
+							k++;
+						}
 						item = item->next;
-						k++;
 					}
 				}
 				else
@@ -4355,6 +4647,50 @@ U8	js_ls_vals[JS_LS_MAX][512];
 I64	js_ls_count = 0; // statically initialized; JIT does not zero plain globals
 I64	js_sym_n = 0;	 // Symbol() uniqueness counter
 
+U0 JsAbsUrl(U8 *base, U8 *src, U8 *out)
+{ // resolve src against base (an absolute http(s) URL) -> out (>= 1024 bytes)
+	U8	*p, *lastslash = NULL;
+	I64	 n;
+
+	if (!src)
+	{
+		out[0] = 0;
+		return;
+	}
+	if (StrFind("://", src) || !base || !StrFind("://", base))
+	{ // already absolute (or no usable base): use as-is
+		StrCopy(out, src);
+		return;
+	}
+	if (src[0] == '/')
+	{ // origin (scheme://host) + src
+		p = StrFind("://", base) + 3;
+		while (*p && *p != '/')
+			p++;
+		n = p - base;
+		MemCopy(out, base, n);
+		StrCopy(out + n, src);
+		return;
+	}
+	// relative to the directory of base
+	StrCopy(out, base);
+	p = StrFind("://", out) + 3;
+	while (*p)
+	{
+		if (*p == '/')
+			lastslash = p;
+		p++;
+	}
+	if (lastslash)
+		StrCopy(lastslash + 1, src);
+	else
+	{
+		n = StrLen(out);
+		out[n] = '/';
+		StrCopy(out + n + 1, src);
+	}
+}
+
 CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 					 CJsVal **args, I64 argc)
 { // self = the native function value itself (carries promise binding in proto)
@@ -4372,6 +4708,26 @@ CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 
 	switch (id)
 	{
+		case JSN_FN_CALL: // fn.call(thisArg, ...rest) - this_val IS the target fn
+			if (argc >= 1)
+				return JsCall(ji, this_val, args[0], &args[1], argc - 1);
+			return JsCall(ji, this_val, JsUndefV(ji), NULL, 0);
+		case JSN_FN_APPLY: // fn.apply(thisArg, argsArray)
+			w = JsArgOr(ji, args, argc, 1);
+			if (w && w->type == JV_ARR)
+				return JsCall(ji, this_val, JsArgOr(ji, args, argc, 0),
+							  w->items, w->count);
+			return JsCall(ji, this_val, JsArgOr(ji, args, argc, 0), NULL, 0);
+		case JSN_FN_BIND: // fn.bind(thisArg) -> a bound native remembering _t/_this
+			v = JsNativeV(ji, JSN_FN_BOUND);
+			JsPropSet(ji, v, "_t", this_val);
+			JsPropSet(ji, v, "_this", JsArgOr(ji, args, argc, 0));
+			return v;
+		case JSN_FN_BOUND: // invoking a bound fn: ignore call-site this, use _this
+			pr = JsPropGet(self, "_t");
+			if (pr)
+				return JsCall(ji, pr, JsPropGet(self, "_this"), args, argc);
+			return JsUndefV(ji);
 		case JSN_ALERT:
 			s = JsEscDollars(ji, JsToStr(ji, JsArgOr(ji, args, argc, 0)));
 			PopUpOk(s);
@@ -4600,6 +4956,34 @@ CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 				pa[1] = w->items[i];
 				JsCall(ji, args[0], NULL, pa, 2);
 			}
+			return JsUndefV(ji);
+		case JSN_AUDIO_CTOR: // new Audio(url) -> media element (subset)
+			v = JsValNew(ji, JV_OBJ);
+			JsPropSet(ji, v, "src", JsStrV(ji, JsToStr(ji, JsArgOr(ji, args, argc, 0))));
+			JsPropSet(ji, v, "volume", JsNumV(ji, 1));
+			JsPropSet(ji, v, "paused", JsBoolV(ji, TRUE));
+			JsPropSet(ji, v, "loop", JsBoolV(ji, FALSE));
+			JsPropSet(ji, v, "currentTime", JsNumV(ji, 0));
+			JsPropSet(ji, v, "play",	JsNativeV(ji, JSN_AUDIO_PLAY));
+			JsPropSet(ji, v, "pause",	JsNativeV(ji, JSN_AUDIO_PAUSE));
+			JsPropSet(ji, v, "load",	JsNativeV(ji, JSN_NOOP_UNDEF));
+			JsPropSet(ji, v, "canPlayType", JsNativeV(ji, JSN_NOOP_UNDEF));
+			JsPropSet(ji, v, "addEventListener",	JsNativeV(ji, JSN_NOOP_UNDEF));
+			JsPropSet(ji, v, "removeEventListener",	JsNativeV(ji, JSN_NOOP_UNDEF));
+			return v;
+		case JSN_AUDIO_PLAY: // element.play(): fetch+decode+stream to AC97
+			w = JsPropGet(this_val, "src");
+			if (w)
+			{
+				JsAbsUrl(ji->url, JsToStr(ji, w), buf);
+				if (*buf)
+					ZAudioPlay(buf);
+			}
+			JsPropSet(ji, this_val, "paused", JsBoolV(ji, FALSE));
+			return JsUndefV(ji); // (real play() returns a Promise; undefined here)
+		case JSN_AUDIO_PAUSE:
+			ZAudioStop();
+			JsPropSet(ji, this_val, "paused", JsBoolV(ji, TRUE));
 			return JsUndefV(ji);
 		case JSN_NOOP_UNDEF: // generic stub method
 			return JsUndefV(ji);
@@ -5482,6 +5866,12 @@ CJsVal *JsCall(CJsInterp *ji, CJsVal *fn, CJsVal *this_val,
 	else
 		call_env->parent = ji->genv;
 
+	// bind params in call_env. Set env FIRST so default-value expressions can
+	// reference earlier parameters.
+	saved_env = ji->env;
+	ji->env = call_env;
+	if (this_val)
+		JsEnvDeclare(ji, call_env, "this", this_val);
 	param = func->a;
 	i = 0;
 	while (param)
@@ -5497,18 +5887,15 @@ CJsVal *JsCall(CJsInterp *ji, CJsVal *fn, CJsVal *this_val,
 			}
 			JsEnvDeclare(ji, call_env, param->str, rest);
 		}
-		else if (i < argc)
+		else if (i < argc && args[i]->type != JV_UNDEF)
 			JsEnvDeclare(ji, call_env, param->str, args[i]);
+		else if (param->a) // default value (arg missing or explicitly undefined)
+			JsEnvDeclare(ji, call_env, param->str, JsEval(ji, param->a));
 		else
 			JsEnvDeclare(ji, call_env, param->str, JsUndefV(ji));
 		param = param->next;
 		i++;
 	}
-	if (this_val)
-		JsEnvDeclare(ji, call_env, "this", this_val);
-
-	saved_env = ji->env;
-	ji->env = call_env;
 	ji->ret_val = NULL;
 
 	JsEval(ji, func->b);
@@ -5611,6 +5998,7 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsGlobalNative(ji, "requestAnimationFrame",	JSN_SETTIMEOUT); // ~immediate timer
 	JsGlobalNative(ji, "cancelAnimationFrame",	JSN_CLEARTIMER);
 	JsGlobalNative(ji, "queueMicrotask",		JSN_SETTIMEOUT);
+	JsGlobalNative(ji, "Audio",					JSN_AUDIO_CTOR);
 
 	math = JsValNew(ji, JV_OBJ); // history: no real session stack, calls are no-ops
 	JsPropSet(ji, math, "pushState",	JsNativeV(ji, JSN_NOOP_UNDEF));
