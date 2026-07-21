@@ -159,6 +159,8 @@
 #define JSN_STR_PADSTART	122
 #define JSN_STR_PADEND		123
 #define JSN_STR_SUBSTR		124
+#define JSN_RE_TEST			125	// stub regex: test() -> FALSE
+#define JSN_RE_EXEC			126	// stub regex: exec() -> null
 
 /* token types */
 #define JT_EOF		0
@@ -166,6 +168,7 @@
 #define JT_STR		2
 #define JT_IDENT	3
 #define JT_PUNCT	4
+#define JT_REGEX	5	// /pattern/flags literal; str = pattern, num = flag bits
 
 /* multi-char puncts; single-char puncts use their ASCII code */
 #define JP_EQ2		256
@@ -185,6 +188,8 @@
 #define JP_MODEQ	270
 #define JP_ARROW	271
 #define JP_SPREAD	272	// ...
+#define JP_OPTCHAIN	273	// ?.
+#define JP_NULLISH	274	// ??
 
 /* AST node types */
 #define JN_NUM		1
@@ -222,6 +227,7 @@
 #define JN_SPREAD	33	// ...expr in call args / array literals; a = expr
 #define JN_AWAIT	34	// await expr; unwraps our synchronous promises
 #define JN_DESTRUCT	35	// const {a,b:c}=e / [x,y]=e; op: 0 obj 1 arr; a=init, b=idents
+#define JN_REGEX	36	// regex literal -> stub RegExp object (no engine yet)
 
 /* control flow states */
 #define JF_NORMAL	0
@@ -605,6 +611,85 @@ Bool JsIdentCh(I64 ch, Bool first)
 	return FALSE;
 }
 
+Bool JsLexRegexPos(CJsInterp *ji, I64 n)
+{ // is a '/' here a REGEX literal (vs division)? Standard heuristic: regex
+  // after nothing, after most puncts (not ')' / ']'), or after these keywords.
+	CJsTok *pt;
+
+	if (!n)
+		return TRUE;
+	pt = &ji->toks[n - 1];
+	if (pt->type == JT_PUNCT)
+		return pt->punct != ')' && pt->punct != ']';
+	if (pt->type == JT_IDENT)
+		return !StrCompare(pt->str, "return") || !StrCompare(pt->str, "typeof") ||
+			   !StrCompare(pt->str, "case")   || !StrCompare(pt->str, "delete") ||
+			   !StrCompare(pt->str, "void")   || !StrCompare(pt->str, "in") ||
+			   !StrCompare(pt->str, "of")     || !StrCompare(pt->str, "instanceof") ||
+			   !StrCompare(pt->str, "new")    || !StrCompare(pt->str, "else") ||
+			   !StrCompare(pt->str, "do");
+
+	return FALSE;
+}
+
+I64 JsLexRegex(CJsInterp *ji, U8 *p, CJsTok *t)
+{ // scan /pattern/flags at p (p[0] == '/'). Fills t (JT_REGEX, str = pattern,
+  // num = flag bits g1 i2 m4 s8 u16 y32); returns chars consumed, 0 = not a
+  // one-line regex (caller lexes '/' as division instead).
+	U8	 pat[512];
+	I64	 i = 1, len = 0, fl = 0;
+	Bool inclass = FALSE;
+
+	while (p[i] && p[i] != '\n' && len < 508)
+	{
+		if (p[i] == '\\' && p[i + 1])
+		{
+			pat[len++] = p[i];
+			pat[len++] = p[i + 1];
+			i += 2;
+		}
+		else if (p[i] == '[')
+		{
+			inclass = TRUE;
+			pat[len++] = p[i++];
+		}
+		else if (p[i] == ']')
+		{
+			inclass = FALSE;
+			pat[len++] = p[i++];
+		}
+		else if (p[i] == '/' && !inclass)
+			break;
+		else
+			pat[len++] = p[i++];
+	}
+	if (p[i] != '/' || !len)
+		return 0;
+	i++;
+	while ('a' <= p[i] <= 'z')
+	{
+		if (p[i] == 'g')
+			fl |= 1;
+		else if (p[i] == 'i')
+			fl |= 2;
+		else if (p[i] == 'm')
+			fl |= 4;
+		else if (p[i] == 's')
+			fl |= 8;
+		else if (p[i] == 'u')
+			fl |= 16;
+		else if (p[i] == 'y')
+			fl |= 32;
+		i++;
+	}
+	pat[len] = 0;
+	t->type	= JT_REGEX;
+	t->str	= JsStrDup(ji, pat);
+	t->num	= fl;
+
+	return i;
+}
+
 Bool JsLex(CJsInterp *ji, U8 *src)
 {
 	U8	*p = src;
@@ -712,6 +797,13 @@ Bool JsLex(CJsInterp *ji, U8 *src)
 			p++;
 			goto js_tpl_part;
 		}
+		else if (*p == '/' && p[1] != '/' && p[1] != '*' &&
+				 JsLexRegexPos(ji, n) && (len = JsLexRegex(ji, p, &ji->toks[n])))
+		{ // regex literal -> JT_REGEX token (stub RegExp object at runtime).
+		  // Without this every minified bundle dies at the first /re/.
+			n++;
+			p += len;
+		}
 		else if (*p == '"' || *p == '\'')
 		{ // string literal
 			quote = *p++;
@@ -755,6 +847,8 @@ Bool JsLex(CJsInterp *ji, U8 *src)
 		{
 			punct = 0;
 			if (!StrNCompare(p, "...", 3))		{ punct = JP_SPREAD; p += 3; }
+			else if (!StrNCompare(p, "?.", 2))	{ punct = JP_OPTCHAIN; p += 2; }
+			else if (!StrNCompare(p, "??", 2))	{ punct = JP_NULLISH; p += 2; }
 			else if (!StrNCompare(p, "===", 3))	{ punct = JP_EQ3;	p += 3; }
 			else if (!StrNCompare(p, "!==", 3))	{ punct = JP_NE3;	p += 3; }
 			else if (!StrNCompare(p, "==", 2))	{ punct = JP_EQ2;	p += 2; }
@@ -940,7 +1034,8 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 {
 	CJsTok	*t = JsTok(ji);
 	CJsNode *node, *item, *tail;
-	U8		 numkey[24];
+	U8		 numkey[24], embuf[96];
+	I64		 emk;
 
 	if (t->type == JT_NUM)
 	{
@@ -954,6 +1049,14 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 		ji->pos++;
 		node = JsNode(ji, JN_STR);
 		node->str = t->str;
+		return node;
+	}
+	if (t->type == JT_REGEX)
+	{
+		ji->pos++;
+		node = JsNode(ji, JN_REGEX);
+		node->str = t->str;
+		node->op  = t->num; // flag bits
 		return node;
 	}
 	if (t->type == JT_IDENT)
@@ -1076,7 +1179,25 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 		return node;
 	}
 
-	JsErr(ji, "unexpected token");
+	t = JsTok(ji);
+	if (t->type == JT_IDENT || t->type == JT_STR)
+	{ // name the offender so the Network Log says WHAT to implement next
+		emk = StrLen(t->str);
+		if (emk > 20)
+			emk = 20;
+		MemCopy(numkey, t->str, emk);
+		numkey[emk] = 0;
+		StrPrint(embuf, "unexpected token '%s' (tok %d)", numkey, ji->pos);
+	}
+	else if (t->type == JT_PUNCT && t->punct < 256)
+		StrPrint(embuf, "unexpected '%c' (tok %d)", t->punct, ji->pos);
+	else
+		StrPrint(embuf, "unexpected token type %d code %d (tok %d)",
+				 t->type, t->punct, ji->pos);
+	for (emk = 0; embuf[emk]; emk++)
+		if (embuf[emk] == 0x24)
+			embuf[emk] = '?'; // dollars are live DolDoc commands in the log
+	JsErr(ji, embuf);
 	ji->pos++;
 
 	return NULL;
@@ -1090,7 +1211,21 @@ CJsNode *JsParsePostfix(CJsInterp *ji)
 
 	while (node && going && !ji->has_err)
 	{
-		if (JsEatPunct(ji, '.'))
+		if (JsEatPunct(ji, JP_OPTCHAIN))
+		{ // a?.b: approximated as a.b (member-get on undef already yields undef,
+		  // so there is no crash to guard). ?.( and ?.[ fall through to the
+		  // call/index branches on the next loop pass.
+			t = JsTok(ji);
+			if (t->type == JT_IDENT)
+			{
+				ji->pos++;
+				wrap = JsNode(ji, JN_MEMBER);
+				wrap->a	  = node;
+				wrap->str = t->str;
+				node = wrap;
+			}
+		}
+		else if (JsEatPunct(ji, '.'))
 		{
 			t = JsTok(ji);
 			if (t->type != JT_IDENT)
@@ -1203,7 +1338,7 @@ CJsNode *JsParseUnary(CJsInterp *ji)
 }
 
 CJsNode *JsParseBinLevel(CJsInterp *ji, I64 level)
-{ // level 0: * / %   1: + -   2: < > <= >=   3: == != === !==   4: &&   5: ||
+{ // level 0: * / %   1: + -   2: < > <= >=   3: == != === !==   4: &&   5: ||   6: ??
 	CJsNode *node, *wrap;
 	I64		 op;
 	Bool	 going = TRUE;
@@ -1245,6 +1380,10 @@ CJsNode *JsParseBinLevel(CJsInterp *ji, I64 level)
 					if (op != JP_OR)
 						op = -1;
 					break;
+				case 6:
+					if (op != JP_NULLISH)
+						op = -1;
+					break;
 			}
 		}
 		if (op < 0)
@@ -1268,7 +1407,7 @@ CJsNode *JsParseBinLevel(CJsInterp *ji, I64 level)
 
 CJsNode *JsParseCond(CJsInterp *ji)
 {
-	CJsNode *node = JsParseBinLevel(ji, 5), *wrap;
+	CJsNode *node = JsParseBinLevel(ji, 6), *wrap;
 
 	if (node && JsEatPunct(ji, '?'))
 	{
@@ -1749,7 +1888,7 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 	}
 	if (JsIsKw(ji, "continue") || JsIsKw(ji, "do") || JsIsKw(ji, "switch"))
 	{ // try/throw/class are handled above now
-		JsErr(ji, "unsupported statement");
+		JsErr(ji, "unsupported statement (switch/do/continue) - script stopped");
 		return NULL;
 	}
 
@@ -2476,6 +2615,16 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 			if (v)
 				return v;
 			return JsUndefV(ji);
+		case JN_REGEX:
+			// Stub RegExp: parses + carries source/flags so bundles run past the
+			// literal; test()/exec() report no-match. Real engine = future work.
+			v = JsValNew(ji, JV_OBJ);
+			JsPropSet(ji, v, "source", JsStrV(ji, node->str));
+			JsPropSet(ji, v, "global", JsBoolV(ji, node->op & 1));
+			JsPropSet(ji, v, "lastIndex", JsNumV(ji, 0));
+			JsPropSet(ji, v, "test", JsNativeV(ji, JSN_RE_TEST));
+			JsPropSet(ji, v, "exec", JsNativeV(ji, JSN_RE_EXEC));
+			return v;
 		case JN_ARRLIT:
 			v = JsArrV(ji);
 			child = node->a;
@@ -2546,6 +2695,13 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 			{
 				v = JsEval(ji, node->a);
 				if (JsToBool(v))
+					return v;
+				return JsEval(ji, node->b);
+			}
+			if (op == JP_NULLISH)
+			{ // a ?? b: b only when a is null/undefined
+				v = JsEval(ji, node->a);
+				if (v && v->type != JV_UNDEF && v->type != JV_NULL)
 					return v;
 				return JsEval(ji, node->b);
 			}
@@ -3830,6 +3986,10 @@ CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 		case JSN_LS_CLEAR:
 			js_ls_count = 0;
 			return JsUndefV(ji);
+		case JSN_RE_TEST: // stub regex: no engine yet, never matches
+			return JsBoolV(ji, FALSE);
+		case JSN_RE_EXEC:
+			return JsNullV(ji);
 		case JSN_ARR_REDUCE:
 			if (this_val->type != JV_ARR || !argc)
 				return JsUndefV(ji);
