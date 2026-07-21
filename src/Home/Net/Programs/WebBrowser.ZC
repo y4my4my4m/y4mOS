@@ -319,7 +319,7 @@ U0 ZincCollectCss(CZNode *node, I64 *external_left)
 //load and the interpreter can't digest framework bundles anyway, so this is
 //a time cap, not a hard capability limit -- raise it freely.
 #define ZINC_EXT_JS_MAX		8
-#define ZINC_EXT_JS_BYTES	262144
+#define ZINC_EXT_JS_BYTES	2097152	// = HTTP_BODY_MAX, the real ceiling
 
 I64 zinc_ext_js_left = ZINC_EXT_JS_MAX;
 

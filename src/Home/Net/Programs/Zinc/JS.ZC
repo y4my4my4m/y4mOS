@@ -31,7 +31,7 @@
 
 	Needs: HTML.ZC. No literal dollar signs allowed in this file. */
 
-#define JS_MAX_SRC			65536
+#define JS_MAX_SRC			2097152	// = HTTP_BODY_MAX: bigger can't arrive anyway
 #define JS_MAX_STEPS		2000000
 #define JS_MAX_DEPTH		48
 #define JS_MAX_ARGS			8
@@ -622,10 +622,16 @@ Bool JsLex(CJsInterp *ji, U8 *src)
 	}
 	p = src;
 
-	ji->toks = JsAlloc(ji, cap * sizeof(CJsTok))(CJsTok *);
+	// NOT arena-allocated: the token array is ~32 bytes per source CHAR (worst
+	// case) and is only needed during parse - JsRun frees it right after. Token
+	// strings are JsStrDup'd into the arena and shared by the AST, so they live
+	// on. Zeroed alloc matters: the tail's type==0 (JT_EOF) terminates parsing.
+	ji->toks = CAlloc(cap * sizeof(CJsTok))(CJsTok *);
 
 	while (*p)
 	{
+		if (!(n & 2047))
+			Yield; // big bundles: stay cooperative while tokenizing
 		if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
 			p++;
 		else if (p[0] == '/' && p[1] == '/')
@@ -4782,6 +4788,11 @@ Bool JsRun(CJsInterp *ji, U8 *src)
 	if (!JsLex(ji, src))
 	{
 		NetLog("%s", ji->err);
+		if (ji->toks)
+		{ // token array is a plain CAlloc, not arena: free on every exit
+			Free(ji->toks);
+			ji->toks = NULL;
+		}
 		return FALSE;
 	}
 
@@ -4796,6 +4807,13 @@ Bool JsRun(CJsInterp *ji, U8 *src)
 		ji->flow = JF_NORMAL; // stray top-level break/return/throw
 		if (ji->pos == before)
 			ji->pos++;
+	}
+
+	if (ji->toks)
+	{ // parse done: the AST owns arena strings, the token array can go. This is
+	  // what makes big-bundle caps affordable (toks = 32B x source chars).
+		Free(ji->toks);
+		ji->toks = NULL;
 	}
 
 	JsFlushWrites(ji);
