@@ -3276,6 +3276,8 @@ public U0 ZincGX(U8 *start_url=NULL)
 			{//Built-in page: parse directly in THIS (main) task's heap.
 				if (!StrICompare(current, "zinc:test"))
 					ZincSetPage(current, zinc_testpage);
+				else if (!StrICompare(current, "zinc:hi"))
+					ZincSetPage(current, zinc_hipage);
 				else if (!StrICompare(current, "zinc:css"))
 					ZincSetPage(current, zinc_csspage);
 				else

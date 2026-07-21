@@ -102,6 +102,20 @@ U8 *zinc_testpage =
 	"<p><a href=\"zinc:welcome\">back to welcome</a></p>"
 	"</body></html>";
 
+// Minimal document.write probes to isolate WHERE values corrupt: a bare string
+// literal, a two-string concat, and a bare number. Expected: "hi ab 42".
+// Minimal corrupt case + control. Script 1: string+NUMBER concat (corrupts).
+// Script 2: string+string control (works). The [BAD ...] probe marker printed
+// by document.write pins where the value went bad (see js_dbg_* in JS.ZC).
+U8 *zinc_hipage =
+	"<html><body><h1>probe</h1>"
+	"<script>document.write('n' + 4);</script>"
+	"<p>ctl:</p>"
+	"<script>document.write('x' + 'y');</script>"
+	"<p>expected: n4 then xy; a [BAD ...] marker shows the corruption breadcrumbs</p>"
+	"<p><a href=\"zinc:welcome\">back to welcome</a></p>"
+	"</body></html>";
+
 U8 *zinc_csspage =
 	"<html><head><title>Zinc CSS self-test</title><style>"
 	"body { background: #f0f0f2; color: #222222; }"
@@ -469,6 +483,8 @@ U0 ZincLoad(U8 *url)
 	{ // built-in pages: no real base URL to resolve links against
 		if (!StrICompare(url, "zinc:test"))
 			ZincSetPage(url, zinc_testpage);
+		else if (!StrICompare(url, "zinc:hi"))
+			ZincSetPage(url, zinc_hipage);
 		else if (!StrICompare(url, "zinc:css"))
 			ZincSetPage(url, zinc_csspage);
 		else

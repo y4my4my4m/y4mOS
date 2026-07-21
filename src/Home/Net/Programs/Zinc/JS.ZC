@@ -201,6 +201,28 @@
 #define JSN_FN_APPLY		164	// fn.apply(thisArg, argsArray)
 #define JSN_FN_BIND			165	// fn.bind(thisArg) -> bound native
 #define JSN_FN_BOUND		166	// the bound function produced by bind
+#define JSN_DOC_GETBYTAG	167	// getElementsByTagName (doc or element scoped)
+#define JSN_DOC_GETBYCLASS	168	// getElementsByClassName
+#define JSN_DOC_GETBYNAME	169	// getElementsByName
+#define JSN_EL_CONTAINS		170	// element.contains(other)
+#define JSN_EL_MATCHES		171	// element.matches(selector)
+#define JSN_EL_CLOSEST		172	// element.closest(selector)
+#define JSN_EL_HASATTR		173	// element.hasAttribute(name)
+#define JSN_EL_RMATTR		174	// element.removeAttribute(name)
+#define JSN_EL_CLONE		175	// element.cloneNode(deep)
+#define JSN_EL_INSBEFORE	176	// element.insertBefore(new, ref)
+#define JSN_EL_RECT			177	// element.getBoundingClientRect()
+#define JSN_OBJ_VALUES		178	// Object.values(o)
+#define JSN_OBJ_ENTRIES		179	// Object.entries(o)
+#define JSN_OBJ_DEFINEPROP	180	// Object.defineProperty(o, k, desc)
+#define JSN_OBJ_DEFINEPROPS	181	// Object.defineProperties(o, descs)
+#define JSN_OBJ_CREATE		182	// Object.create(proto, descs?)
+#define JSN_OBJ_FREEZE		183	// Object.freeze / seal / preventExtensions (no-op)
+#define JSN_OBJ_GETPROTO	184	// Object.getPrototypeOf(o)
+#define JSN_OBJ_SETPROTO	185	// Object.setPrototypeOf(o, p)
+#define JSN_OBJ_GETDESC		186	// Object.getOwnPropertyDescriptor(o, k)
+#define JSN_OBJ_FROMENTRIES	187	// Object.fromEntries(iterable)
+#define JSN_OBJ_ISFROZEN	188	// Object.isFrozen / isSealed / isExtensible
 
 /* token types */
 #define JT_EOF		0
@@ -616,9 +638,11 @@ F64 JsToNum(CJsVal *v)
 U8 *JsNumToStr(CJsInterp *ji, F64 n)
 {
 	U8	buf[64];
-	I64	i = n;
+	I64	i = ToI64(n);
 
-	if (i(F64) == n && Abs(n) < 1e15)
+	// ToF64/ToI64 intrinsics, NOT postfix casts: `i(F64)` is a no-op (gotcha #1),
+	// which silently sent every integer down the %g branch (4 -> "4.00000000e0").
+	if (ToF64(i) == n && Abs(n) < 1e15)
 		StrPrint(buf, "%d", i);
 	else
 		StrPrint(buf, "%g", n);
@@ -628,8 +652,9 @@ U8 *JsNumToStr(CJsInterp *ji, F64 n)
 
 U8 *JsToStr(CJsInterp *ji, CJsVal *v)
 {
-	U8	*out, *piece;
-	I64	 i, len;
+	U8	   *out, *piece;
+	I64		i, len;
+	CJsVal *w;
 
 	switch (v->type)
 	{
@@ -657,6 +682,11 @@ U8 *JsToStr(CJsInterp *ji, CJsVal *v)
 				CatPrint(out, "%s", piece);
 			}
 			return out;
+		case JV_OBJ:
+			// custom toString()/valueOf() coercion is deferred: calling into a
+			// corrupted-looking object here turned heap bugs into hard GP faults.
+			// A plain object stringifies to the spec default.
+			return "[object Object]";
 	}
 
 	return "[object Object]";
@@ -1079,6 +1109,7 @@ CJsNode *JsNode(CJsInterp *ji, I64 type)
 CJsNode *JsParseArgs(CJsInterp *ji)
 { // '(' already eaten; returns arg list, eats ')'
 	CJsNode *head = NULL, *tail = NULL, *arg;
+	I64		 dep;
 
 	if (JsEatPunct(ji, ')'))
 		return NULL;
@@ -1101,7 +1132,18 @@ CJsNode *JsParseArgs(CJsInterp *ji)
 	}
 	while (JsEatPunct(ji, ','));
 	if (!JsEatPunct(ji, ')'))
-		JsErr(ji, "expected ) in call");
+	{ // desync RECOVERY: balanced-skip to this call's ) so the whole script
+	  // survives (a hard parse error would kill the entire bundle).
+		dep = 1;
+		while (dep > 0 && JsTok(ji)->type != JT_EOF)
+		{
+			if (JsIsPunct(ji, '(') || JsIsPunct(ji, '[') || JsIsPunct(ji, '{'))
+				dep++;
+			else if (JsIsPunct(ji, ')') || JsIsPunct(ji, ']') || JsIsPunct(ji, '}'))
+				dep--;
+			ji->pos++;
+		}
+	}
 
 	return head;
 }
@@ -1461,6 +1503,7 @@ CJsNode *JsParsePostfix(CJsInterp *ji)
 	CJsNode *node = JsParsePrimary(ji), *wrap;
 	CJsTok	*t;
 	Bool	 going = TRUE;
+	I64		 dep;
 
 	while (node && going && !ji->has_err)
 	{
@@ -1496,9 +1539,21 @@ CJsNode *JsParsePostfix(CJsInterp *ji)
 		{
 			wrap = JsNode(ji, JN_INDEX);
 			wrap->a = node;
-			wrap->b = JsParseAssign(ji);
+			wrap->b = JsParseExpr(ji); // full expr: obj[a, b] comma is legal
 			if (!JsEatPunct(ji, ']'))
-				JsErr(ji, "expected ]");
+			{ // desync RECOVERY: balanced-skip to the closing ] so the whole
+			  // script survives (a hard parse error would kill the bundle).
+				dep = 1;
+				while (dep > 0 && JsTok(ji)->type != JT_EOF)
+				{
+					if (JsIsPunct(ji, '{') || JsIsPunct(ji, '[') || JsIsPunct(ji, '('))
+						dep++;
+					else if (JsIsPunct(ji, '}') || JsIsPunct(ji, ']') ||
+							 JsIsPunct(ji, ')'))
+						dep--;
+					ji->pos++;
+				}
+			}
 			node = wrap;
 		}
 		else if (JsEatPunct(ji, '('))
@@ -2502,7 +2557,7 @@ U0 JsTextContentSet(CJsInterp *ji, CZNode *node, U8 *s)
 CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 {
 	CJsVal *v;
-	CZNode *node;
+	CZNode *node, *snode, *scur;
 	U8	   *attr;
 	U8		buf[1024]; // stack frames stay small: this recurses via JsEval
 	I64		len;
@@ -2603,6 +2658,12 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				return JsNativeV(ji, JSN_DOC_WRITE);
 			if (!StrCompare(name, "getElementById"))
 				return JsNativeV(ji, JSN_DOC_GETBYID);
+			if (!StrCompare(name, "getElementsByTagName"))
+				return JsNativeV(ji, JSN_DOC_GETBYTAG);
+			if (!StrCompare(name, "getElementsByClassName"))
+				return JsNativeV(ji, JSN_DOC_GETBYCLASS);
+			if (!StrCompare(name, "getElementsByName"))
+				return JsNativeV(ji, JSN_DOC_GETBYNAME);
 			if (!StrCompare(name, "createElement"))
 				return JsNativeV(ji, JSN_DOC_CREATE_EL);
 			if (!StrCompare(name, "createTextNode"))
@@ -2721,6 +2782,26 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 				return JsNativeV(ji, JSN_QSEL);
 			if (!StrCompare(name, "querySelectorAll"))
 				return JsNativeV(ji, JSN_QSELALL);
+			if (!StrCompare(name, "getElementsByTagName"))
+				return JsNativeV(ji, JSN_DOC_GETBYTAG);
+			if (!StrCompare(name, "getElementsByClassName"))
+				return JsNativeV(ji, JSN_DOC_GETBYCLASS);
+			if (!StrCompare(name, "contains"))
+				return JsNativeV(ji, JSN_EL_CONTAINS);
+			if (!StrCompare(name, "matches"))
+				return JsNativeV(ji, JSN_EL_MATCHES);
+			if (!StrCompare(name, "closest"))
+				return JsNativeV(ji, JSN_EL_CLOSEST);
+			if (!StrCompare(name, "hasAttribute"))
+				return JsNativeV(ji, JSN_EL_HASATTR);
+			if (!StrCompare(name, "removeAttribute"))
+				return JsNativeV(ji, JSN_EL_RMATTR);
+			if (!StrCompare(name, "cloneNode"))
+				return JsNativeV(ji, JSN_EL_CLONE);
+			if (!StrCompare(name, "insertBefore"))
+				return JsNativeV(ji, JSN_EL_INSBEFORE);
+			if (!StrCompare(name, "getBoundingClientRect"))
+				return JsNativeV(ji, JSN_EL_RECT);
 			if (!StrCompare(name, "classList"))
 			{
 				v = JsValNew(ji, JV_OBJ);
@@ -2739,6 +2820,43 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 			{
 				if (node->first_child)
 					return JsElemV(ji, node->first_child);
+				return JsNullV(ji);
+			}
+			if (!StrCompare(name, "lastChild"))
+			{
+				if (node->last_child)
+					return JsElemV(ji, node->last_child);
+				return JsNullV(ji);
+			}
+			if (!StrCompare(name, "nextSibling") ||
+				!StrCompare(name, "nextElementSibling"))
+			{
+				snode = node->next;
+				if (!StrCompare(name, "nextElementSibling"))
+					while (snode && snode->type != ZH_ELEM)
+						snode = snode->next;
+				if (snode)
+					return JsElemV(ji, snode);
+				return JsNullV(ji);
+			}
+			if (!StrCompare(name, "previousSibling") ||
+				!StrCompare(name, "previousElementSibling"))
+			{ // no back-pointer in CZNode: scan the parent's child list. name !=
+			  // "previousElementSibling" means the text-inclusive variant.
+				snode = NULL;
+				if (node->parent)
+				{
+					scur = node->parent->first_child;
+					while (scur && scur != node)
+					{
+						if (StrCompare(name, "previousElementSibling") ||
+							scur->type == ZH_ELEM)
+							snode = scur;
+						scur = scur->next;
+					}
+				}
+				if (snode)
+					return JsElemV(ji, snode);
 				return JsNullV(ji);
 			}
 			if (!StrCompare(name, "children"))
@@ -2951,9 +3069,12 @@ CJsVal *JsEvalBin(CJsInterp *ji, I64 op, CJsVal *a, CJsVal *b)
 		{
 			sa = JsToStr(ji, a);
 			sb = JsToStr(ji, b);
-			cat = JsAlloc(ji, StrLen(sa) + StrLen(sb) + 1);
-			StrCopy(cat, sa);
-			CatPrint(cat, "%s", sb);
+			cmp	  = StrLen(sa);
+			depth = StrLen(sb);
+			// explicit copy into a margin-padded buffer (no CatPrint format pass)
+			cat = JsAlloc(ji, cmp + depth + 8);
+			MemCopy(cat, sa, cmp);
+			MemCopy(cat + cmp, sb, depth + 1); // sb including its NUL
 			return JsStrV(ji, cat);
 		}
 		return JsNumV(ji, JsToNum(a) + JsToNum(b));
@@ -3432,7 +3553,10 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 							argv[argc++] = sv;
 					}
 					else
-						argv[argc++] = JsEval(ji, child);
+					{ // local first - see the arg-eval note in the call path below
+						sv = JsEval(ji, child);
+						argv[argc++] = sv;
+					}
 					child = child->next;
 				}
 				return JsConstruct(ji, fn, argv, argc, JsCtorName(node->a->a));
@@ -3463,7 +3587,13 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 						argv[argc++] = sv;
 				}
 				else
-					argv[argc++] = JsEval(ji, child);
+				{ // eval into a local FIRST: `argv[argc++] = JsEval(...)` computes
+				  // the slot address before the call and a deep callee chain
+				  // clobbers it -> the store misses argv and stale stack junk
+				  // (old return addresses) is read back as the argument value.
+					sv = JsEval(ji, child);
+					argv[argc++] = sv;
+				}
 				child = child->next;
 			}
 			if (!fn || (fn->type != JV_FUNC && fn->type != JV_NATIVE))
@@ -4691,6 +4821,57 @@ U0 JsAbsUrl(U8 *base, U8 *src, U8 *out)
 	}
 }
 
+U0 JsElemCollect(CJsInterp *ji, CZNode *root, I64 mode, U8 *key, CJsVal *arr)
+{ // collect matching DESCENDANTS of root (never root itself) into arr. mode 0 =
+  // tag (key or "*"), 1 = class token, 2 = name attr. Backs
+  // getElementsByTagName/ClassName/Name (both are descendant-only per spec).
+	CZNode *child;
+	U8	   *a;
+	Bool	hit;
+
+	if (!root)
+		return;
+	child = root->first_child;
+	while (child)
+	{
+		if (child->type == ZH_ELEM && arr->count < 400)
+		{
+			hit = FALSE;
+			if (mode == 0)
+				hit = !StrCompare(key, "*") || !StrICompare(child->tag, key);
+			else if (mode == 1)
+				hit = JsClassHasTok(ZNodeAttr(child, "class"), key);
+			else
+			{
+				a	= ZNodeAttr(child, "name");
+				hit = a && !StrCompare(a, key);
+			}
+			if (hit)
+				JsArrPush(ji, arr, JsElemV(ji, child));
+		}
+		JsElemCollect(ji, child, mode, key, arr);
+		child = child->next;
+	}
+}
+
+Bool JsNodeContains(CZNode *root, CZNode *target)
+{ // TRUE if target is root or a descendant of root
+	CZNode *child;
+
+	if (!root || !target)
+		return FALSE;
+	if (root == target)
+		return TRUE;
+	child = root->first_child;
+	while (child)
+	{
+		if (JsNodeContains(child, target))
+			return TRUE;
+		child = child->next;
+	}
+	return FALSE;
+}
+
 CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 					 CJsVal **args, I64 argc)
 { // self = the native function value itself (carries promise binding in proto)
@@ -4754,6 +4935,77 @@ CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 			if (node)
 				return JsElemV(ji, node);
 			return JsNullV(ji);
+		case JSN_DOC_GETBYTAG:
+		case JSN_DOC_GETBYCLASS:
+		case JSN_DOC_GETBYNAME:
+			node = ji->dom_root;
+			if (this_val->type == JV_OBJ && this_val->node)
+				node = this_val->node; // element-scoped variant
+			v = JsArrV(ji);
+			s = JsToStr(ji, JsArgOr(ji, args, argc, 0));
+			if (id == JSN_DOC_GETBYTAG)
+				JsElemCollect(ji, node, 0, s, v);
+			else if (id == JSN_DOC_GETBYCLASS)
+				JsElemCollect(ji, node, 1, s, v);
+			else
+				JsElemCollect(ji, node, 2, s, v);
+			return v;
+		case JSN_EL_CONTAINS:
+			w = JsArgOr(ji, args, argc, 0);
+			if (this_val->type == JV_OBJ && w && w->type == JV_OBJ)
+				return JsBoolV(ji, JsNodeContains(this_val->node, w->node));
+			return JsBoolV(ji, FALSE);
+		case JSN_EL_MATCHES:
+			JsQSelSplit(JsToStr(ji, JsArgOr(ji, args, argc, 0)), qtag, qcls, qid);
+			if (this_val->type == JV_OBJ && this_val->node)
+				return JsBoolV(ji, JsQSelMatch(this_val->node, qtag, qcls, qid));
+			return JsBoolV(ji, FALSE);
+		case JSN_EL_CLOSEST:
+			JsQSelSplit(JsToStr(ji, JsArgOr(ji, args, argc, 0)), qtag, qcls, qid);
+			node = NULL;
+			if (this_val->type == JV_OBJ)
+				node = this_val->node;
+			while (node)
+			{
+				if (JsQSelMatch(node, qtag, qcls, qid))
+					return JsElemV(ji, node);
+				node = node->parent;
+			}
+			return JsNullV(ji);
+		case JSN_EL_HASATTR:
+			if (this_val->type == JV_OBJ && this_val->node)
+				return JsBoolV(ji, ZNodeAttr(this_val->node,
+							   JsToStr(ji, JsArgOr(ji, args, argc, 0))) != NULL);
+			return JsBoolV(ji, FALSE);
+		case JSN_EL_RMATTR:
+			if (this_val->type == JV_OBJ && this_val->node)
+			{ // no true attr removal helper: blank it (visually equivalent here)
+				ZNodeAttrSet(this_val->node,
+							 JsToStr(ji, JsArgOr(ji, args, argc, 0)), "");
+				ji->dom_dirty = TRUE;
+			}
+			return JsUndefV(ji);
+		case JSN_EL_CLONE:
+			if (this_val->type == JV_OBJ && this_val->node)
+				return JsElemV(ji, this_val->node); // shallow alias (no deep copy)
+			return JsNullV(ji);
+		case JSN_EL_INSBEFORE: // approximate: append (ref-node ordering not honored)
+			w = JsArgOr(ji, args, argc, 0);
+			if (this_val->type == JV_OBJ && this_val->node &&
+				w && w->type == JV_OBJ && w->node)
+				JsNodeAppend(ji, this_val->node, w->node);
+			return w;
+		case JSN_EL_RECT: // no layout coords in the JS layer: a zeroed DOMRect
+			v = JsValNew(ji, JV_OBJ);
+			JsPropSet(ji, v, "x", JsNumV(ji, 0));
+			JsPropSet(ji, v, "y", JsNumV(ji, 0));
+			JsPropSet(ji, v, "top", JsNumV(ji, 0));
+			JsPropSet(ji, v, "left", JsNumV(ji, 0));
+			JsPropSet(ji, v, "right", JsNumV(ji, 0));
+			JsPropSet(ji, v, "bottom", JsNumV(ji, 0));
+			JsPropSet(ji, v, "width", JsNumV(ji, 0));
+			JsPropSet(ji, v, "height", JsNumV(ji, 0));
+			return v;
 		case JSN_LOC_ASSIGN: // location.assign(url) / location.replace(url)
 			ji->navigate = JsStrDup(ji, JsToStr(ji, JsArgOr(ji, args, argc, 0)));
 			return JsUndefV(ji);
@@ -5354,6 +5606,146 @@ CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 				}
 			}
 			return v;
+		case JSN_OBJ_VALUES:
+			v = JsArrV(ji);
+			w = JsArgOr(ji, args, argc, 0);
+			if (w->type == JV_OBJ)
+			{
+				prp = w->props;
+				while (prp)
+				{
+					JsArrPush(ji, v, prp->val(CJsVal *));
+					prp = prp->next;
+				}
+			}
+			return v;
+		case JSN_OBJ_ENTRIES:
+			v = JsArrV(ji);
+			w = JsArgOr(ji, args, argc, 0);
+			if (w->type == JV_OBJ)
+			{
+				prp = w->props;
+				while (prp)
+				{ // each entry is a [key, value] pair array
+					pr = JsArrV(ji);
+					JsArrPush(ji, pr, JsStrV(ji, prp->name));
+					JsArrPush(ji, pr, prp->val(CJsVal *));
+					JsArrPush(ji, v, pr);
+					prp = prp->next;
+				}
+			}
+			return v;
+		case JSN_OBJ_FROMENTRIES:
+			v = JsValNew(ji, JV_OBJ);
+			w = JsArgOr(ji, args, argc, 0);
+			if (w->type == JV_ARR)
+			{
+				for (a = 0; a < w->count; a++)
+				{
+					pr = w->items[a];
+					if (pr && pr->type == JV_ARR && pr->count >= 2)
+						JsPropSet(ji, v, JsToStr(ji, pr->items[0]), pr->items[1]);
+				}
+			}
+			return v;
+		case JSN_OBJ_DEFINEPROP:
+			v = JsArgOr(ji, args, argc, 0); // target
+			w = JsArgOr(ji, args, argc, 2); // descriptor
+			if (v->type == JV_OBJ && w->type == JV_OBJ)
+			{
+				s	= JsToStr(ji, JsArgOr(ji, args, argc, 1)); // key
+				pr	= JsPropGet(w, "value");
+				if (!pr)
+				{ // accessor descriptor: run the getter once, store its result
+					rej = JsPropGet(w, "get");
+					if (rej && (rej->type == JV_FUNC || rej->type == JV_NATIVE))
+						pr = JsCall(ji, rej, v, NULL, 0);
+				}
+				if (!pr)
+					pr = JsUndefV(ji);
+				JsPropSet(ji, v, s, pr);
+			}
+			return v;
+		case JSN_OBJ_DEFINEPROPS:
+			v = JsArgOr(ji, args, argc, 0);
+			w = JsArgOr(ji, args, argc, 1); // { key: descriptor, ... }
+			if (v->type == JV_OBJ && w->type == JV_OBJ)
+			{
+				prp = w->props;
+				while (prp)
+				{
+					pr = prp->val(CJsVal *);
+					if (pr && pr->type == JV_OBJ)
+					{
+						resv = JsPropGet(pr, "value");
+						if (!resv)
+						{
+							rej = JsPropGet(pr, "get");
+							if (rej && (rej->type == JV_FUNC || rej->type == JV_NATIVE))
+								resv = JsCall(ji, rej, v, NULL, 0);
+						}
+						if (resv)
+							JsPropSet(ji, v, prp->name, resv);
+					}
+					prp = prp->next;
+				}
+			}
+			return v;
+		case JSN_OBJ_CREATE:
+			v = JsValNew(ji, JV_OBJ);
+			w = JsArgOr(ji, args, argc, 0);
+			if (w->type == JV_OBJ)
+				v->proto = w; // null proto (Object.create(null)) leaves it NULL
+			w = JsArgOr(ji, args, argc, 1);
+			if (w->type == JV_OBJ)
+			{
+				prp = w->props;
+				while (prp)
+				{
+					pr = prp->val(CJsVal *);
+					if (pr && pr->type == JV_OBJ)
+					{
+						resv = JsPropGet(pr, "value");
+						if (resv)
+							JsPropSet(ji, v, prp->name, resv);
+					}
+					prp = prp->next;
+				}
+			}
+			return v;
+		case JSN_OBJ_GETPROTO:
+			w = JsArgOr(ji, args, argc, 0);
+			if (w->type == JV_OBJ && w->proto)
+				return w->proto;
+			return JsNullV(ji);
+		case JSN_OBJ_SETPROTO:
+			v = JsArgOr(ji, args, argc, 0);
+			w = JsArgOr(ji, args, argc, 1);
+			if (v->type == JV_OBJ)
+			{
+				if (w->type == JV_OBJ)
+					v->proto = w;
+				else
+					v->proto = NULL;
+			}
+			return v;
+		case JSN_OBJ_GETDESC:
+			w	 = JsArgOr(ji, args, argc, 0);
+			resv = NULL;
+			if (w->type == JV_OBJ)
+				resv = JsPropGet(w, JsToStr(ji, JsArgOr(ji, args, argc, 1)));
+			if (!resv)
+				return JsUndefV(ji);
+			v = JsValNew(ji, JV_OBJ);
+			JsPropSet(ji, v, "value", resv);
+			JsPropSet(ji, v, "writable", JsBoolV(ji, TRUE));
+			JsPropSet(ji, v, "enumerable", JsBoolV(ji, TRUE));
+			JsPropSet(ji, v, "configurable", JsBoolV(ji, TRUE));
+			return v;
+		case JSN_OBJ_FREEZE:
+			return JsArgOr(ji, args, argc, 0); // no enforcement; return the object
+		case JSN_OBJ_ISFROZEN:
+			return JsBoolV(ji, FALSE); // we never freeze, so all three report false
 		case JSN_ARR_ISARR:
 			return JsBoolV(ji, JsArgOr(ji, args, argc, 0)->type == JV_ARR);
 		case JSN_MATH_FLOOR:
@@ -6023,6 +6415,22 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	math = JsValNew(ji, JV_OBJ); // Object namespace
 	JsPropSet(ji, math, "keys",   JsNativeV(ji, JSN_OBJ_KEYS));
 	JsPropSet(ji, math, "assign", JsNativeV(ji, JSN_OBJ_ASSIGN));
+	JsPropSet(ji, math, "values",  JsNativeV(ji, JSN_OBJ_VALUES));
+	JsPropSet(ji, math, "entries", JsNativeV(ji, JSN_OBJ_ENTRIES));
+	JsPropSet(ji, math, "fromEntries", JsNativeV(ji, JSN_OBJ_FROMENTRIES));
+	JsPropSet(ji, math, "defineProperty",   JsNativeV(ji, JSN_OBJ_DEFINEPROP));
+	JsPropSet(ji, math, "defineProperties", JsNativeV(ji, JSN_OBJ_DEFINEPROPS));
+	JsPropSet(ji, math, "create",  JsNativeV(ji, JSN_OBJ_CREATE));
+	JsPropSet(ji, math, "getPrototypeOf", JsNativeV(ji, JSN_OBJ_GETPROTO));
+	JsPropSet(ji, math, "setPrototypeOf", JsNativeV(ji, JSN_OBJ_SETPROTO));
+	JsPropSet(ji, math, "getOwnPropertyDescriptor", JsNativeV(ji, JSN_OBJ_GETDESC));
+	JsPropSet(ji, math, "getOwnPropertyNames", JsNativeV(ji, JSN_OBJ_KEYS));
+	JsPropSet(ji, math, "freeze",  JsNativeV(ji, JSN_OBJ_FREEZE));
+	JsPropSet(ji, math, "seal",	   JsNativeV(ji, JSN_OBJ_FREEZE));
+	JsPropSet(ji, math, "preventExtensions", JsNativeV(ji, JSN_OBJ_FREEZE));
+	JsPropSet(ji, math, "isFrozen",		 JsNativeV(ji, JSN_OBJ_ISFROZEN));
+	JsPropSet(ji, math, "isSealed",		 JsNativeV(ji, JSN_OBJ_ISFROZEN));
+	JsPropSet(ji, math, "isExtensible",	 JsNativeV(ji, JSN_OBJ_ISFROZEN));
 	JsEnvDeclare(ji, ji->genv, "Object", math);
 
 	math = JsValNew(ji, JV_OBJ); // Array namespace
