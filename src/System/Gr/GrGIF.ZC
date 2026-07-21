@@ -128,7 +128,7 @@ public CDC *GIFReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
 	CDC	*dc = NULL;
 	I64	 w, h, packed, gct_flag, gct_sz, c, label, len, lzw_len, npix, i, x, y, py;
 	I64	 left, top, iw, ih, ipacked, lct_flag, interlace, lct_sz, min_cs, srcrow;
-	I64	 trans_flag = 0, trans_idx = -1;
+	I64	 trans_flag = 0, trans_idx = -1, act_n = 0;
 	U32	*row;
 
 	if (size < 13 || buf[0] != 'G' || buf[1] != 'I' || buf[2] != 'F')
@@ -180,15 +180,17 @@ public CDC *GIFReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
 			interlace = ipacked >> 6 & 1;
 			lct_sz	  = 2 << (ipacked & 7);
 			act = gct;
+			act_n = gct_sz;
 			if (lct_flag)
 			{
 				act = p;
+				act_n = lct_sz;
 				p	+= lct_sz * 3;
 			}
 			if (!act || iw < 1 || ih < 1 || iw > GIF_MAXDIM || ih > GIF_MAXDIM)
 				return NULL;
 			min_cs = *p++;
-			if (min_cs < 1 || min_cs > 11)
+			if (min_cs < 1 || min_cs > 8)	// spec max 8: indices must fit a byte
 				return NULL;
 
 			// concatenate the LZW data sub-blocks into one buffer
@@ -227,8 +229,8 @@ public CDC *GIFReadBuf(U8 *buf, I64 size, CTask *mem_task=NULL)
 						if (left + x < w)
 						{
 							i = idx[srcrow + x];
-							if (!(trans_flag && i == trans_idx))
-							{
+							if (!(trans_flag && i == trans_idx) && i < act_n)
+							{//i >= palette size (corrupt stream): leave transparent
 								pal			 = act + i * 3;
 								row[left + x] = pal[0] << 16 | pal[1] << 8 | pal[2];
 							}

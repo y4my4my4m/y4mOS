@@ -371,6 +371,10 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	GxRunFlush;
 	if (gx.x > GX_MARGIN + gx.indent)
 		GxNewline(0);
+	if ((author->clear_side & 1) && gx.y < GxFloatBottom(0))
+		gx.y = GxFloatBottom(0);	// clear:left / both
+	if ((author->clear_side & 2) && gx.y < GxFloatBottom(1))
+		gx.y = GxFloatBottom(1);	// clear:right / both
 
 	MemCopy(&kid, style, sizeof(CZStyle));
 	ZStyleStripBox(&kid);
@@ -633,6 +637,144 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 
 /* ---- dispatch ---- */
 
+U0 L2Float(CZNode *node, CZStyle *style, CZStyle *author)
+{//Place a float:left/right element out of flow at the left/right edge of the
+//current line box; following flow content then wraps beside it via the float
+//insets that GxNewline/GxWord apply. Width = explicit or shrink-to-fit (capped).
+	CZStyle	 kid;
+	CZNode	*child;
+	CGxOp	*op;
+	I64		 fw, fx, avail, mw, mh, lx, rx, ftop, fbot, box_op;
+	I64		 save_x, save_y, save_ind, save_wrap;
+
+	GxRunFlush;
+	GxFloatRecompute(gx.y);
+	lx = GX_MARGIN + gx.indent;
+	if (gx_float_lx > lx)
+		lx = gx_float_lx;
+	rx = gx.wrap_w;
+	if (gx_float_rx < rx)
+		rx = gx_float_rx;
+	avail = rx - lx;
+	if (avail < 40)
+		avail = 40;
+
+	fw = 0;
+	if (author->width > 0)
+		fw = author->width;
+	else if (author->width < 0)
+		fw = avail * -author->width / 100;
+	else
+	{ // shrink-to-fit: measure the content, cap to the free width
+		L2Measure(node, style, avail, &mw, &mh);
+		fw = mw + 8;
+	}
+	if (fw > avail)
+		fw = avail;
+	if (fw < 24)
+		fw = 24;
+
+	if (author->float_side == 2)
+		fx = rx - fw;
+	else
+		fx = lx;
+
+	save_x	  = gx.x;
+	save_y	  = gx.y;
+	save_ind  = gx.indent;
+	save_wrap = gx.wrap_w;
+	ftop = gx.y;
+
+	gx.indent = fx - GX_MARGIN;
+	gx.wrap_w = fx + fw;
+	gx.x	  = fx;
+
+	box_op = -1;
+	if (author->bg >= 0 || author->border >= 0 || author->grad >= 0 ||
+		author->bg_img >= 0)
+	{
+		op = GxOpAdd(GXO_BOX, fx - 2, gx.y - 2, fw + 2, 8);
+		if (op)
+		{
+			box_op = gx.op_count - 1;
+			op->has_bg = author->bg >= 0;
+			op->fg = GxPenBg(author->bg, de_theme.win_bg);
+			op->ul = author->border >= 0;
+			op->bg = GxPenBg(author->border, de_theme.panel_edge);
+			op->grad = author->grad;
+			if (author->bg_img >= 0 && author->bg_img < zcss_bgimg_count)
+			{
+				op->img_url = ZincResolveLink(zcss_bgimg[author->bg_img]);
+				op->bg_px  = author->bg_px;
+				op->bg_py  = author->bg_py;
+				op->bg_sw  = author->bg_sw;
+				op->bg_sh  = author->bg_sh;
+				op->bg_rep = author->bg_repeat;
+			}
+		}
+	}
+
+	if (L2Delegated(node->tag))
+		GxNode(node, style);			// v1 lays img/svg/widgets within the box
+	else
+	{
+		MemCopy(&kid, style, sizeof(CZStyle));
+		ZStyleStripBox(&kid);
+		child = node->first_child;
+		while (child)
+		{
+			L2Node(child, &kid);
+			child = child->next;
+		}
+	}
+	GxRunFlush;
+	if (gx.x > GX_MARGIN + gx.indent)
+		GxNewline(0);
+	fbot = gx.y;
+	if (author->height > 0 && fbot < ftop + author->height)
+		fbot = ftop + author->height;
+	if (fbot <= ftop)
+		fbot = ftop + FONT_HEIGHT;
+	if (box_op >= 0)
+		gx.ops[box_op].h = MaxI64(8, fbot - gx.ops[box_op].y);
+
+	GxFloatAdd(author->float_side - 1, fx - 2, fx + fw, ftop, fbot);
+
+	// restore flow: content continues beside the float at the same y
+	gx.indent = save_ind;
+	gx.wrap_w = save_wrap;
+	gx.y	  = save_y;
+	gx.x	  = save_x;
+	GxFloatRecompute(gx.y);
+	if (gx.x <= GX_MARGIN + gx.indent && gx_float_lx > gx.x)
+		gx.x = gx_float_lx;
+}
+
+U0 L2SpriteInline(CZNode *node, CZStyle *author)
+{//Place a fixed-size CSS-background sprite (e.g. a country flag) INLINE, like a
+//replaced inline-block image: flush the run, wrap if it won't fit, emit a
+//GXO_BOX with the sprite params at the pen, then advance the pen. Lets multiple
+//sprites sit in a row instead of each on its own line. (v1's inline path can't
+//render CSS background images, so v2 does the placement.)
+	CGxOp *op;
+	I64	   w = author->width, h = author->height;
+
+	GxRunFlush;
+	if (gx.x + w > gx.wrap_w && gx.x > GX_MARGIN + gx.indent)
+		GxNewline(0);
+	op = GxOpAdd(GXO_BOX, gx.x, gx.y, w, h);
+	if (op && author->bg_img >= 0 && author->bg_img < zcss_bgimg_count)
+	{
+		op->img_url = ZincResolveLink(zcss_bgimg[author->bg_img]);
+		op->bg_px  = author->bg_px;
+		op->bg_py  = author->bg_py;
+		op->bg_sw  = author->bg_sw;
+		op->bg_sh  = author->bg_sh;
+		op->bg_rep = author->bg_repeat;
+	}
+	gx.x += w + 2;
+}
+
 U0 L2Node(CZNode *node, CZStyle *inh)
 {
 	CZStyle style, author;
@@ -652,6 +794,25 @@ U0 L2Node(CZNode *node, CZStyle *inh)
 	ZCssApply(node, &author);
 	if (author.display == ZCSS_DISP_NONE)
 		return;
+
+	if (author.bg_img >= 0 && author.width > 0 && author.width <= 64 &&
+		author.height > 0 && author.height <= 64 && !node->first_child)
+	{//Fixed-size background sprite / icon (flags): flow it inline, in a row.
+		L2SpriteInline(node, &author);
+		return;
+	}
+
+	if (zinc_floats && l2_meas_depth == 0 &&
+		(author.float_side == 1 || author.float_side == 2))
+	{//float:left/right: out of flow at the edge, following content wraps beside.
+	//NEVER during measure: L2Float's shrink-to-fit runs L2Measure -> L2Node on
+	//the SAME node, which would re-enter L2Float (recursion) and record phantom
+	//float regions (GxFloatAdd is not rolled back by the measure sandbox).
+		ZStyleMerge(&style, &author);
+		style.display = -1;
+		L2Float(node, &style, &author);
+		return;
+	}
 
 	if (!L2Handles(node, &author))
 	{ // v1 engine lays this subtree (inline runs, lists, tables, widgets...)

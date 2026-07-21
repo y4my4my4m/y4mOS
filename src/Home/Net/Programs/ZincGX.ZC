@@ -457,21 +457,119 @@ U0 GxRunFlush()
 	gx.run_len = 0;
 }
 
+// ---- CSS floats ----
+// Active float regions. Content reflows around them: GxNewline/GxWord narrow the
+// line to [line-left..line-right] using gx_float_lx/rx, recomputed per line from
+// the floats overlapping the current y. When gx_float_n==0 the insets stay at
+// their neutral values, so non-float pages lay out exactly as before.
+#define GX_FLOATS	16
+
+class CGxFloatRgn
+{
+	I64	side;		// 0 left, 1 right
+	I64	x0, x1;		// absolute x span
+	I64	top, bot;	// absolute y span
+};
+
+CGxFloatRgn	gx_floats[GX_FLOATS];
+I64			gx_float_n	= 0;
+I64			gx_float_lx	= 0;			// active left-float right edge (0 = none)
+I64			gx_float_rx	= 0x40000000;	// active right-float left edge (huge = none)
+
+U0 GxFloatReset()
+{ // called at the start of each layout
+	gx_float_n	= 0;
+	gx_float_lx	= 0;
+	gx_float_rx	= 0x40000000;
+}
+
+U0 GxFloatRecompute(I64 y)
+{ // set the left/right float insets for content at vertical position y
+	I64 i, lx = 0, rx = 0x40000000;
+
+	for (i = 0; i < gx_float_n; i++)
+		if (gx_floats[i].top <= y < gx_floats[i].bot)
+		{
+			if (gx_floats[i].side == 0)
+			{
+				if (gx_floats[i].x1 > lx)
+					lx = gx_floats[i].x1;
+			}
+			else if (gx_floats[i].x0 < rx)
+				rx = gx_floats[i].x0;
+		}
+	gx_float_lx = lx;
+	gx_float_rx = rx;
+}
+
+U0 GxFloatAdd(I64 side, I64 x0, I64 x1, I64 top, I64 bot)
+{
+	if (gx_float_n < GX_FLOATS)
+	{
+		gx_floats[gx_float_n].side = side;
+		gx_floats[gx_float_n].x0	 = x0;
+		gx_floats[gx_float_n].x1	 = x1;
+		gx_floats[gx_float_n].top	 = top;
+		gx_floats[gx_float_n].bot	 = bot;
+		gx_float_n++;
+	}
+}
+
+I64 GxFloatBottom(I64 side)
+{ // lowest bottom among active floats of a side (side < 0 = any). For clear.
+	I64 i, b = 0;
+
+	for (i = 0; i < gx_float_n; i++)
+		if (side < 0 || gx_floats[i].side == side)
+			if (gx_floats[i].bot > b)
+				b = gx_floats[i].bot;
+
+	return b;
+}
+
+public Bool zinc_floats  = TRUE; //Floats(FALSE) disables CSS float layout (bisect tool).
+public Bool zinc_shadows = TRUE; //Shadows(FALSE) disables box-shadow rendering.
+
+public U0 Floats(Bool on)
+{//Runtime toggle for CSS float layout. Reload the page to re-lay.
+	zinc_floats = on;
+}
+
+public U0 Shadows(Bool on)
+{//Runtime toggle for box-shadow rendering. Takes effect next frame.
+	zinc_shadows = on;
+}
+
 U0 GxNewline(I64 extra)
 {
 	GxRunFlush;
 	GxLineAlign;
-	gx.x = GX_MARGIN + gx.indent;
 	gx.y += gx.line_h + extra;
 	gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+	gx.x = GX_MARGIN + gx.indent;
+	if (gx_float_n)
+	{ // wrap the new line past any left float that spans this y
+		GxFloatRecompute(gx.y);
+		if (gx_float_lx > gx.x)
+			gx.x = gx_float_lx;
+	}
 }
 
 U0 GxWord(U8 *word, I64 len, CZStyle *style, I64 scale)
 {//Place one word, wrapping as needed, merging into the current run.
-	I64 cw, need, px = 0, i, glyph_h, lh;
+	I64 cw, need, px = 0, i, glyph_h, lh, rw, lstart;
 
 	if (len <= 0)
 		return;
+	lstart = GX_MARGIN + gx.indent;
+	rw	   = gx.wrap_w;
+	if (gx_float_n)
+	{ // narrow the line to the space left/right of active floats
+		if (gx_float_lx > lstart)
+			lstart = gx_float_lx;
+		if (gx_float_rx < rw)
+			rw = gx_float_rx;
+	}
 	if (zinc_ttf)
 	{//advance widths from the chosen font's own metrics (mono vs proportional)
 		CGrFont *wf = GrFontPick(style->mono == 1);
@@ -487,7 +585,7 @@ U0 GxWord(U8 *word, I64 len, CZStyle *style, I64 scale)
 		need = len * cw;
 	}
 	//First content on a fresh line decides that line's text-align.
-	if (gx.x <= GX_MARGIN + gx.indent && style->align > 0)
+	if (gx.x <= lstart && style->align > 0)
 		gx.line_align = style->align;
 	//Style/link/scale change or wrap breaks the run.
 	if (gx.run_len &&
@@ -495,7 +593,7 @@ U0 GxWord(U8 *word, I64 len, CZStyle *style, I64 scale)
 		 MemCompare(&gx.run_style, style, sizeof(CZStyle))))
 		GxRunFlush;
 
-	if (gx.x + need > gx.wrap_w && gx.x > GX_MARGIN + gx.indent)
+	if (gx.x + need > rw && gx.x > lstart)
 	{
 		GxRunFlush;
 		GxNewline(0);
@@ -1861,6 +1959,7 @@ U0 GxLayout()
 
 	gx.busy = TRUE;
 	GxOpsReset;
+	GxFloatReset;
 	GxPageStyle;
 	gx.wrap_w = Fs->pix_width - GX_SBAR_W - GX_MARGIN;
 	gx.last_w = Fs->pix_width;
@@ -2076,7 +2175,7 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 				GrRect(dc, op->x, oy, op->w, op->h);
 				break;
 			case GXO_BOX:
-				if (op->sh_col >= 0)
+				if (zinc_shadows && op->sh_col >= 0)
 				{//box-shadow: one offset rect behind the box (cheap, drawn per frame
 				//so NO per-pixel blur loop - a soft blur would be a pre-rendered DC).
 					dc->color = ColorRGB(op->sh_col >> 16 & 0xFF,
