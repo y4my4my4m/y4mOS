@@ -441,6 +441,10 @@ extern U0 JsStyleIngest(CJsInterp *ji, CZNode *node);
 
 /* ---- arena ---- */
 
+// Soft parse-error budget: unrecognized primaries are skipped, not fatal.
+// First few are logged per script (reset in JsRun) so gaps stay visible.
+I64 js_soft_errs = 0;
+
 U8 *JsAlloc(CJsInterp *ji, I64 size)
 {
 	CJsAllocHdr *h = CAlloc(size + sizeof(CJsAllocHdr));
@@ -1492,7 +1496,11 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 	for (emk = 0; embuf[emk]; emk++)
 		if (embuf[emk] == 0x24)
 			embuf[emk] = '?'; // dollars are live DolDoc commands in the log
-	JsErr(ji, embuf);
+	// SOFT error: skip the token and keep parsing. One unrecognized construct
+	// must not kill a 400KB bundle - the damage stays local to this expression
+	// (callers treat the NULL as an empty node; JsRun's anti-stall advances).
+	if (++js_soft_errs <= 8)
+		NetLog("JS: skip %s", embuf);
 	ji->pos++;
 
 	return NULL;
@@ -6482,6 +6490,7 @@ Bool JsRun(CJsInterp *ji, U8 *src)
 	ji->depth	= 0;
 	ji->flow	= JF_NORMAL;
 	ji->env		= ji->genv;
+	js_soft_errs = 0; // fresh soft-error log budget per script
 
 	if (!JsLex(ji, src))
 	{
