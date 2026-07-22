@@ -223,6 +223,83 @@
 #define JSN_OBJ_GETDESC		186	// Object.getOwnPropertyDescriptor(o, k)
 #define JSN_OBJ_FROMENTRIES	187	// Object.fromEntries(iterable)
 #define JSN_OBJ_ISFROZEN	188	// Object.isFrozen / isSealed / isExtensible
+#define JSN_IMAGE_CTOR		189	// new Image() - tracking pixels / preloaders
+#define JSN_NOOP_FALSE		190	// generic no-op -> false
+#define JSN_UAD_ENTROPY		191	// navigator.userAgentData.getHighEntropyValues()
+#define JSN_CRYPTO_RANDVALS	192	// crypto.getRandomValues(typedArrayLike)
+#define JSN_CRYPTO_UUID		193	// crypto.randomUUID()
+#define JSN_STRUCT_CLONE	194	// structuredClone(v)
+#define JSN_USP_CTOR		195	// new URLSearchParams(str)
+#define JSN_USP_GET			196	// .get(k)
+#define JSN_USP_SET			197	// .set / .append
+#define JSN_USP_HAS			198	// .has(k)
+#define JSN_USP_TOSTR		199	// .toString()
+#define JSN_STR_MATCH		200	// str.match(re)
+#define JSN_STR_SEARCH		201	// str.search(re)
+#define JSN_STR_MATCHALL	202	// str.matchAll(re)
+#define JSN_REFLECT_GET		203	// Reflect.get(o,k)
+#define JSN_REFLECT_SET		204	// Reflect.set(o,k,v)
+#define JSN_REFLECT_HAS		205	// Reflect.has(o,k)
+#define JSN_REFLECT_DELETE	206	// Reflect.deleteProperty(o,k)
+#define JSN_REFLECT_APPLY	207	// Reflect.apply(fn,this,args)
+#define JSN_REFLECT_CONSTRUCT 208 // Reflect.construct(fn,args)
+#define JSN_TEXTENC_CTOR	209	// new TextEncoder()
+#define JSN_TEXTENC_ENCODE	210	// .encode(str) -> byte array (UTF-8)
+#define JSN_TEXTDEC_CTOR	211	// new TextDecoder()
+#define JSN_TEXTDEC_DECODE	212	// .decode(bytes) -> string
+// --- extra Array.prototype methods ---
+#define JSN_ARR_SOME		213	// .some(fn)
+#define JSN_ARR_EVERY		214	// .every(fn)
+#define JSN_ARR_FINDINDEX	215	// .findIndex(fn)
+#define JSN_ARR_FILL		216	// .fill(v,start,end)
+#define JSN_ARR_AT			217	// .at(i) (negative from end)
+#define JSN_ARR_SPLICE		218	// .splice(start,delCount,...items)
+#define JSN_ARR_UNSHIFT		219	// .unshift(...items)
+#define JSN_ARR_FLAT		220	// .flat(depth)
+#define JSN_ARR_FLATMAP		221	// .flatMap(fn)
+#define JSN_ARR_LASTINDEXOF	222	// .lastIndexOf(v)
+#define JSN_ARR_FINDLAST	223	// .findLast(fn)
+// --- typed arrays / ArrayBuffer / DataView ---
+#define JSN_ARRAYBUFFER_CTOR 224	// new ArrayBuffer(len)
+#define JSN_U8ARR_CTOR		225	// new Uint8Array(...)
+#define JSN_I8ARR_CTOR		226	// new Int8Array(...)
+#define JSN_U8C_CTOR		227	// new Uint8ClampedArray(...)
+#define JSN_U16ARR_CTOR		228	// new Uint16Array(...)
+#define JSN_I16ARR_CTOR		229	// new Int16Array(...)
+#define JSN_U32ARR_CTOR		230	// new Uint32Array(...)
+#define JSN_I32ARR_CTOR		231	// new Int32Array(...)
+#define JSN_F32ARR_CTOR		232	// new Float32Array(...)
+#define JSN_F64ARR_CTOR		233	// new Float64Array(...)
+#define JSN_TA_SET			234	// typedArr.set(src,offset)
+#define JSN_TA_SUBARRAY		235	// typedArr.subarray(a,b) (alias slice)
+#define JSN_DATAVIEW_CTOR	236	// new DataView(buffer)
+#define JSN_DV_GETU8		237	// getUint8/getInt8
+#define JSN_DV_SETU8		238	// setUint8/setInt8
+#define JSN_DV_GETU16		239	// getUint16/getInt16
+#define JSN_DV_SETU16		240	// setUint16/setInt16
+#define JSN_DV_GETU32		241	// getUint32/getInt32
+#define JSN_DV_SETU32		242	// setUint32/setInt32
+#define JSN_DV_GETF32		243	// getFloat32/getFloat64 (approx)
+#define JSN_DV_SETF32		244	// setFloat32/setFloat64
+// --- crypto.subtle ---
+#define JSN_SUBTLE_DIGEST	245	// crypto.subtle.digest(alg, data) -> Promise<ArrayBuffer>
+// --- Proxy ---
+#define JSN_PROXY_CTOR		246	// new Proxy(target, handler)
+// --- fetch primitives: FormData / Blob / Headers / Request / Response ---
+#define JSN_FORMDATA_CTOR	247	// new FormData()
+#define JSN_FD_APPEND		248	// .append / .set
+#define JSN_FD_GET			249	// .get / .has (has -> bool via truthiness)
+#define JSN_BLOB_CTOR		250	// new Blob(parts, opts)
+#define JSN_BLOB_TEXT		251	// blob.text() -> Promise<string>
+#define JSN_BLOB_ARRBUF		252	// blob.arrayBuffer() -> Promise<ArrayBuffer>
+#define JSN_HEADERS_CTOR	253	// new Headers(init)
+#define JSN_HDR_GET			254	// headers.get(name)
+#define JSN_HDR_SET			255	// headers.set/append(name,val)
+// 256-289 are reserved for JP_* punct codes; keep JSN ids clear of that range.
+#define JSN_HDR_HAS			290	// headers.has(name)
+#define JSN_REQUEST_CTOR	291	// new Request(url, opts)
+#define JSN_RESPONSE_CTOR	292	// new Response(body, opts)
+// NOTE: JSN_RESP_JSON (79) / JSN_RESP_TEXT (78) already defined above; reused here.
 
 /* token types */
 #define JT_EOF		0
@@ -1230,6 +1307,14 @@ CJsNode *JsParseClass(CJsInterp *ji)
 	return node;
 }
 
+// Readable names for multi-char puncts JP_EQ2(256)..JP_INSTOF(289), for logs.
+U8 *jp_desc[34] = {
+	"==", "!=", "===", "!==", "<=", ">=", "&&", "||", "++", "--",
+	"+=", "-=", "*=", "/=", "%=", "=>", "...", "?.", "??", "<<",
+	">>", ">>>", "**", "&&=", "||=", "??=", "&=", "|=", "^=", "<<=",
+	">>=", "**=", "in", "instanceof"
+};
+
 U0 JsTokDesc(CJsInterp *ji, I64 idx, U8 *out)
 { // short printable form of one token, for parse diagnostics. out >= 16 bytes.
 	CJsTok *t;
@@ -1253,6 +1338,8 @@ U0 JsTokDesc(CJsInterp *ji, I64 idx, U8 *out)
 		StrPrint(out, "/re/");
 	else if (t->punct < 256)
 		StrPrint(out, "%c", t->punct);
+	else if (t->punct >= JP_EQ2 && t->punct <= JP_INSTOF)
+		StrCopy(out, jp_desc[t->punct - JP_EQ2]); // readable multi-char op
 	else
 		StrPrint(out, "#%d", t->punct);
 }
@@ -2599,6 +2686,397 @@ U0 JsTextContentSet(CJsInterp *ji, CZNode *node, U8 *s)
 	ji->dom_dirty = TRUE;
 }
 
+/* ---- regex engine: compact backtracking matcher ---- */
+// Supports: literals, . [set] [^set] ranges, \d\w\s\D\W\S + escaped literals,
+// anchors (start caret, end via 0x24), groups ( ) (grouping only), alternation,
+// quantifiers * + ? {n} {n,} {n,m}, case-insensitive. Whole-match only.
+#define JS_RE_MAXREP	200
+#define JS_RE_MAXCAP	16
+I64 js_re_icase = 0;
+U8 *js_re_pat0	= NULL;				// pattern start, for group numbering
+I64 js_re_ncap	= 0;				// highest capturing group index recorded
+U8 *js_re_cs[JS_RE_MAXCAP];			// capture start pointers (into subject)
+U8 *js_re_ce[JS_RE_MAXCAP];			// capture end pointers
+
+I64 JsReGroupIdx(U8 *gp)
+{ // 1-based capture index of the group opening at gp: count '(' from js_re_pat0
+  // up to and including gp, skipping escapes and char classes. (?:...) not special.
+	U8	*q = js_re_pat0;
+	I64	 n = 0;
+	if (!q)
+		return 0;
+	while (q <= gp && *q)
+	{
+		if (*q == '\\')
+			q += 2;
+		else if (*q == '[')
+		{
+			q++;
+			while (*q && *q != ']')
+			{
+				if (*q == '\\')
+					q++;
+				q++;
+			}
+			if (*q)
+				q++;
+		}
+		else
+		{
+			if (*q == '(')
+				n++;
+			q++;
+		}
+	}
+	return n;
+}
+
+Bool JsReW(U8 c)
+{
+	if ('a' <= c <= 'z' || 'A' <= c <= 'Z' || '0' <= c <= '9')
+		return TRUE;
+	return c == '_';
+}
+
+Bool JsReMeta(U8 m, U8 c)
+{ // backslash-m tested against subject char c
+	if (m == 'd')	return '0' <= c <= '9';
+	if (m == 'D')	return !('0' <= c <= '9');
+	if (m == 'w')	return JsReW(c);
+	if (m == 'W')	return !JsReW(c);
+	if (m == 's')	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
+	if (m == 'S')	return !(c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f');
+	if (m == 'n')	return c == '\n';
+	if (m == 't')	return c == '\t';
+	if (m == 'r')	return c == '\r';
+	return c == m; // escaped literal (\. \* \/ \\ ...)
+}
+
+U8 JsReLo(U8 c)
+{
+	if (js_re_icase && 'A' <= c <= 'Z')
+		return c + 32;
+	return c;
+}
+
+Bool JsReEq(U8 a, U8 b)
+{
+	return JsReLo(a) == JsReLo(b);
+}
+
+Bool JsReClass(U8 *p, U8 *pe, U8 c)
+{ // p..pe is the class body (between [ and ]); returns whether c is in the set
+	Bool neg = FALSE, hit = FALSE;
+	U8	 lc = JsReLo(c);
+
+	if (p < pe && *p == '^')
+	{
+		neg = TRUE;
+		p++;
+	}
+	while (p < pe)
+	{
+		if (*p == '\\' && p + 1 < pe)
+		{
+			if (JsReMeta(p[1], c))
+				hit = TRUE;
+			p += 2;
+		}
+		else if (p + 2 < pe && p[1] == '-' && p[2] != ']')
+		{
+			if (JsReLo(*p) <= lc <= JsReLo(p[2]))
+				hit = TRUE;
+			p += 3;
+		}
+		else
+		{
+			if (JsReEq(*p, c))
+				hit = TRUE;
+			p++;
+		}
+	}
+	if (neg)
+		return !hit;
+	return hit;
+}
+
+U8 *JsReSeq(U8 *p, U8 *pe, U8 *s0, U8 *sp, U8 *se); // fwd (mutual recursion)
+
+U8 *JsReAtom1(U8 *as, U8 *ae, U8 *s0, U8 *sp, U8 *se)
+{ // match ONE instance of the atom [as,ae) at sp; returns new sp or NULL
+	if (*as == '(')
+		return JsReSeq(as + 1, ae - 1, s0, sp, se); // group content
+	if (sp >= se)
+		return NULL;
+	if (*as == '.')
+	{
+		if (*sp != '\n')
+			return sp + 1;
+		return NULL;
+	}
+	if (*as == '[')
+	{
+		if (JsReClass(as + 1, ae - 1, *sp))
+			return sp + 1;
+		return NULL;
+	}
+	if (*as == '\\')
+	{
+		if (JsReMeta(as[1], *sp))
+			return sp + 1;
+		return NULL;
+	}
+	if (JsReEq(*as, *sp))
+		return sp + 1;
+	return NULL;
+}
+
+U8 *JsReSeq(U8 *p, U8 *pe, U8 *s0, U8 *sp, U8 *se)
+{ // does pat[p,pe) match at sp? returns end pos in subject on success, else NULL
+	U8	*bar, *as, *ae, *np, *r, *m;
+	U8	*pos[JS_RE_MAXREP + 1];
+	I64	 depth = 0, mn = 1, mx = 1, cnt, gi;
+
+	// top-level alternation
+	bar = NULL;
+	r	= p;
+	while (r < pe)
+	{
+		if (*r == '\\')
+			r++;
+		else if (*r == '(')
+			depth++;
+		else if (*r == ')')
+			depth--;
+		else if (*r == '[')
+		{
+			r++;
+			while (r < pe && *r != ']')
+			{
+				if (*r == '\\')
+					r++;
+				r++;
+			}
+		}
+		else if (*r == '|' && !depth)
+		{
+			bar = r;
+			r	= pe;
+		}
+		if (r < pe)
+			r++;
+	}
+	if (bar)
+	{
+		r = JsReSeq(p, bar, s0, sp, se);
+		if (r)
+			return r;
+		return JsReSeq(bar + 1, pe, s0, sp, se);
+	}
+	if (p >= pe)
+		return sp;
+	if (*p == '^')
+	{
+		if (sp != s0)
+			return NULL;
+		return JsReSeq(p + 1, pe, s0, sp, se);
+	}
+	if (*p == 0x24 && p + 1 == pe) // 0x24 = end anchor (never quote a bare dollar)
+	{
+		if (sp == se)
+			return sp;
+		return NULL;
+	}
+	// parse atom span [as,ae)
+	as = p;
+	if (*p == '\\')
+		ae = p + 2;
+	else if (*p == '(')
+	{
+		depth = 1;
+		ae	  = p + 1;
+		while (ae < pe && depth)
+		{
+			if (*ae == '\\')
+				ae++;
+			else if (*ae == '(')
+				depth++;
+			else if (*ae == ')')
+				depth--;
+			if (depth)
+				ae++;
+		}
+		ae++;
+	}
+	else if (*p == '[')
+	{
+		ae = p + 1;
+		while (ae < pe && *ae != ']')
+		{
+			if (*ae == '\\')
+				ae++;
+			ae++;
+		}
+		ae++;
+	}
+	else
+		ae = p + 1;
+	if (ae > pe)
+		ae = pe;
+	// quantifier
+	np = ae;
+	if (ae < pe && *ae == '*')
+	{
+		mn = 0;
+		mx = JS_RE_MAXREP;
+		np = ae + 1;
+	}
+	else if (ae < pe && *ae == '+')
+	{
+		mn = 1;
+		mx = JS_RE_MAXREP;
+		np = ae + 1;
+	}
+	else if (ae < pe && *ae == '?')
+	{
+		mn = 0;
+		mx = 1;
+		np = ae + 1;
+	}
+	else if (ae < pe && *ae == '{')
+	{
+		np = ae + 1;
+		mn = 0;
+		while (np < pe && '0' <= *np <= '9')
+		{
+			mn = mn * 10 + *np - '0';
+			np++;
+		}
+		mx = mn;
+		if (np < pe && *np == ',')
+		{
+			np++;
+			mx = JS_RE_MAXREP;
+			if (np < pe && *np != '}')
+			{
+				mx = 0;
+				while (np < pe && '0' <= *np <= '9')
+				{
+					mx = mx * 10 + *np - '0';
+					np++;
+				}
+			}
+		}
+		if (np < pe && *np == '}')
+			np++;
+	}
+	if (np < pe && *np == '?')
+		np++; // lazy quantifier -> approximate as greedy
+	// greedy: consume as many atom instances as possible, then backtrack
+	cnt	   = 0;
+	pos[0] = sp;
+	r	   = sp;
+	while (cnt < mx && cnt < JS_RE_MAXREP)
+	{
+		m = JsReAtom1(as, ae, s0, r, se);
+		if (!m || m == r)
+			cnt = cnt; // hit floor / zero-width: stop growing
+		if (!m || m == r)
+			mx = cnt; // force loop exit without a break statement
+		else
+		{
+			r		 = m;
+			cnt++;
+			pos[cnt] = r;
+		}
+	}
+	while (cnt >= mn)
+	{
+		r = JsReSeq(np, pe, s0, pos[cnt], se);
+		if (r)
+		{
+			if (*as == '(' && cnt >= 1)
+			{ // capturing group on the winning path: record last-iteration span
+				gi = JsReGroupIdx(as);
+				if (gi >= 1 && gi < JS_RE_MAXCAP)
+				{
+					js_re_cs[gi] = pos[cnt - 1];
+					js_re_ce[gi] = pos[cnt];
+					if (gi > js_re_ncap)
+						js_re_ncap = gi;
+				}
+			}
+			return r;
+		}
+		cnt--;
+	}
+	return NULL;
+}
+
+Bool JsReSearch(U8 *pat, U8 *str, I64 start, Bool icase, I64 *ms, I64 *me)
+{ // find first match of pat in str at or after `start`. Fills byte offsets.
+	U8	*p	 = pat, *pe = pat + StrLen(pat);
+	U8	*s0	 = str, *se = str + StrLen(str), *sp, *r;
+	I64	 i;
+
+	js_re_icase = icase;
+	js_re_pat0	= pat; // for capture-group numbering in JsReSeq
+	sp = str + start;
+	if (start < 0)
+		sp = str;
+	while (sp <= se)
+	{
+		js_re_ncap = 0; // reset captures for this start attempt
+		for (i = 0; i < JS_RE_MAXCAP; i++)
+		{
+			js_re_cs[i] = NULL;
+			js_re_ce[i] = NULL;
+		}
+		r = JsReSeq(p, pe, s0, sp, se);
+		if (r)
+		{
+			*ms = sp - str;
+			*me = r - str;
+			return TRUE;
+		}
+		sp++;
+	}
+	return FALSE;
+}
+
+Bool JsReValSearch(CJsInterp *ji, CJsVal *re, U8 *str, I64 start, I64 *ms, I64 *me)
+{ // extract source+ignoreCase from a regex value and search. re may be a string.
+	U8	*pat;
+	CJsVal *w;
+	Bool ic = FALSE;
+
+	if (re->type == JV_STR)
+		pat = re->str;
+	else
+	{
+		w = JsPropGet(re, "source");
+		if (!w)
+			return FALSE;
+		pat = JsToStr(ji, w);
+		w	= JsPropGet(re, "ignoreCase");
+		if (w && JsToBool(w))
+			ic = TRUE;
+	}
+	return JsReSearch(pat, str, start, ic, ms, me);
+}
+
+CJsVal *JsStrSlice(CJsInterp *ji, U8 *s, I64 a, I64 b)
+{ // s[a,b) as a fresh JV_STR
+	U8	*d;
+
+	if (b < a)
+		b = a;
+	d = JsAlloc(ji, b - a + 1);
+	MemCopy(d, s + a, b - a);
+	d[b - a] = 0;
+	return JsStrV(ji, d);
+}
+
 U8 *JsCookieGet(CJsInterp *ji)
 { // document.cookie read -> bare "a=b; c=d" for this page's host. MAlloc'ed.
 	CHttpUrl u;
@@ -2628,7 +3106,9 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 	{
 		case JV_UNDEF:
 		case JV_NULL:
-			JsErr(ji, "member access on null/undefined");
+			// Lenient: return undefined instead of throwing. Makes optional
+			// chaining (a?.b) short-circuit and stops a stray null access from
+			// killing a whole bundle (real JS throws; we prioritize running).
 			return JsUndefV(ji);
 		case JV_STR:
 			if (!StrCompare(name, "length"))
@@ -2645,6 +3125,10 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 			if (!StrCompare(name, "toLowerCase"))	return JsNativeV(ji, JSN_STR_TOLOWER);
 			if (!StrCompare(name, "split"))			return JsNativeV(ji, JSN_STR_SPLIT);
 			if (!StrCompare(name, "replace"))		return JsNativeV(ji, JSN_STR_REPLACE);
+			if (!StrCompare(name, "replaceAll"))	return JsNativeV(ji, JSN_STR_REPLACE);
+			if (!StrCompare(name, "match"))			return JsNativeV(ji, JSN_STR_MATCH);
+			if (!StrCompare(name, "matchAll"))		return JsNativeV(ji, JSN_STR_MATCHALL);
+			if (!StrCompare(name, "search"))		return JsNativeV(ji, JSN_STR_SEARCH);
 			if (!StrCompare(name, "trim"))			return JsNativeV(ji, JSN_STR_TRIM);
 			if (!StrCompare(name, "includes"))		return JsNativeV(ji, JSN_STR_INCLUDES);
 			if (!StrCompare(name, "startsWith"))	return JsNativeV(ji, JSN_STR_STARTS);
@@ -2669,6 +3153,23 @@ CJsVal *JsMemberGet(CJsInterp *ji, CJsVal *obj, U8 *name)
 			if (!StrCompare(name, "includes"))	return JsNativeV(ji, JSN_ARR_INCLUDES);
 			if (!StrCompare(name, "pop"))		return JsNativeV(ji, JSN_ARR_POP);
 			if (!StrCompare(name, "shift"))		return JsNativeV(ji, JSN_ARR_SHIFT);
+			if (!StrCompare(name, "some"))		return JsNativeV(ji, JSN_ARR_SOME);
+			if (!StrCompare(name, "every"))		return JsNativeV(ji, JSN_ARR_EVERY);
+			if (!StrCompare(name, "findIndex"))	return JsNativeV(ji, JSN_ARR_FINDINDEX);
+			if (!StrCompare(name, "findLast"))	return JsNativeV(ji, JSN_ARR_FINDLAST);
+			if (!StrCompare(name, "fill"))		return JsNativeV(ji, JSN_ARR_FILL);
+			if (!StrCompare(name, "at"))		return JsNativeV(ji, JSN_ARR_AT);
+			if (!StrCompare(name, "splice"))	return JsNativeV(ji, JSN_ARR_SPLICE);
+			if (!StrCompare(name, "unshift"))	return JsNativeV(ji, JSN_ARR_UNSHIFT);
+			if (!StrCompare(name, "flat"))		return JsNativeV(ji, JSN_ARR_FLAT);
+			if (!StrCompare(name, "flatMap"))	return JsNativeV(ji, JSN_ARR_FLATMAP);
+			if (!StrCompare(name, "lastIndexOf")) return JsNativeV(ji, JSN_ARR_LASTINDEXOF);
+			if (!StrCompare(name, "subarray"))	return JsNativeV(ji, JSN_TA_SUBARRAY);
+			if (!StrCompare(name, "set") && JsPropGet(obj, "BYTES_PER_ELEMENT"))
+				return JsNativeV(ji, JSN_TA_SET);
+			v = JsPropGet(obj, name); // typed-array metadata (buffer/byteLength/...) + assigned props
+			if (v)
+				return v;
 			return JsUndefV(ji);
 		case JV_NATIVE:
 			if (obj->native_id == JSN_DATE_CTOR && !StrCompare(name, "now"))
@@ -3395,6 +3896,8 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 			v = JsValNew(ji, JV_OBJ);
 			JsPropSet(ji, v, "source", JsStrV(ji, node->str));
 			JsPropSet(ji, v, "global", JsBoolV(ji, node->op & 1));
+			JsPropSet(ji, v, "ignoreCase", JsBoolV(ji, node->op & 2));
+			JsPropSet(ji, v, "multiline", JsBoolV(ji, node->op & 4));
 			JsPropSet(ji, v, "lastIndex", JsNumV(ji, 0));
 			JsPropSet(ji, v, "test", JsNativeV(ji, JSN_RE_TEST));
 			JsPropSet(ji, v, "exec", JsNativeV(ji, JSN_RE_EXEC));
@@ -3668,12 +4171,14 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 				child = child->next;
 			}
 			if (!fn || (fn->type != JV_FUNC && fn->type != JV_NATIVE))
-			{ // name the non-callable so the log says which member/global is missing
+			{ // SOFT: log which member/global is missing, but return undefined and
+			  // keep running (a?.b(), optional calls, and unknown APIs stay local).
 				StrPrint(nmbuf, "not a function: %s", JsCtorName(node->a));
 				for (i = 0; nmbuf[i]; i++)
 					if (nmbuf[i] == 0x24)
 						nmbuf[i] = '?';
-				JsErr(ji, nmbuf);
+				if (++js_soft_errs <= 12)
+					NetLog("JS: %s", nmbuf);
 				return JsUndefV(ji);
 			}
 			return JsCall(ji, fn, obj, argv, argc);
@@ -4943,15 +5448,147 @@ Bool JsNodeContains(CZNode *root, CZNode *target)
 	return FALSE;
 }
 
+U0 JsReReplExpand(CJsInterp *ji, U8 *bb, U8 *tmpl, U8 *s, I64 mi, I64 me)
+{ // append tmpl to bb, expanding the 0x24 (dollar) replacement patterns using the
+  // js_re captures: 0x24& = whole match, 0x24 1..9 = group N, doubled 0x24 = literal.
+  // s = subject; [mi,me) = whole-match byte span. 0x24 is the dollar char code.
+	I64 g, a0, a1;
+	while (*tmpl)
+	{
+		if (*tmpl == 0x24 && tmpl[1])
+		{
+			if (tmpl[1] == 0x24)
+			{
+				CatPrint(bb, "%c", 0x24);
+				tmpl += 2;
+			}
+			else if (tmpl[1] == '&')
+			{
+				a0 = mi;
+				while (a0 < me)
+				{
+					CatPrint(bb, "%c", s[a0]);
+					a0++;
+				}
+				tmpl += 2;
+			}
+			else if ('1' <= tmpl[1] <= '9')
+			{
+				g = tmpl[1] - '0';
+				if (g <= js_re_ncap && g < JS_RE_MAXCAP && js_re_cs[g])
+				{
+					a0 = js_re_cs[g] - s;
+					a1 = js_re_ce[g] - s;
+					while (a0 < a1)
+					{
+						CatPrint(bb, "%c", s[a0]);
+						a0++;
+					}
+				}
+				tmpl += 2;
+			}
+			else
+			{
+				CatPrint(bb, "%c", *tmpl);
+				tmpl++;
+			}
+		}
+		else
+		{
+			CatPrint(bb, "%c", *tmpl);
+			tmpl++;
+		}
+	}
+}
+
+F64 JsTypedCoerce(F64 x, I64 width, I64 kind)
+{ // kind: 0=uint 1=sint 2=float 3=clamped-uint8. Construct-time coercion only.
+	I64 v;
+	if (kind == 2)
+		return x;
+	if (kind == 3)
+	{
+		if (x < 0) return 0;
+		if (x > 255) return 255;
+		return ToF64(ToI64(x) & 0xFF);
+	}
+	v = ToI64(x);
+	if (width == 1) v = v & 0xFF;
+	else if (width == 2) v = v & 0xFFFF;
+	else if (width == 4) v = v & 0xFFFFFFFF;
+	if (kind == 1)
+	{ // sign-extend
+		if (width == 1 && v >= 0x80)		v -= 0x100;
+		else if (width == 2 && v >= 0x8000)	v -= 0x10000;
+		else if (width == 4 && v >= 0x80000000) v -= 0x100000000;
+	}
+	return ToF64(v);
+}
+
+CJsVal *JsTypedNew(CJsInterp *ji, CJsVal **args, I64 argc, I64 width, I64 kind)
+{ // typed arrays are backed by a normal JV_ARR of numbers (no shared buffer
+  // aliasing, but map/index/length/set all work). Metadata rides in props.
+	CJsVal *arr, *a0, *el;
+	I64 i, n;
+	arr = JsArrV(ji);
+	n = 0;
+	a0 = JsArgOr(ji, args, argc, 0);
+	if (a0->type == JV_NUM)
+	{ // new T(length)
+		n = ToI64(a0->num);
+		for (i = 0; i < n; i++)
+			JsArrPush(ji, arr, JsNumV(ji, 0));
+	}
+	else if (a0->type == JV_ARR)
+	{ // new T([...]) or new T(otherTypedArray)
+		for (i = 0; i < a0->count; i++)
+			JsArrPush(ji, arr,
+				JsNumV(ji, JsTypedCoerce(JsToNum(a0->items[i]), width, kind)));
+	}
+	else if (a0->type == JV_OBJ)
+	{ // new T(arrayBuffer) or array-like
+		el = JsMemberGet(ji, a0, "_bytes");
+		if (el->type == JV_ARR)
+		{ // ArrayBuffer/typed-array view: copy raw bytes (width-1 exact; wider approx)
+			for (i = 0; i < el->count; i++)
+				JsArrPush(ji, arr,
+					JsNumV(ji, JsTypedCoerce(JsToNum(el->items[i]), width, kind)));
+		}
+		else
+		{
+			el = JsMemberGet(ji, a0, "byteLength");
+			if (el->type == JV_NUM)
+				n = ToI64(el->num) / width;
+			else
+			{
+				el = JsMemberGet(ji, a0, "length");
+				if (el->type == JV_NUM)
+					n = ToI64(el->num);
+			}
+			for (i = 0; i < n; i++)
+				JsArrPush(ji, arr, JsNumV(ji, 0));
+		}
+	}
+	JsPropSet(ji, arr, "BYTES_PER_ELEMENT", JsNumV(ji, width));
+	JsPropSet(ji, arr, "byteLength", JsNumV(ji, arr->count * width));
+	JsPropSet(ji, arr, "set", JsNativeV(ji, JSN_TA_SET));
+	el = JsValNew(ji, JV_OBJ); // .buffer -> ArrayBuffer-ish wrapper
+	JsPropSet(ji, el, "byteLength", JsNumV(ji, arr->count * width));
+	JsPropSet(ji, el, "_bytes", arr);
+	JsPropSet(ji, arr, "buffer", el);
+	return arr;
+}
+
 CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 					 CJsVal **args, I64 argc)
 { // self = the native function value itself (carries promise binding in proto)
 	U8	 buf[1024];
 	U8	*s, *sep, *bb;
-	I64	 i, a, b, len;
+	I64	 i, a, b, len, k, m, tb;
 	F64	 best, ms;
 	CJsVal *v, *w, *pr, *resv, *rej;
 	CJsVal *pa[2];
+	CJsVal *ra[16];		// replace()/regex capture arg buffer
 	CZNode *node, *nd2;
 	CDateStruct ds;
 	CJsTimer *t;
@@ -5128,10 +5765,40 @@ CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 		case JSN_LS_CLEAR:
 			js_ls_count = 0;
 			return JsUndefV(ji);
-		case JSN_RE_TEST: // stub regex: no engine yet, never matches
+		case JSN_RE_TEST: // regex.test(str)
+			if (this_val->type == JV_OBJ && argc &&
+				JsReValSearch(ji, this_val, JsToStr(ji, args[0]), 0, &a, &b))
+				return JsBoolV(ji, TRUE);
 			return JsBoolV(ji, FALSE);
-		case JSN_RE_EXEC:
-			return JsNullV(ji);
+		case JSN_RE_EXEC: // regex.exec(str) -> [match] (advances lastIndex if /g)
+			if (this_val->type != JV_OBJ || !argc)
+				return JsNullV(ji);
+			s  = JsToStr(ji, args[0]);
+			a  = 0;
+			pr = JsPropGet(this_val, "global");
+			w  = JsPropGet(this_val, "lastIndex");
+			if (pr && JsToBool(pr) && w)
+				a = ToI64(JsToNum(w));
+			if (!JsReValSearch(ji, this_val, s, a, &b, &len))
+			{
+				if (pr && JsToBool(pr))
+					JsPropSet(ji, this_val, "lastIndex", JsNumV(ji, 0));
+				return JsNullV(ji);
+			}
+			v = JsArrV(ji);
+			JsArrPush(ji, v, JsStrSlice(ji, s, b, len));
+			for (i = 1; i <= js_re_ncap && i < JS_RE_MAXCAP; i++)
+			{
+				if (js_re_cs[i])
+					JsArrPush(ji, v,
+						JsStrSlice(ji, s, js_re_cs[i] - s, js_re_ce[i] - s));
+				else
+					JsArrPush(ji, v, JsUndefV(ji));
+			}
+			JsPropSet(ji, v, "index", JsNumV(ji, b));
+			if (pr && JsToBool(pr))
+				JsPropSet(ji, this_val, "lastIndex", JsNumV(ji, len));
+			return v;
 		case JSN_ERROR_CTOR: // Error/TypeError/... -> object with message
 			v = JsValNew(ji, JV_OBJ);
 			JsPropSet(ji, v, "name", JsStrV(ji, "Error"));
@@ -5294,6 +5961,18 @@ CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 			JsPropSet(ji, v, "addEventListener",	JsNativeV(ji, JSN_NOOP_UNDEF));
 			JsPropSet(ji, v, "removeEventListener",	JsNativeV(ji, JSN_NOOP_UNDEF));
 			return v;
+		case JSN_IMAGE_CTOR: // new Image() / new Image(w,h): tracking/preload stub.
+			v = JsValNew(ji, JV_OBJ);
+			JsPropSet(ji, v, "src", JsStrV(ji, ""));
+			JsPropSet(ji, v, "width",  JsNumV(ji, JsToNum(JsArgOr(ji, args, argc, 0))));
+			JsPropSet(ji, v, "height", JsNumV(ji, JsToNum(JsArgOr(ji, args, argc, 1))));
+			JsPropSet(ji, v, "naturalWidth",  JsNumV(ji, 0));
+			JsPropSet(ji, v, "naturalHeight", JsNumV(ji, 0));
+			JsPropSet(ji, v, "complete", JsBoolV(ji, TRUE));
+			JsPropSet(ji, v, "alt", JsStrV(ji, ""));
+			JsPropSet(ji, v, "addEventListener",	JsNativeV(ji, JSN_NOOP_UNDEF));
+			JsPropSet(ji, v, "removeEventListener",	JsNativeV(ji, JSN_NOOP_UNDEF));
+			return v;
 		case JSN_AUDIO_PLAY: // element.play(): fetch+decode+stream to AC97
 			w = JsPropGet(this_val, "src");
 			if (w)
@@ -5310,8 +5989,181 @@ CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 			return JsUndefV(ji);
 		case JSN_NOOP_UNDEF: // generic stub method
 			return JsUndefV(ji);
+		case JSN_NOOP_FALSE:
+			return JsBoolV(ji, FALSE);
 		case JSN_NOOP_ARR:
 			return JsArrV(ji);
+		case JSN_UAD_ENTROPY: // getHighEntropyValues(hints) -> resolved promise
+			v = JsValNew(ji, JV_OBJ);
+			JsPropSet(ji, v, "architecture", JsStrV(ji, "x86"));
+			JsPropSet(ji, v, "bitness",		 JsStrV(ji, "64"));
+			JsPropSet(ji, v, "mobile",		 JsBoolV(ji, FALSE));
+			JsPropSet(ji, v, "model",		 JsStrV(ji, ""));
+			JsPropSet(ji, v, "platform",	 JsStrV(ji, "Linux"));
+			JsPropSet(ji, v, "platformVersion", JsStrV(ji, "6.1.0"));
+			JsPropSet(ji, v, "uaFullVersion", JsStrV(ji, "126.0.0.0"));
+			pr = JsPromiseNew(ji);
+			JsPromiseSettle(ji, pr, v, FALSE);
+			return pr;
+		case JSN_CRYPTO_RANDVALS: // fill args[0] (array-like) with OS randomness
+			w = JsArgOr(ji, args, argc, 0);
+			if (w->type == JV_ARR)
+				for (i = 0; i < w->count; i++)
+					w->items[i] = JsNumV(ji, RandU32 & 0xFF);
+			return w;
+		case JSN_CRYPTO_UUID: // v4 UUID from OS randomness (lowercase hex per RFC)
+			StrPrint(buf, "%08X-%04X-4%03X-%04X-%08X%04X",
+					 RandU32, RandU32 & 0xFFFF, RandU32 & 0xFFF,
+					 (RandU32 & 0x3FFF) | 0x8000, RandU32, RandU32 & 0xFFFF);
+			for (i = 0; buf[i]; i++)
+				if ('A' <= buf[i] <= 'F')
+					buf[i] = buf[i] + 32;
+			return JsStrV(ji, buf);
+		case JSN_STRUCT_CLONE: // structuredClone(v): JSON round-trip deep copy
+			bb = MAlloc(65536);
+			i  = 0;
+			bb[0] = 0;
+			JsJsonStringify(ji, JsArgOr(ji, args, argc, 0), bb, &i, 65536, 0);
+			s = bb;
+			v = JsJsonParseVal(ji, &s, 0);
+			Free(bb);
+			return v;
+		case JSN_USP_CTOR: // new URLSearchParams("a=1&b=2")
+			v = JsValNew(ji, JV_OBJ);
+			w = JsValNew(ji, JV_OBJ); // _kv backing store
+			s = JsToStr(ji, JsArgOr(ji, args, argc, 0));
+			if (*s == '?')
+				s++;
+			while (*s)
+			{ // split on '&', then '='
+				a = 0;
+				while (s[a] && s[a] != '=' && s[a] != '&' && a < 250)
+					a++;
+				MemCopy(buf, s, a);
+				buf[a] = 0;
+				s += a;
+				qtag[0] = 0;
+				if (*s == '=')
+				{
+					s++;
+					b = 0;
+					while (s[b] && s[b] != '&' && b < 500)
+						b++;
+					MemCopy(qcls, s, b);
+					qcls[b] = 0;
+					s += b;
+					if (*buf)
+						JsPropSet(ji, w, buf, JsStrV(ji, qcls));
+				}
+				else if (*buf)
+					JsPropSet(ji, w, buf, JsStrV(ji, ""));
+				if (*s == '&')
+					s++;
+			}
+			JsPropSet(ji, v, "_kv",	 w);
+			JsPropSet(ji, v, "get",	 JsNativeV(ji, JSN_USP_GET));
+			JsPropSet(ji, v, "set",	 JsNativeV(ji, JSN_USP_SET));
+			JsPropSet(ji, v, "append", JsNativeV(ji, JSN_USP_SET));
+			JsPropSet(ji, v, "has",	 JsNativeV(ji, JSN_USP_HAS));
+			JsPropSet(ji, v, "toString", JsNativeV(ji, JSN_USP_TOSTR));
+			return v;
+		case JSN_USP_GET:
+			w  = JsPropGet(this_val, "_kv");
+			pr = NULL;
+			if (w)
+				pr = JsPropGet(w, JsToStr(ji, JsArgOr(ji, args, argc, 0)));
+			if (pr)
+				return pr;
+			return JsNullV(ji);
+		case JSN_USP_SET:
+			w = JsPropGet(this_val, "_kv");
+			if (w && argc >= 2)
+				JsPropSet(ji, w, JsToStr(ji, args[0]), args[1]);
+			return JsUndefV(ji);
+		case JSN_USP_HAS:
+			w = JsPropGet(this_val, "_kv");
+			if (w)
+				return JsBoolV(ji,
+					JsPropGet(w, JsToStr(ji, JsArgOr(ji, args, argc, 0))) != NULL);
+			return JsBoolV(ji, FALSE);
+		case JSN_USP_TOSTR:
+			w = JsPropGet(this_val, "_kv");
+			buf[0] = 0;
+			if (w)
+			{
+				prp = w->props;
+				while (prp)
+				{
+					if (StrLen(buf) < 900)
+					{
+						if (buf[0])
+							CatPrint(buf, "&");
+						CatPrint(buf, "%s=%s", prp->name,
+								 JsToStr(ji, prp->val(CJsVal *)));
+					}
+					prp = prp->next;
+				}
+			}
+			return JsStrV(ji, buf);
+		case JSN_REFLECT_GET:
+			w = JsArgOr(ji, args, argc, 0);
+			return JsMemberGet(ji, w, JsToStr(ji, JsArgOr(ji, args, argc, 1)));
+		case JSN_REFLECT_SET:
+			w = JsArgOr(ji, args, argc, 0);
+			if (w->type == JV_OBJ)
+				JsPropSet(ji, w, JsToStr(ji, JsArgOr(ji, args, argc, 1)),
+						  JsArgOr(ji, args, argc, 2));
+			return JsBoolV(ji, TRUE);
+		case JSN_REFLECT_HAS:
+			w = JsArgOr(ji, args, argc, 0);
+			return JsBoolV(ji, w->type == JV_OBJ &&
+				JsPropGet(w, JsToStr(ji, JsArgOr(ji, args, argc, 1))) != NULL);
+		case JSN_REFLECT_DELETE:
+			w = JsArgOr(ji, args, argc, 0);
+			if (w->type == JV_OBJ)
+				JsPropSet(ji, w, JsToStr(ji, JsArgOr(ji, args, argc, 1)),
+						  JsUndefV(ji));
+			return JsBoolV(ji, TRUE);
+		case JSN_REFLECT_APPLY: // Reflect.apply(fn, thisArg, argsArray)
+			w  = JsArgOr(ji, args, argc, 2);
+			pr = JsArgOr(ji, args, argc, 0);
+			if (w->type == JV_ARR)
+				return JsCall(ji, pr, JsArgOr(ji, args, argc, 1), w->items,
+							  w->count);
+			return JsCall(ji, pr, JsArgOr(ji, args, argc, 1), NULL, 0);
+		case JSN_REFLECT_CONSTRUCT: // Reflect.construct(fn, argsArray)
+			w  = JsArgOr(ji, args, argc, 1);
+			pr = JsArgOr(ji, args, argc, 0);
+			if (w->type == JV_ARR)
+				return JsConstruct(ji, pr, w->items, w->count, "reflect");
+			return JsConstruct(ji, pr, NULL, 0, "reflect");
+		case JSN_TEXTENC_CTOR: // new TextEncoder()
+			v = JsValNew(ji, JV_OBJ);
+			JsPropSet(ji, v, "encoding", JsStrV(ji, "utf-8"));
+			JsPropSet(ji, v, "encode", JsNativeV(ji, JSN_TEXTENC_ENCODE));
+			return v;
+		case JSN_TEXTENC_ENCODE: // .encode(str) -> array of UTF-8 byte values
+			s = JsToStr(ji, JsArgOr(ji, args, argc, 0));
+			v = JsArrV(ji);
+			while (*s)
+				JsArrPush(ji, v, JsNumV(ji, *s++ & 0xFF));
+			return v;
+		case JSN_TEXTDEC_CTOR: // new TextDecoder()
+			v = JsValNew(ji, JV_OBJ);
+			JsPropSet(ji, v, "encoding", JsStrV(ji, "utf-8"));
+			JsPropSet(ji, v, "decode", JsNativeV(ji, JSN_TEXTDEC_DECODE));
+			return v;
+		case JSN_TEXTDEC_DECODE: // .decode(byteArray) -> string
+			w  = JsArgOr(ji, args, argc, 0);
+			bb = MAlloc(4096);
+			a  = 0;
+			if (w->type == JV_ARR)
+				for (i = 0; i < w->count && a < 4090; i++)
+					bb[a++] = ToI64(JsToNum(w->items[i])) & 0xFF;
+			bb[a] = 0;
+			v = JsStrV(ji, bb);
+			Free(bb);
+			return v;
 		case JSN_OBSERVER_CTOR: // observers: constructable, never fire
 			v = JsValNew(ji, JV_OBJ);
 			JsPropSet(ji, v, "observe",		JsNativeV(ji, JSN_NOOP_UNDEF));
@@ -6108,6 +6960,26 @@ CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 			v = JsArrV(ji);
 			if (this_val->type != JV_STR)
 				return v;
+			if (argc && args[0]->type == JV_OBJ && JsPropGet(args[0], "source"))
+			{ // regex split: a=segment start, b=search from
+				s = this_val->str;
+				a = 0;
+				b = 0;
+				while (b <= StrLen(s) &&
+					   JsReValSearch(ji, args[0], s, b, &i, &len))
+				{
+					if (len == i)
+						b = i + 1; // zero-width match: skip forward
+					else
+					{
+						JsArrPush(ji, v, JsStrSlice(ji, s, a, i));
+						a = len;
+						b = len;
+					}
+				}
+				JsArrPush(ji, v, JsStrSlice(ji, s, a, StrLen(s)));
+				return v;
+			}
 			sep = JsToStr(ji, JsArgOr(ji, args, argc, 0));
 			s = this_val->str;
 			if (!*sep)
@@ -6138,11 +7010,113 @@ CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 				s = bb + len;
 			}
 			return v;
-		case JSN_STR_REPLACE:
+		case JSN_STR_MATCH: // str.match(re) -> [m0] (all matches if /g), else null
+			if (this_val->type != JV_STR || !argc)
+				return JsNullV(ji);
+			s	= this_val->str;
+			pr	= JsPropGet(args[0], "global");
+			a	= 0;
+			v	= JsArrV(ji);
+			b	= 0;
+			while (JsReValSearch(ji, args[0], s, a, &b, &len))
+			{
+				JsArrPush(ji, v, JsStrSlice(ji, s, b, len));
+				if (!pr || !JsToBool(pr))
+				{ // non-global: one match array with captures + .index
+					for (i = 1; i <= js_re_ncap && i < JS_RE_MAXCAP; i++)
+					{
+						if (js_re_cs[i])
+							JsArrPush(ji, v, JsStrSlice(ji, s,
+								js_re_cs[i] - s, js_re_ce[i] - s));
+						else
+							JsArrPush(ji, v, JsUndefV(ji));
+					}
+					JsPropSet(ji, v, "index", JsNumV(ji, b));
+					return v;
+				}
+				a = len;
+				if (len == b) // zero-width: advance to avoid infinite loop
+					a = len + 1;
+			}
+			if (v->count)
+				return v;
+			return JsNullV(ji);
+		case JSN_STR_MATCHALL: // -> array of [match] arrays (iterable enough)
+			v = JsArrV(ji);
+			if (this_val->type == JV_STR && argc)
+			{
+				s = this_val->str;
+				a = 0;
+				while (JsReValSearch(ji, args[0], s, a, &b, &len))
+				{
+					w = JsArrV(ji);
+					JsArrPush(ji, w, JsStrSlice(ji, s, b, len));
+					JsPropSet(ji, w, "index", JsNumV(ji, b));
+					JsArrPush(ji, v, w);
+					a = len;
+					if (len == b)
+						a = len + 1;
+				}
+			}
+			return v;
+		case JSN_STR_SEARCH: // str.search(re) -> index or -1
+			if (this_val->type == JV_STR && argc &&
+				JsReValSearch(ji, args[0], this_val->str, 0, &a, &b))
+				return JsNumV(ji, a);
+			return JsNumV(ji, -1);
+		case JSN_STR_REPLACE: // string OR regex pattern; regex honors the /g flag
 			if (this_val->type != JV_STR || argc < 2)
 				return this_val;
-			sep = JsToStr(ji, args[0]); // pattern (string only, first hit)
-			bb = StrFind(sep, this_val->str);
+			s = this_val->str;
+			if (args[0]->type == JV_OBJ) // regex replace (a=write cursor, b=search)
+			{
+				len = StrLen(s);
+				bb	= MAlloc(len * 3 + 256);
+				bb[0] = 0;
+				a	= 0;
+				b	= 0;
+				pr	= JsPropGet(args[0], "global");
+				while (b <= len && StrLen(bb) < len * 3 + 100 &&
+					   JsReValSearch(ji, args[0], s, b, &i, &b))
+				{ // i = match start, b now = match end
+					while (a < i)
+					{
+						CatPrint(bb, "%c", s[a]);
+						a++;
+					}
+					if (args[1]->type == JV_FUNC || args[1]->type == JV_NATIVE)
+					{ // replacer(match, p1..pN, offset, string)
+						ra[0] = JsStrSlice(ji, s, i, b);
+						k	  = 1;
+						for (m = 1; m <= js_re_ncap && m < JS_RE_MAXCAP && k < 13; m++)
+						{
+							if (js_re_cs[m])
+								ra[k++] = JsStrSlice(ji, s,
+									js_re_cs[m] - s, js_re_ce[m] - s);
+							else
+								ra[k++] = JsUndefV(ji);
+						}
+						ra[k++] = JsNumV(ji, i);
+						ra[k++] = JsStrV(ji, s);
+						CatPrint(bb, "%s",
+								 JsToStr(ji, JsCall(ji, args[1], NULL, ra, k)));
+					}
+					else
+						JsReReplExpand(ji, bb, JsToStr(ji, args[1]), s, i, b);
+					a = b;
+					if (b == i) // zero-width: step past one char so we progress
+						b = i + 1;
+					if (!pr || !JsToBool(pr))
+						b = len + 1; // non-global: stop after the first replacement
+				}
+				if (a <= len)
+					CatPrint(bb, "%s", s + a);
+				v = JsStrV(ji, bb);
+				Free(bb);
+				return v;
+			}
+			sep = JsToStr(ji, args[0]); // plain-string pattern (first hit)
+			bb = StrFind(sep, s);
 			if (!bb || !*sep)
 				return this_val;
 			s = MAlloc(StrLen(this_val->str) + StrLen(JsToStr(ji, args[1])) + 2);
@@ -6285,6 +7259,432 @@ CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 				this_val->items[i - 1] = this_val->items[i];
 			this_val->count--;
 			return v;
+		case JSN_ARR_SOME:
+		case JSN_ARR_EVERY:
+		case JSN_ARR_FINDINDEX:
+		case JSN_ARR_FINDLAST:
+			v = JsUndefV(ji); // findLast accumulator
+			if (this_val->type != JV_ARR || !argc)
+			{
+				if (id == JSN_ARR_EVERY)		return JsBoolV(ji, TRUE);
+				if (id == JSN_ARR_SOME)			return JsBoolV(ji, FALSE);
+				if (id == JSN_ARR_FINDINDEX)	return JsNumV(ji, -1);
+				return v;
+			}
+			for (i = 0; i < this_val->count && !ji->has_err; i++)
+			{
+				pa[0] = this_val->items[i];
+				pa[1] = JsNumV(ji, i);
+				w = JsCall(ji, args[0], NULL, pa, 2);
+				if (id == JSN_ARR_SOME)
+				{ if (JsToBool(w)) return JsBoolV(ji, TRUE); }
+				else if (id == JSN_ARR_EVERY)
+				{ if (!JsToBool(w)) return JsBoolV(ji, FALSE); }
+				else if (id == JSN_ARR_FINDINDEX)
+				{ if (JsToBool(w)) return JsNumV(ji, i); }
+				else
+				{ if (JsToBool(w)) v = this_val->items[i]; }
+			}
+			if (id == JSN_ARR_SOME)			return JsBoolV(ji, FALSE);
+			if (id == JSN_ARR_EVERY)		return JsBoolV(ji, TRUE);
+			if (id == JSN_ARR_FINDINDEX)	return JsNumV(ji, -1);
+			return v;
+		case JSN_ARR_FILL:
+			if (this_val->type != JV_ARR)
+				return this_val;
+			w = JsArgOr(ji, args, argc, 0);
+			a = 0;
+			b = this_val->count;
+			if (argc > 1)
+			{ a = ToI64(JsToNum(args[1])); if (a < 0) a += this_val->count; }
+			if (argc > 2)
+			{ b = ToI64(JsToNum(args[2])); if (b < 0) b += this_val->count; }
+			if (a < 0) a = 0;
+			if (b > this_val->count) b = this_val->count;
+			for (i = a; i < b; i++)
+				this_val->items[i] = w;
+			return this_val;
+		case JSN_ARR_AT:
+			if (this_val->type != JV_ARR)
+				return JsUndefV(ji);
+			a = ToI64(JsToNum(JsArgOr(ji, args, argc, 0)));
+			if (a < 0) a += this_val->count;
+			if (a < 0 || a >= this_val->count)
+				return JsUndefV(ji);
+			return this_val->items[a];
+		case JSN_ARR_LASTINDEXOF:
+			if (this_val->type != JV_ARR)
+				return JsNumV(ji, -1);
+			w = JsArgOr(ji, args, argc, 0);
+			for (i = this_val->count - 1; i >= 0; i--)
+				if (JsStrictEq(this_val->items[i], w))
+					return JsNumV(ji, i);
+			return JsNumV(ji, -1);
+		case JSN_ARR_UNSHIFT:
+			if (this_val->type != JV_ARR)
+				return JsNumV(ji, 0);
+			w = JsArrV(ji);
+			for (i = 0; i < argc; i++)
+				JsArrPush(ji, w, args[i]);
+			for (i = 0; i < this_val->count; i++)
+				JsArrPush(ji, w, this_val->items[i]);
+			this_val->items = w->items;
+			this_val->count = w->count;
+			this_val->cap   = w->cap;
+			return JsNumV(ji, this_val->count);
+		case JSN_ARR_SPLICE:
+			v = JsArrV(ji); // removed items
+			if (this_val->type != JV_ARR)
+				return v;
+			a = 0;
+			if (argc > 0)
+			{ a = ToI64(JsToNum(args[0])); if (a < 0) a += this_val->count; }
+			if (a < 0) a = 0;
+			if (a > this_val->count) a = this_val->count;
+			b = this_val->count - a; // deleteCount default = rest
+			if (argc > 1)
+			{ b = ToI64(JsToNum(args[1])); if (b < 0) b = 0; }
+			if (b > this_val->count - a) b = this_val->count - a;
+			for (i = 0; i < b; i++)
+				JsArrPush(ji, v, this_val->items[a + i]);
+			w = JsArrV(ji);
+			for (i = 0; i < a; i++)
+				JsArrPush(ji, w, this_val->items[i]);
+			for (i = 2; i < argc; i++)
+				JsArrPush(ji, w, args[i]);
+			for (i = a + b; i < this_val->count; i++)
+				JsArrPush(ji, w, this_val->items[i]);
+			this_val->items = w->items;
+			this_val->count = w->count;
+			this_val->cap   = w->cap;
+			return v;
+		case JSN_ARR_FLAT:
+			v = JsArrV(ji);
+			if (this_val->type != JV_ARR)
+				return v;
+			a = 1;
+			if (argc > 0) a = ToI64(JsToNum(args[0]));
+			for (i = 0; i < this_val->count; i++)
+			{
+				if (a > 0 && this_val->items[i]->type == JV_ARR)
+					for (b = 0; b < this_val->items[i]->count; b++)
+						JsArrPush(ji, v, this_val->items[i]->items[b]);
+				else
+					JsArrPush(ji, v, this_val->items[i]);
+			}
+			return v;
+		case JSN_ARR_FLATMAP:
+			v = JsArrV(ji);
+			if (this_val->type != JV_ARR || !argc)
+				return v;
+			for (i = 0; i < this_val->count && !ji->has_err; i++)
+			{
+				pa[0] = this_val->items[i];
+				pa[1] = JsNumV(ji, i);
+				w = JsCall(ji, args[0], NULL, pa, 2);
+				if (w->type == JV_ARR)
+					for (b = 0; b < w->count; b++)
+						JsArrPush(ji, v, w->items[b]);
+				else
+					JsArrPush(ji, v, w);
+			}
+			return v;
+		case JSN_ARRAYBUFFER_CTOR: // new ArrayBuffer(len)
+			v = JsValNew(ji, JV_OBJ);
+			a = ToI64(JsToNum(JsArgOr(ji, args, argc, 0)));
+			w = JsArrV(ji);
+			for (i = 0; i < a; i++)
+				JsArrPush(ji, w, JsNumV(ji, 0));
+			JsPropSet(ji, v, "_bytes", w);
+			JsPropSet(ji, v, "byteLength", JsNumV(ji, a));
+			JsPropSet(ji, v, "slice", JsNativeV(ji, JSN_ARR_SLICE));
+			return v;
+		case JSN_U8ARR_CTOR:	return JsTypedNew(ji, args, argc, 1, 0);
+		case JSN_I8ARR_CTOR:	return JsTypedNew(ji, args, argc, 1, 1);
+		case JSN_U8C_CTOR:		return JsTypedNew(ji, args, argc, 1, 3);
+		case JSN_U16ARR_CTOR:	return JsTypedNew(ji, args, argc, 2, 0);
+		case JSN_I16ARR_CTOR:	return JsTypedNew(ji, args, argc, 2, 1);
+		case JSN_U32ARR_CTOR:	return JsTypedNew(ji, args, argc, 4, 0);
+		case JSN_I32ARR_CTOR:	return JsTypedNew(ji, args, argc, 4, 1);
+		case JSN_F32ARR_CTOR:	return JsTypedNew(ji, args, argc, 4, 2);
+		case JSN_F64ARR_CTOR:	return JsTypedNew(ji, args, argc, 8, 2);
+		case JSN_TA_SET: // typedArr.set(src, offset)
+			if (this_val->type != JV_ARR)
+				return JsUndefV(ji);
+			w = JsArgOr(ji, args, argc, 0);
+			a = 0;
+			if (argc > 1)
+				a = ToI64(JsToNum(args[1]));
+			if (w->type == JV_ARR)
+				for (i = 0; i < w->count; i++)
+					if (a + i >= 0 && a + i < this_val->count)
+						this_val->items[a + i] = w->items[i];
+			return JsUndefV(ji);
+		case JSN_TA_SUBARRAY: // typedArr.subarray(begin, end)
+			v = JsArrV(ji);
+			if (this_val->type != JV_ARR)
+				return v;
+			a = 0;
+			b = this_val->count;
+			if (argc > 0) a = ToI64(JsToNum(args[0]));
+			if (argc > 1) b = ToI64(JsToNum(args[1]));
+			if (a < 0) a += this_val->count;
+			if (b < 0) b += this_val->count;
+			if (a < 0) a = 0;
+			if (b > this_val->count) b = this_val->count;
+			for (i = a; i < b; i++)
+				JsArrPush(ji, v, this_val->items[i]);
+			return v;
+		case JSN_DATAVIEW_CTOR: // new DataView(buffer)
+			v = JsValNew(ji, JV_OBJ);
+			w = JsArgOr(ji, args, argc, 0);
+			pr = NULL;
+			if (w->type == JV_OBJ)
+			{
+				resv = JsMemberGet(ji, w, "_bytes");
+				if (resv->type == JV_ARR)
+					pr = resv;
+			}
+			if (!pr)
+				pr = JsArrV(ji);
+			JsPropSet(ji, v, "_bytes", pr);
+			JsPropSet(ji, v, "byteLength", JsNumV(ji, pr->count));
+			JsPropSet(ji, v, "getUint8",	JsNativeV(ji, JSN_DV_GETU8));
+			JsPropSet(ji, v, "getInt8",		JsNativeV(ji, JSN_DV_GETU8));
+			JsPropSet(ji, v, "setUint8",	JsNativeV(ji, JSN_DV_SETU8));
+			JsPropSet(ji, v, "setInt8",		JsNativeV(ji, JSN_DV_SETU8));
+			JsPropSet(ji, v, "getUint16",	JsNativeV(ji, JSN_DV_GETU16));
+			JsPropSet(ji, v, "getInt16",	JsNativeV(ji, JSN_DV_GETU16));
+			JsPropSet(ji, v, "setUint16",	JsNativeV(ji, JSN_DV_SETU16));
+			JsPropSet(ji, v, "setInt16",	JsNativeV(ji, JSN_DV_SETU16));
+			JsPropSet(ji, v, "getUint32",	JsNativeV(ji, JSN_DV_GETU32));
+			JsPropSet(ji, v, "getInt32",	JsNativeV(ji, JSN_DV_GETU32));
+			JsPropSet(ji, v, "setUint32",	JsNativeV(ji, JSN_DV_SETU32));
+			JsPropSet(ji, v, "setInt32",	JsNativeV(ji, JSN_DV_SETU32));
+			JsPropSet(ji, v, "getFloat32",	JsNativeV(ji, JSN_DV_GETF32));
+			JsPropSet(ji, v, "getFloat64",	JsNativeV(ji, JSN_DV_GETF32));
+			JsPropSet(ji, v, "setFloat32",	JsNativeV(ji, JSN_DV_SETF32));
+			JsPropSet(ji, v, "setFloat64",	JsNativeV(ji, JSN_DV_SETF32));
+			return v;
+		case JSN_DV_GETU8:
+		case JSN_DV_GETU16:
+		case JSN_DV_GETU32:
+			w = JsMemberGet(ji, this_val, "_bytes");
+			a = ToI64(JsToNum(JsArgOr(ji, args, argc, 0))); // byte offset
+			len = 1;
+			if (id == JSN_DV_GETU16) len = 2;
+			if (id == JSN_DV_GETU32) len = 4;
+			b = JsToBool(JsArgOr(ji, args, argc, 1)); // littleEndian
+			m = 0;
+			if (w->type == JV_ARR)
+				for (i = 0; i < len; i++)
+				{
+					k = a + i;
+					tb = 0;
+					if (k >= 0 && k < w->count)
+						tb = ToI64(JsToNum(w->items[k])) & 0xFF;
+					if (b)
+						m = m | (tb << (8 * i));
+					else
+						m = m | (tb << (8 * (len - 1 - i)));
+				}
+			return JsNumV(ji, m);
+		case JSN_DV_SETU8:
+		case JSN_DV_SETU16:
+		case JSN_DV_SETU32:
+			w = JsMemberGet(ji, this_val, "_bytes");
+			a = ToI64(JsToNum(JsArgOr(ji, args, argc, 0))); // byte offset
+			m = ToI64(JsToNum(JsArgOr(ji, args, argc, 1))); // value
+			len = 1;
+			if (id == JSN_DV_SETU16) len = 2;
+			if (id == JSN_DV_SETU32) len = 4;
+			b = JsToBool(JsArgOr(ji, args, argc, 2)); // littleEndian
+			if (w->type == JV_ARR)
+				for (i = 0; i < len; i++)
+				{
+					if (b)
+						tb = (m >> (8 * i)) & 0xFF;
+					else
+						tb = (m >> (8 * (len - 1 - i))) & 0xFF;
+					k = a + i;
+					if (k >= 0 && k < w->count)
+						w->items[k] = JsNumV(ji, tb);
+				}
+			return JsUndefV(ji);
+		case JSN_DV_GETF32: // float DataView not bit-accurate; return 0 (honest stub)
+			return JsNumV(ji, 0);
+		case JSN_DV_SETF32:
+			return JsUndefV(ji);
+		case JSN_SUBTLE_DIGEST: // crypto.subtle.digest(alg, data) -> Promise<ArrayBuffer>
+			// alg ignored; always SHA-256 (the only hash we carry). data = typed
+			// array / ArrayBuffer / string.
+			w = JsArgOr(ji, args, argc, 1);
+			v = NULL; // byte source
+			if (w->type == JV_ARR)
+				v = w;
+			else if (w->type == JV_OBJ)
+			{
+				resv = JsMemberGet(ji, w, "_bytes");
+				if (resv->type == JV_ARR)
+					v = resv;
+			}
+			if (v)
+			{
+				len = v->count;
+				bb = MAlloc(len + 1);
+				for (i = 0; i < len; i++)
+					bb[i] = ToI64(JsToNum(v->items[i])) & 0xFF;
+			}
+			else
+			{
+				s = JsToStr(ji, w);
+				len = StrLen(s);
+				bb = MAlloc(len + 1);
+				for (i = 0; i < len; i++)
+					bb[i] = s[i];
+			}
+			SHA256(bb, len, buf); // 32-byte digest into buf[0..31]
+			Free(bb);
+			v = JsValNew(ji, JV_OBJ); // ArrayBuffer-ish wrapper of the digest bytes
+			w = JsArrV(ji);
+			for (i = 0; i < 32; i++)
+				JsArrPush(ji, w, JsNumV(ji, buf[i] & 0xFF));
+			JsPropSet(ji, v, "_bytes", w);
+			JsPropSet(ji, v, "byteLength", JsNumV(ji, 32));
+			pr = JsPromiseNew(ji);
+			JsPromiseSettle(ji, pr, v, FALSE);
+			return pr;
+		case JSN_PROXY_CTOR: // v1: identity proxy (target passed through; traps not fired)
+			return JsArgOr(ji, args, argc, 0);
+		case JSN_FORMDATA_CTOR:
+			v = JsValNew(ji, JV_OBJ);
+			JsPropSet(ji, v, "_kv",		JsValNew(ji, JV_OBJ));
+			JsPropSet(ji, v, "append",	JsNativeV(ji, JSN_FD_APPEND));
+			JsPropSet(ji, v, "set",		JsNativeV(ji, JSN_FD_APPEND));
+			JsPropSet(ji, v, "get",		JsNativeV(ji, JSN_FD_GET));
+			JsPropSet(ji, v, "has",		JsNativeV(ji, JSN_FD_GET));
+			return v;
+		case JSN_FD_APPEND:
+			w = JsMemberGet(ji, this_val, "_kv");
+			if (w->type == JV_OBJ && argc >= 2)
+				JsPropSet(ji, w, JsToStr(ji, args[0]), args[1]);
+			return JsUndefV(ji);
+		case JSN_FD_GET:
+			w = JsMemberGet(ji, this_val, "_kv");
+			if (w->type == JV_OBJ && argc >= 1)
+				return JsMemberGet(ji, w, JsToStr(ji, args[0]));
+			return JsNullV(ji);
+		case JSN_BLOB_CTOR: // new Blob(parts, opts) - concat string parts
+			v = JsValNew(ji, JV_OBJ);
+			buf[0] = 0;
+			len = 0;
+			w = JsArgOr(ji, args, argc, 0);
+			if (w->type == JV_ARR)
+				for (i = 0; i < w->count; i++)
+				{
+					s = JsToStr(ji, w->items[i]);
+					while (*s && len < 1000)
+						buf[len++] = *s++;
+				}
+			buf[len] = 0;
+			JsPropSet(ji, v, "_text",		JsStrV(ji, buf));
+			JsPropSet(ji, v, "size",		JsNumV(ji, len));
+			JsPropSet(ji, v, "type",		JsStrV(ji, ""));
+			JsPropSet(ji, v, "text",		JsNativeV(ji, JSN_BLOB_TEXT));
+			JsPropSet(ji, v, "arrayBuffer",	JsNativeV(ji, JSN_BLOB_ARRBUF));
+			return v;
+		case JSN_BLOB_TEXT:
+			pr = JsPromiseNew(ji);
+			JsPromiseSettle(ji, pr, JsMemberGet(ji, this_val, "_text"), FALSE);
+			return pr;
+		case JSN_BLOB_ARRBUF:
+			s = JsToStr(ji, JsMemberGet(ji, this_val, "_text"));
+			v = JsValNew(ji, JV_OBJ);
+			w = JsArrV(ji);
+			while (*s)
+				JsArrPush(ji, w, JsNumV(ji, *s++ & 0xFF));
+			JsPropSet(ji, v, "_bytes",		w);
+			JsPropSet(ji, v, "byteLength",	JsNumV(ji, w->count));
+			pr = JsPromiseNew(ji);
+			JsPromiseSettle(ji, pr, v, FALSE);
+			return pr;
+		case JSN_HEADERS_CTOR: // new Headers(init) - copy init object's props into _kv
+			v = JsValNew(ji, JV_OBJ);
+			w = JsValNew(ji, JV_OBJ);
+			resv = JsArgOr(ji, args, argc, 0);
+			if (resv->type == JV_OBJ)
+			{
+				prp = resv->props;
+				while (prp)
+				{
+					JsPropSet(ji, w, prp->name, (prp->val)(CJsVal *));
+					prp = prp->next;
+				}
+			}
+			JsPropSet(ji, v, "_kv",		w);
+			JsPropSet(ji, v, "get",		JsNativeV(ji, JSN_HDR_GET));
+			JsPropSet(ji, v, "set",		JsNativeV(ji, JSN_HDR_SET));
+			JsPropSet(ji, v, "append",	JsNativeV(ji, JSN_HDR_SET));
+			JsPropSet(ji, v, "has",		JsNativeV(ji, JSN_HDR_HAS));
+			return v;
+		case JSN_HDR_GET:
+			w = JsMemberGet(ji, this_val, "_kv");
+			if (w->type == JV_OBJ && argc >= 1)
+			{
+				v = JsMemberGet(ji, w, JsToStr(ji, args[0]));
+				if (v->type != JV_UNDEF)
+					return v;
+			}
+			return JsNullV(ji);
+		case JSN_HDR_SET:
+			w = JsMemberGet(ji, this_val, "_kv");
+			if (w->type == JV_OBJ && argc >= 2)
+				JsPropSet(ji, w, JsToStr(ji, args[0]), args[1]);
+			return JsUndefV(ji);
+		case JSN_HDR_HAS:
+			w = JsMemberGet(ji, this_val, "_kv");
+			if (w->type == JV_OBJ && argc >= 1)
+				return JsBoolV(ji,
+					JsMemberGet(ji, w, JsToStr(ji, args[0]))->type != JV_UNDEF);
+			return JsBoolV(ji, FALSE);
+		case JSN_REQUEST_CTOR: // new Request(url, opts)
+			v = JsValNew(ji, JV_OBJ);
+			JsPropSet(ji, v, "url",
+				JsStrV(ji, JsToStr(ji, JsArgOr(ji, args, argc, 0))));
+			resv = JsStrV(ji, "GET");
+			w = JsArgOr(ji, args, argc, 1);
+			if (w->type == JV_OBJ)
+			{
+				rej = JsMemberGet(ji, w, "method");
+				if (rej->type == JV_STR)
+					resv = rej;
+			}
+			JsPropSet(ji, v, "method",	resv);
+			JsPropSet(ji, v, "headers",
+				JsCallNative(ji, NULL, JSN_HEADERS_CTOR, NULL, NULL, 0));
+			return v;
+		case JSN_RESPONSE_CTOR: // new Response(body, opts)
+			v = JsValNew(ji, JV_OBJ);
+			JsPropSet(ji, v, "_body",		JsArgOr(ji, args, argc, 0));
+			JsPropSet(ji, v, "ok",			JsBoolV(ji, TRUE));
+			JsPropSet(ji, v, "status",		JsNumV(ji, 200));
+			JsPropSet(ji, v, "statusText",	JsStrV(ji, "OK"));
+			JsPropSet(ji, v, "headers",
+				JsCallNative(ji, NULL, JSN_HEADERS_CTOR, NULL, NULL, 0));
+			JsPropSet(ji, v, "json",		JsNativeV(ji, JSN_RESP_JSON));
+			JsPropSet(ji, v, "text",		JsNativeV(ji, JSN_RESP_TEXT));
+			w = JsArgOr(ji, args, argc, 1);
+			if (w->type == JV_OBJ)
+			{
+				resv = JsMemberGet(ji, w, "status");
+				if (resv->type == JV_NUM)
+				{
+					JsPropSet(ji, v, "status", resv);
+					JsPropSet(ji, v, "ok",
+						JsBoolV(ji, resv->num >= 200 && resv->num < 300));
+				}
+			}
+			return v;
 	}
 
 	JsErr(ji, "unknown native");
@@ -6385,7 +7785,7 @@ U0 JsGlobalNative(CJsInterp *ji, U8 *name, I64 id)
 CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 {
 	CJsInterp *ji = CAlloc(sizeof(CJsInterp));
-	CJsVal	  *math, *console_obj, *date;
+	CJsVal	  *math, *console_obj, *date, *uad, *brand, *scr, *subtle;
 
 	ji->dom_root = dom_root;
 	ji->genv = JsAlloc(ji, sizeof(CJsEnv))(CJsEnv *);
@@ -6462,6 +7862,51 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsGlobalNative(ji, "cancelAnimationFrame",	JSN_CLEARTIMER);
 	JsGlobalNative(ji, "queueMicrotask",		JSN_SETTIMEOUT);
 	JsGlobalNative(ji, "Audio",					JSN_AUDIO_CTOR);
+	JsGlobalNative(ji, "Image",					JSN_IMAGE_CTOR);
+	JsGlobalNative(ji, "structuredClone",		JSN_STRUCT_CLONE);
+	JsGlobalNative(ji, "URLSearchParams",		JSN_USP_CTOR);
+
+	JsGlobalNative(ji, "TextEncoder",			JSN_TEXTENC_CTOR);
+	JsGlobalNative(ji, "TextDecoder",			JSN_TEXTDEC_CTOR);
+
+	JsGlobalNative(ji, "ArrayBuffer",			JSN_ARRAYBUFFER_CTOR);
+	JsGlobalNative(ji, "Uint8Array",			JSN_U8ARR_CTOR);
+	JsGlobalNative(ji, "Int8Array",				JSN_I8ARR_CTOR);
+	JsGlobalNative(ji, "Uint8ClampedArray",		JSN_U8C_CTOR);
+	JsGlobalNative(ji, "Uint16Array",			JSN_U16ARR_CTOR);
+	JsGlobalNative(ji, "Int16Array",			JSN_I16ARR_CTOR);
+	JsGlobalNative(ji, "Uint32Array",			JSN_U32ARR_CTOR);
+	JsGlobalNative(ji, "Int32Array",			JSN_I32ARR_CTOR);
+	JsGlobalNative(ji, "Float32Array",			JSN_F32ARR_CTOR);
+	JsGlobalNative(ji, "Float64Array",			JSN_F64ARR_CTOR);
+	JsGlobalNative(ji, "DataView",				JSN_DATAVIEW_CTOR);
+	JsGlobalNative(ji, "Proxy",					JSN_PROXY_CTOR);
+	JsGlobalNative(ji, "FormData",				JSN_FORMDATA_CTOR);
+	JsGlobalNative(ji, "Blob",					JSN_BLOB_CTOR);
+	JsGlobalNative(ji, "Headers",				JSN_HEADERS_CTOR);
+	JsGlobalNative(ji, "Request",				JSN_REQUEST_CTOR);
+	JsGlobalNative(ji, "Response",				JSN_RESPONSE_CTOR);
+
+	math = JsValNew(ji, JV_OBJ); // crypto (real OS-seeded randomness, not crypto-grade)
+	JsPropSet(ji, math, "getRandomValues", JsNativeV(ji, JSN_CRYPTO_RANDVALS));
+	JsPropSet(ji, math, "randomUUID",	   JsNativeV(ji, JSN_CRYPTO_UUID));
+	subtle = JsValNew(ji, JV_OBJ); // crypto.subtle.digest reuses the real SHA-256 core
+	JsPropSet(ji, subtle, "digest", JsNativeV(ji, JSN_SUBTLE_DIGEST));
+	JsPropSet(ji, math, "subtle", subtle);
+	JsEnvDeclare(ji, ji->genv, "crypto", math);
+
+	math = JsValNew(ji, JV_OBJ); // Reflect (maps onto existing property/call semantics)
+	JsPropSet(ji, math, "get",		   JsNativeV(ji, JSN_REFLECT_GET));
+	JsPropSet(ji, math, "set",		   JsNativeV(ji, JSN_REFLECT_SET));
+	JsPropSet(ji, math, "has",		   JsNativeV(ji, JSN_REFLECT_HAS));
+	JsPropSet(ji, math, "deleteProperty", JsNativeV(ji, JSN_REFLECT_DELETE));
+	JsPropSet(ji, math, "ownKeys",	   JsNativeV(ji, JSN_OBJ_KEYS));
+	JsPropSet(ji, math, "getPrototypeOf", JsNativeV(ji, JSN_OBJ_GETPROTO));
+	JsPropSet(ji, math, "setPrototypeOf", JsNativeV(ji, JSN_OBJ_SETPROTO));
+	JsPropSet(ji, math, "defineProperty", JsNativeV(ji, JSN_OBJ_DEFINEPROP));
+	JsPropSet(ji, math, "apply",	   JsNativeV(ji, JSN_REFLECT_APPLY));
+	JsPropSet(ji, math, "construct",   JsNativeV(ji, JSN_REFLECT_CONSTRUCT));
+	JsEnvDeclare(ji, ji->genv, "Reflect", math);
 
 	math = JsValNew(ji, JV_OBJ); // history: no real session stack, calls are no-ops
 	JsPropSet(ji, math, "pushState",	JsNativeV(ji, JSN_NOOP_UNDEF));
@@ -6486,7 +7931,41 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsPropSet(ji, math, "doNotTrack",	JsNullV(ji));
 	JsPropSet(ji, math, "maxTouchPoints", JsNumV(ji, 0));
 	JsPropSet(ji, math, "hardwareConcurrency", JsNumV(ji, 4));
+	JsPropSet(ji, math, "webdriver",	JsBoolV(ji, FALSE)); // not automation
+	JsPropSet(ji, math, "deviceMemory",	JsNumV(ji, 8));
+	JsPropSet(ji, math, "pdfViewerEnabled", JsBoolV(ji, TRUE));
+	JsPropSet(ji, math, "javaEnabled",	JsNativeV(ji, JSN_NOOP_FALSE));
+	date = JsArrV(ji); // navigator.languages
+	JsArrPush(ji, date, JsStrV(ji, "en-US"));
+	JsArrPush(ji, date, JsStrV(ji, "en"));
+	JsPropSet(ji, math, "languages", date);
+	// navigator.userAgentData: UA Client Hints JS surface, matches the HTTP hints
+	uad	  = JsValNew(ji, JV_OBJ);
+	JsPropSet(ji, uad, "mobile",   JsBoolV(ji, FALSE));
+	JsPropSet(ji, uad, "platform", JsStrV(ji, "Linux"));
+	date = JsArrV(ji); // brands list
+	brand = JsValNew(ji, JV_OBJ);
+	JsPropSet(ji, brand, "brand", JsStrV(ji, "Chromium"));
+	JsPropSet(ji, brand, "version", JsStrV(ji, "126"));
+	JsArrPush(ji, date, brand);
+	brand = JsValNew(ji, JV_OBJ);
+	JsPropSet(ji, brand, "brand", JsStrV(ji, "Google Chrome"));
+	JsPropSet(ji, brand, "version", JsStrV(ji, "126"));
+	JsArrPush(ji, date, brand);
+	JsPropSet(ji, uad, "brands", date);
+	JsPropSet(ji, uad, "getHighEntropyValues", JsNativeV(ji, JSN_UAD_ENTROPY));
+	JsPropSet(ji, math, "userAgentData", uad);
 	JsEnvDeclare(ji, ji->genv, "navigator", math);
+
+	scr = JsValNew(ji, JV_OBJ); // window.screen
+	JsPropSet(ji, scr, "width",		 JsNumV(ji, 1920));
+	JsPropSet(ji, scr, "height",	 JsNumV(ji, 1080));
+	JsPropSet(ji, scr, "availWidth",  JsNumV(ji, 1920));
+	JsPropSet(ji, scr, "availHeight", JsNumV(ji, 1040));
+	JsPropSet(ji, scr, "colorDepth",  JsNumV(ji, 24));
+	JsPropSet(ji, scr, "pixelDepth",  JsNumV(ji, 24));
+	JsEnvDeclare(ji, ji->genv, "screen", scr);
+	JsEnvDeclare(ji, ji->genv, "devicePixelRatio", JsNumV(ji, 1));
 
 	math = JsValNew(ji, JV_OBJ); // reuse the local for the JSON namespace
 	JsPropSet(ji, math, "parse",	 JsNativeV(ji, JSN_JSON_PARSE));

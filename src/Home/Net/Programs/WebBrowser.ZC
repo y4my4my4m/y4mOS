@@ -104,16 +104,40 @@ U8 *zinc_testpage =
 
 // Minimal document.write probes to isolate WHERE values corrupt: a bare string
 // literal, a two-string concat, and a bare number. Expected: "hi ab 42".
-// Quick JS sanity page: string/number coercion, array, function, ternary.
+// Modern-JS torture page: each numbered token localizes a parse gap. Targets
+// the vercel bundle's shapes (nested ternary, regex-in-context, optchain, arrow).
 U8 *zinc_hipage =
-	"<html><body><h1>JS sanity</h1><script>"
-	"document.write('<p>concat: ' + 'A' + 'B' + '</p>');"
-	"document.write('<p>num: ' + (2+2) + ' ' + 1.5 + '</p>');"
-	"var a=[1,2,3];a.push(4);document.write('<p>arr: ' + a.join('-') + '</p>');"
-	"function add(x,y){ return x+y; }"
-	"document.write('<p>fn: ' + add(2,3) + ' cond: ' + (1<2?'ok':'bad') + '</p>');"
+	"<html><body><h1>JS torture</h1><script>"
+	"var s={sleeping:1,fatigue:5,weather:'fog'};"
+	"document.write('1:'+(s.sleeping?s.fatigue?90:45:0)+' ');"
+	"document.write('2:'+(s.weather==='fog'?6:0)+' ');"
+	"document.write('3:'+('a@b'.match(/@/)?'m':'n')+' ');"
+	"document.write('4:'+('a<b'.match(/</)?'m':'n')+' ');"
+	"document.write('5:'+('x  y'.replace(/ +/g,'_'))+' ');"
+	"document.write('6:'+(s.missing?.prop??'def')+' ');"
+	"var f=s.sleeping?function(){return 'A'}:function(){return 'B'};"
+	"document.write('7:'+f()+' ');"
+	"var g=(a,b)=>a+b;document.write('8:'+g(2,3)+' ');"
+	"document.write('9:'+(1<2?3>1?'yy':'yn':'n')+' ');"
 	"</script>"
-	"<p>expected: AB / 4 1.5 / 1-2-3-4 / 5 ok</p>"
+	"<p>expected: 1:45 2:6 3:m 4:m 5:x_y 6:def 7:A 8:5 9:yy</p>"
+	"<h1>API batch</h1><script>"
+	"document.write('10:'+(new Uint8Array([1,2,3]).length)+' ');"
+	"document.write('11:'+([1,2,3].some(x=>x>2)?'T':'F')+' ');"
+	"document.write('12:'+([1,2,3].at(-1))+' ');"
+	"var q=[1,2,3,4];q.splice(1,2);document.write('13:'+q.join('')+' ');"
+	"var u=new Uint8Array(3);u.set([9,8],1);document.write('14:'+u.join('')+' ');"
+	"var d=new DataView(new ArrayBuffer(4));d.setUint16(0,258);"
+	"document.write('15:'+d.getUint16(0)+' ');"
+	"document.write('16:'+(new Headers({a:'1'}).get('a'))+' ');"
+	"document.write('17:'+([1,[2,3]].flat().join(''))+' ');"
+	"document.write('18:'+('2024-01'.match(/([0-9]+)-([0-9]+)/)[2])+' ');"
+	"document.write('19:'+(/([a-z])([0-9])/.exec('a1')[1])+' ');"
+	"document.write('20:'+('a1b2'.replace(/([a-z])([0-9])/g,"
+	"function(m,p1,p2){return p2+p1}))+' ');"
+	"</script>"
+	"<p>expected: 10:3 11:T 12:3 13:14 14:098 15:258 16:1 17:123</p>"
+	"<p>expected: 18:01 19:a 20:1a2b</p>"
 	"<p><a href=\"zinc:welcome\">back to welcome</a></p>"
 	"</body></html>";
 
