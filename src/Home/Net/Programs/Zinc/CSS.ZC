@@ -97,6 +97,9 @@ class CZCssRule
 	I8		anc_comb;		// 0 descendant, 1 child '>', 2 adjacent '+', 3 general '~'
 	U8		sel_attr[24];	// [attr] / [attr=val] selector part; "" = none
 	U8		sel_attr_val[32];
+	U8		root_class[32];	// leading body.X / html.X scope; "" = none. Matches
+							// only when the page's <body> carries class X (100r
+							// scopes per-page styles via body.page_projects etc).
 	I8		pseudo;			// 0 none, 1 :first-child, 2 :last-child,
 							// 3 :nth-child(odd), 4 :nth-child(even)
 	I64		spec;
@@ -329,6 +332,9 @@ public Bool zcss_has_gen = FALSE;  // any ::before/::after rule present
 // Drives prefers-color-scheme exactly like a real browser: a dark system
 // applies the site's dark blocks and skips its light overrides, and v.v.
 public Bool zcss_pref_dark = TRUE;
+// The current page's <body> class list (space-separated). Set by GxLayout each
+// relayout so body.page_X-scoped rules can check it. "" = none.
+public U8 zcss_body_class[256];
 I64			zcss_bgimg_count = 0; // reset per page; JIT zeroes nothing
 
 /* ---- linear-gradient backgrounds (storage) ----
@@ -969,6 +975,19 @@ zcss_fn_done:;
 
 	rule = &zcss_rules[zcss_rule_count];
 	ZCssSimpleParse(cur_s, cur_e, rule->sel_tag, rule->sel_class, rule->sel_id);
+	rule->root_class[0] = 0;
+	q = sel; // leading body.CLASS / html.CLASS = page-scope: record the class so
+	while (*q == ' ' || *q == '\t')  // ZCssRuleMatch can gate on the <body> class
+		q++;
+	if (!StrNCompare(q, "body.", 5) || !StrNCompare(q, "html.", 5))
+	{
+		q += 5;
+		an = 0;
+		while (*q && *q != ' ' && *q != '\t' && *q != '.' && *q != '#' &&
+			   *q != '>' && *q != '+' && *q != '~' && an < 31)
+			rule->root_class[an++] = *q++;
+		rule->root_class[an] = 0;
+	}
 	rule->has_anc	= FALSE;
 	rule->anc_child = FALSE;
 	rule->anc_comb	= 0;
@@ -1205,6 +1224,9 @@ Bool ZCssRuleMatch(CZCssRule *rule, CZNode *node)
 
 	if (rule->pseudo >= 5)
 		return FALSE; // ::before/::after style generated content, not the element
+	if (rule->root_class[0] &&
+		!ZCssClassListHas(zcss_body_class, rule->root_class))
+		return FALSE; // body.page_X-scoped rule, but this page isn't page_X
 	if (!ZCssSimpleMatch(rule->sel_tag, rule->sel_class, rule->sel_id, node))
 		return FALSE;
 	if (rule->sel_attr[0])

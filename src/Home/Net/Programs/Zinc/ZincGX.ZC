@@ -1645,8 +1645,18 @@ U0 GxPageStyle()
 			gx.page_fg = a.fg;
 	}
 	el = GxFindTag(zinc_dom, "body");
+	zcss_body_class[0] = 0; // capture the <body> class for body.page_X-scoped CSS
 	if (el)
 	{
+		attr = ZNodeAttr(el, "class");
+		if (attr)
+		{
+			c = StrLen(attr);
+			if (c > 255)
+				c = 255;
+			MemCopy(zcss_body_class, attr, c);
+			zcss_body_class[c] = 0; // c is reassigned before its next use below
+		}
 		ZCssApply(el, &a);
 		if (a.bg >= 0)
 			gx.page_bg = a.bg;
@@ -2574,6 +2584,12 @@ gx_draw_next:;
 	}
 
 	gx.hover_href = hover;
+	// TODO(cursor): we know the hover context here (hover != NULL over a link,
+	// over a text run = I-beam, else arrow) but ZealOS draws ONE system pointer
+	// sprite in the kernel compositor with no per-task/per-context API. Switching
+	// pointer/I-beam/arrow needs a kernel-side hook that takes a requested cursor
+	// shape from the focused task (e.g. a `sys_cursor_shape` global the compositor
+	// reads) - a kernel change, not a Zinc-local one. Left for that pass.
 	GxDrawChrome(dc);
 }
 
@@ -3102,6 +3118,12 @@ U0 GxClickContent(I64 x, I64 y)
 		op = &gx.ops[i];
 		if (!(op->x <= x < op->x + op->w && op->y <= cy < op->y + op->h))
 			goto gx_click_next;
+		if (op->node && !StrCompare(op->node->tag, "details"))
+		{ // click the summary toggles the <details> open/closed
+			op->node->checked = !op->node->checked;
+			gx.relayout = TRUE;
+			return;
+		}
 		if ((op->type == GXO_TEXT || op->type == GXO_IMG) && op->href)
 		{ // a linked image (<a><img></a>, e.g. 100r's rabbit nav) navigates too
 			GxNavTo(ZincResolveLink(op->href));

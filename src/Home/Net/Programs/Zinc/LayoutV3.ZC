@@ -28,6 +28,7 @@ public U0 Layout3(Bool on)
 U0 V3Measure(CZNode *node, CZStyle *inh, I64 avail, I64 *w_out, I64 *h_out)
 { // lay node into a scratch window avail wide; report content w/h; roll back
 	CL2State sv;
+	CZStyle	 mi;
 	I64		 i, x0, y0, maxx;
 
 	*w_out = 0;
@@ -51,7 +52,13 @@ U0 V3Measure(CZNode *node, CZStyle *inh, I64 avail, I64 *w_out, I64 *h_out)
 	y0 = gx.y;
 	gx.wrap_w = x0 + avail;
 
-	V3Node(node, inh);
+	// measure LEFT-aligned: text-align:center/right would otherwise push ops to
+	// the middle/right of `avail`, so the measured "content width" came back as
+	// ~half the container instead of the intrinsic width. That made centered
+	// flex items (100r's .nav_link) measure ~2x too wide -> 1 per row.
+	MemCopy(&mi, inh, sizeof(CZStyle));
+	mi.align = 0;
+	V3Node(node, &mi);
 	GxRunFlush;
 
 	maxx = x0;
@@ -1686,11 +1693,11 @@ U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
 U0 V3Node(CZNode *node, CZStyle *inh)
 {
 	CZStyle	 style, author, kid;
-	CZNode	*child;
+	CZNode	*child, *sm;
 	CGxOp	*op;
 	U8		*gen, *attr, *type;
-	I64		 i, ax, ay, aw, sv_x, sv_y, sv_ind, sv_wrap;
-	Bool	 blockish;
+	I64		 i, ax, ay, aw, sv_x, sv_y, sv_ind, sv_wrap, togi, sy0;
+	Bool	 blockish, dopen;
 
 	if (!node || gx.op_count >= GX_OPS_MAX - 8)
 		return;
@@ -1806,14 +1813,70 @@ U0 V3Node(CZNode *node, CZStyle *inh)
 		gx.wrap_w = sv_wrap;
 		goto v3_after;
 	}
-	if (!StrCompare(node->tag, "svg"))
-	{
-		V3Svg(node, &style);
+	if (!StrCompare(node->tag, "svg") || !StrCompare(node->tag, "img"))
+	{ // display:block image/svg gets its OWN line (100r's nav stacks a rabbit
+	  // ABOVE its text label; both are `nav a img{display:block}`, so without
+	  // this they flowed side by side -> items twice as wide, 2 per row).
+		if (author.display == ZCSS_DISP_BLOCK)
+		{
+			GxRunFlush;
+			if (gx.x > GX_MARGIN + gx.indent)
+				GxNewline(0);
+		}
+		if (!StrCompare(node->tag, "img"))
+			V3Img(node, &style);
+		else
+			V3Svg(node, &style);
+		if (author.display == ZCSS_DISP_BLOCK)
+		{
+			GxRunFlush;
+			GxNewline(0);
+		}
 		goto v3_after;
 	}
-	if (!StrCompare(node->tag, "img"))
-	{
-		V3Img(node, &style);
+	if (!StrCompare(node->tag, "details"))
+	{ // <details>: render the <summary> (styled + clickable), and the rest only
+	  // when open. State lives in node->checked; a transparent click-box over the
+	  // summary toggles it (GxClickContent). <details open> starts expanded.
+		dopen = node->checked;
+		if (ZNodeAttr(node, "open"))
+			dopen = TRUE;
+		GxRunFlush;
+		if (gx.x > GX_MARGIN + gx.indent)
+			GxNewline(0);
+		sy0 = gx.y;
+		op = GxOpAdd(GXO_BOX, GX_MARGIN + gx.indent - 3, sy0 - 2,
+					 gx.wrap_w - (GX_MARGIN + gx.indent - 3), 8);
+		togi = -1;
+		if (op)
+		{ // invisible (no bg/border) click target carrying the details node
+			togi = gx.op_count - 1;
+			op->node = node;
+		}
+		MemCopy(&kid, &style, sizeof(CZStyle));
+		ZStyleStripBox(&kid);
+		sm = node->first_child;
+		while (sm && !(sm->type == ZH_ELEM && !StrCompare(sm->tag, "summary")))
+			sm = sm->next;
+		if (sm)
+			V3Node(sm, &kid);
+		else
+			GxText("Details", &style, 1, FALSE);
+		GxRunFlush;
+		if (gx.x > GX_MARGIN + gx.indent)
+			GxNewline(0);
+		if (togi >= 0)
+			gx.ops[togi].h = MaxI64(8, gx.y - sy0);
+		if (dopen)
+		{
+			child = node->first_child;
+			while (child)
+			{
+				if (!(child->type == ZH_ELEM && !StrCompare(child->tag, "summary")))
+					V3Node(child, &kid);
+				child = child->next;
+			}
+		}
 		goto v3_after;
 	}
 	if (!StrCompare(node->tag, "input"))
