@@ -1660,18 +1660,16 @@ U0 GxPageStyle()
 			//bgcolor pages paint the page that way).
 			gx.page_bg = GxBgProbe(el, 0);
 	}
-	gx.page_has_bg = gx.page_bg >= 0;
-	if (gx.page_has_bg)
-	{
-		if (gx.page_fg >= 0)
-			gx.text_pen = GxPenBg(gx.page_fg, de_theme.text);
-		else
-			gx.text_pen = ColorRGB(0, 0, 0); //CSS default: black text.
-	}
-	else if (gx.page_fg >= 0)
-		gx.text_pen = GxPen(gx.page_fg, de_theme.text);
+	// UA default: white page + black text (like every real browser). Pages that
+	// WANT dark set their own body bg (the vercel game etc, still honored). The
+	// old dark de_theme fallback made every plain/undetected-bg site look broken.
+	if (gx.page_bg < 0)
+		gx.page_bg = 0xFFFFFF;
+	gx.page_has_bg = TRUE;
+	if (gx.page_fg >= 0)
+		gx.text_pen = GxPenBg(gx.page_fg, ColorRGB(0, 0, 0));
 	else
-		gx.text_pen = de_theme.text;
+		gx.text_pen = ColorRGB(0, 0, 0);
 }
 
 //Layout v2: box-model engine (flex, position, 4-side box) built on the v1

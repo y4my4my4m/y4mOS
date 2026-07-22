@@ -688,15 +688,274 @@ I64 ZCssGridCols(U8 *val)
 				p++;
 		}
 		else
-		{
+		{ // one track token; a function value (minmax(0, 1fr), clamp(),
+		  // fit-content()) is ONE track even with internal spaces/commas
 			count++;
-			while (*p && *p != ' ' && *p != '\t')
+			d = 0;
+			while (*p && (d > 0 || (*p != ' ' && *p != '\t')))
+			{
+				if (*p == '(')
+					d++;
+				else if (*p == ')')
+					d--;
 				p++;
+			}
 		}
 	}
 	if (count > 12)
 		count = 12;
 	return count;
+}
+
+U0 ZCssGridTrackKind(U8 *tok, U8 *tok_end, I64 *px, I64 *fr)
+{ // classify ONE column track -> fixed px (*px>0) OR flexible fr weight (*fr>0)
+	U8	*p = tok, *b;
+	I64	 d, v;
+
+	*px = 0;
+	*fr = 0;
+	while (p < tok_end && (*p == ' ' || *p == '\t'))
+		p++;
+	if (!StrNICompare(p, "minmax(", 7))
+	{ // size by the MAX (2nd) argument: minmax(0, 1fr) -> 1fr; minmax(120px,..)->px
+		b = p + 7;
+		d = 1;
+		while (b < tok_end && d)
+		{
+			if (*b == '(')
+				d++;
+			else if (*b == ')')
+				d--;
+			else if (*b == ',' && d == 1)
+			{
+				b++;
+				break;
+			}
+			b++;
+		}
+		while (b < tok_end && (*b == ' ' || *b == '\t'))
+			b++;
+		p = b; // classify the max part
+	}
+	if (!StrNICompare(p, "fit-content", 11) || !StrNICompare(p, "min-content", 11) ||
+		!StrNICompare(p, "max-content", 11) || !StrNICompare(p, "auto", 4))
+	{ // content-sized tracks: treat as a light flexible track
+		*fr = 1;
+		return;
+	}
+	if ('0' <= *p <= '9' || *p == '.')
+	{
+		v = Str2I64(p);
+		b = p;
+		while (b < tok_end && ('0' <= *b <= '9' || *b == '.'))
+			b++;
+		if (b < tok_end && (*b == 'f' || *b == 'F') &&
+			b + 1 < tok_end && (b[1] == 'r' || b[1] == 'R'))
+		{ // Nfr
+			*fr = MaxI64(1, v);
+			return;
+		}
+		*px = ZCssPx(p); // px/rem/em/vw... ; % degrades to a small fixed guess
+		if (*px < 0)
+			*px = 0;
+		if (!*px)
+			*fr = 1; // unresolved length: fall back to flexible
+		return;
+	}
+	*fr = 1; // unknown keyword -> flexible
+}
+
+I64 ZCssGridParse(U8 *val, I64 g)
+{ // fill track-table row g from grid-template-columns / grid-template. For the
+  // shorthand "<rows> / <cols>", only the part after the top-level '/' is columns.
+	U8	*p, *slash, *tok, *tok_end, *q;
+	I64	 n = 0, rep, i, px, fr, d;
+
+	slash = NULL;
+	p = val;
+	d = 0;
+	while (*p)
+	{
+		if (*p == '(')
+			d++;
+		else if (*p == ')')
+			d--;
+		else if (*p == '/' && d == 0)
+			slash = p;
+		p++;
+	}
+	if (slash)
+		p = slash + 1;
+	else
+		p = val;
+
+	while (*p && n < ZCSS_GRID_TRK)
+	{
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (!*p)
+			break;
+		if (!StrNICompare(p, "repeat(", 7))
+		{
+			q = p + 7;
+			rep = Str2I64(q);
+			if (rep < 1)
+				rep = 1;
+			d = 1;
+			tok = NULL;
+			while (*q && d)
+			{
+				if (*q == '(')
+					d++;
+				else if (*q == ')')
+					d--;
+				else if (*q == ',' && d == 1 && !tok)
+					tok = q + 1;
+				if (d)
+					q++;
+			}
+			tok_end = q;
+			for (i = 0; i < rep && n < ZCSS_GRID_TRK; i++)
+			{
+				if (tok)
+					ZCssGridTrackKind(tok, tok_end, &px, &fr);
+				else
+				{
+					px = 0;
+					fr = 1;
+				}
+				zcss_gtrk_px[g][n] = px;
+				zcss_gtrk_fr[g][n] = fr;
+				n++;
+			}
+			p = q;
+			if (*p == ')')
+				p++;
+		}
+		else
+		{ // one track token; a function value counts once (parens balanced)
+			tok = p;
+			d = 0;
+			while (*p && (d > 0 || (*p != ' ' && *p != '\t')))
+			{
+				if (*p == '(')
+					d++;
+				else if (*p == ')')
+					d--;
+				p++;
+			}
+			tok_end = p;
+			ZCssGridTrackKind(tok, tok_end, &px, &fr);
+			zcss_gtrk_px[g][n] = px;
+			zcss_gtrk_fr[g][n] = fr;
+			n++;
+		}
+	}
+	zcss_gtrk_n[g] = n;
+	return n;
+}
+
+Bool ZCssNameEq(U8 *stored, U8 *tok, I64 len)
+{ // interned name equals the tok[0..len) slice?
+	if (StrLen(stored) != len)
+		return FALSE;
+	return !StrNCompare(stored, tok, len);
+}
+
+U0 ZCssNameCopy(U8 *dst, U8 *tok, I64 len)
+{
+	if (len > 23)
+		len = 23;
+	MemCopy(dst, tok, len);
+	dst[len] = 0;
+}
+
+U0 ZCssGridAreas(U8 *val, I64 g)
+{ // parse grid-template-areas: each quoted string is a row of column cells.
+  // Record each named area's start column + how many columns it spans. '.' = gap.
+	U8	*p = val, *tok;
+	I64	 q, col, a, found, len;
+
+	zcss_gacount[g] = 0;
+	while (*p)
+	{
+		if (*p == '"' || *p == 0x27)
+		{
+			q = *p;
+			p++;
+			col = 0;
+			while (*p && *p != q)
+			{
+				while (*p == ' ' || *p == '\t')
+					p++;
+				if (!*p || *p == q)
+					break;
+				tok = p;
+				while (*p && *p != ' ' && *p != '\t' && *p != q)
+					p++;
+				len = p - tok;
+				if (!(len == 1 && *tok == '.'))
+				{ // a named cell
+					found = -1;
+					for (a = 0; a < zcss_gacount[g]; a++)
+						if (ZCssNameEq(zcss_ganame[g][a], tok, len))
+						{
+							found = a;
+							break;
+						}
+					if (found < 0)
+					{
+						if (zcss_gacount[g] < ZCSS_GAREA_MAX)
+						{
+							found = zcss_gacount[g];
+							ZCssNameCopy(zcss_ganame[g][found], tok, len);
+							zcss_gacol[g][found] = col;
+							zcss_gaspan[g][found] = 1;
+							zcss_gacount[g]++;
+						}
+					}
+					else
+					{ // extend the span to cover this column too
+						if (col < zcss_gacol[g][found])
+						{
+							zcss_gaspan[g][found] += zcss_gacol[g][found] - col;
+							zcss_gacol[g][found] = col;
+						}
+						if (col + 1 - zcss_gacol[g][found] > zcss_gaspan[g][found])
+							zcss_gaspan[g][found] = col + 1 - zcss_gacol[g][found];
+					}
+				}
+				col++;
+			}
+			if (*p == q)
+				p++;
+		}
+		else
+			p++;
+	}
+}
+
+I64 ZCssAreaIntern(U8 *name)
+{ // intern a child's grid-area name (first token only); return index or -1
+	U8	*e = name;
+	I64	 i, len;
+
+	while (*e && *e != ' ' && *e != '\t' && *e != ';' && *e != '/')
+		e++;
+	len = e - name;
+	if (len < 1)
+		return -1;
+	if (len > 23)
+		len = 23;
+	for (i = 0; i < zcss_carea_count; i++)
+		if (ZCssNameEq(zcss_carea[i], name, len))
+			return i;
+	if (zcss_carea_count >= ZCSS_CAREA_MAX)
+		return -1;
+	i = zcss_carea_count;
+	ZCssNameCopy(zcss_carea[i], name, len);
+	zcss_carea_count++;
+	return i;
 }
 
 I64 ZCssGradSide(U8 *tok)

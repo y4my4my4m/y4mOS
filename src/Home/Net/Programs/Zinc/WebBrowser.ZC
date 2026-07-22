@@ -979,9 +979,15 @@ U8 *ZincResolveInput(U8 *s)
 
 U8 *ZincResolveLink(U8 *href)
 { // absolute URL from a page link; MAlloc'ed or NULL
+	U8 buf[576];
 	if (!StrNICompare(href, "http://", 7) || !StrNICompare(href, "https://", 8) ||
 		!StrNICompare(href, "zinc:", 5) || !StrNICompare(href, "data:", 5))
 		return StrNew(href); // data: is self-contained (inline image blobs)
+	if (href[0] == '/' && href[1] == '/')
+	{ // protocol-relative (//en.wikipedia.org/...): inherit the https scheme
+		StrPrint(buf, "https:%s", href);
+		return StrNew(buf);
+	}
 	if (zinc_base_ok)
 		return HttpUrlResolve(&zinc_base, href);
 

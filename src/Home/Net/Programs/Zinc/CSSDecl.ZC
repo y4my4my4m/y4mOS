@@ -537,11 +537,39 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 	}
 	else if (!StrICompare(name, "grid-template-columns") ||
 			 !StrICompare(name, "grid-template"))
-	{ // count the explicit column tracks so grids lay out in the right number
-	  // of columns instead of our width heuristic
-		n = ZCssGridCols(val);
-		if (1 <= n <= 12)
-			out->grid_cols = n;
+	{ // parse the real column tracks (fixed px vs fr) into the side table so the
+	  // layout sizes a 12.25rem sidebar + 1fr content correctly, not equal cols.
+	  // grid-template's "<rows> / <cols>" form: parser reads after the '/'.
+		if (out->grid_idx < 0 && zcss_grid_count < ZCSS_GRID_MAX)
+		{ // one slot per rule; grid-template-areas below reuses it
+			out->grid_idx = zcss_grid_count;
+			zcss_grid_count++;
+			zcss_gtrk_n[out->grid_idx] = 0;
+			zcss_gacount[out->grid_idx] = 0;
+		}
+		if (out->grid_idx >= 0)
+		{
+			n = ZCssGridParse(val, out->grid_idx);
+			if (n >= 1)
+				out->grid_cols = ClampI64(n, 1, 12);
+		}
+	}
+	else if (!StrICompare(name, "grid-template-areas"))
+	{ // named cell map: gives full-width rows (siteNotice/footer span all cols)
+		if (out->grid_idx < 0 && zcss_grid_count < ZCSS_GRID_MAX)
+		{
+			out->grid_idx = zcss_grid_count;
+			zcss_grid_count++;
+			zcss_gtrk_n[out->grid_idx] = 0;
+			zcss_gacount[out->grid_idx] = 0;
+		}
+		if (out->grid_idx >= 0)
+			ZCssGridAreas(val, out->grid_idx);
+	}
+	else if (!StrICompare(name, "grid-area"))
+	{ // child placement by area NAME (numeric line forms are ignored)
+		if (val[0] && !('0' <= val[0] <= '9') && val[0] != '.')
+			out->grid_area_idx = ZCssAreaIntern(val);
 	}
 	else if (!StrICompare(name, "justify-content") ||
 			 !StrICompare(name, "place-content") ||

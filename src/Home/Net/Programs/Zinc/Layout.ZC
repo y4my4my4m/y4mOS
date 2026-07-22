@@ -208,6 +208,8 @@ U0 L2FlexRow(CZNode *node, CZStyle *style, CZStyle *author)
 	CZNode	*child, *rest;
 	I64		 n, i, k, m, row_start, base, avail, gapv, total, extra, gsum;
 	I64		 mw, mh, bw, x, xoff, y0, ymax, save_indent, save_wrap, room, jgap;
+	I64		 g, kt, c, fixsum, frsum, freew, trackw[ZCSS_GRID_TRK];
+	I64		 cs, sp, lastcol, itw, itx, colx[ZCSS_GRID_TRK + 1];
 
 	MemCopy(&kid, style, sizeof(CZStyle));
 	ZStyleStripBox(&kid);
@@ -242,8 +244,96 @@ U0 L2FlexRow(CZNode *node, CZStyle *style, CZStyle *author)
 	if (gapv < 0)
 		gapv = 8;
 
-	if (author->grid_cols > 1)
-	{ // explicit grid: equal fixed columns of grid_cols per row
+	g = author->grid_idx;
+	if (g >= 0 && g < zcss_grid_count && zcss_gtrk_n[g] > 0)
+	{ // real grid tracks: fixed px tracks keep size, fr tracks share the rest.
+	  // Item i lands in column (i % track_count); columns repeat down the rows.
+		kt = zcss_gtrk_n[g];
+		fixsum = 0;
+		frsum = 0;
+		for (c = 0; c < kt; c++)
+		{
+			fixsum += zcss_gtrk_px[g][c];
+			frsum += zcss_gtrk_fr[g][c];
+		}
+		freew = avail - gapv * (kt - 1) - fixsum;
+		if (freew < 0)
+			freew = 0;
+		for (c = 0; c < kt; c++)
+		{
+			if (zcss_gtrk_fr[g][c] > 0 && frsum > 0)
+				trackw[c] = MaxI64(24, freew * zcss_gtrk_fr[g][c] / frsum);
+			else
+				trackw[c] = MaxI64(24, MinI64(zcss_gtrk_px[g][c], avail));
+		}
+		if (zcss_gacount[g] > 0)
+		{ // grid-template-areas: place each child at its named area's columns.
+		  // Rows stack in DOM order; a child starting at/left of the previous
+		  // starts a new row; a full-span area (header/footer) owns its row.
+			colx[0] = base;
+			for (c = 0; c < kt; c++)
+				colx[c + 1] = colx[c] + trackw[c] + gapv;
+			save_indent = gx.indent;
+			save_wrap = gx.wrap_w;
+			y0 = gx.y;
+			ymax = y0;
+			lastcol = -1;
+			for (i = 0; i < n; i++)
+			{
+				ZCssApply(items[i], &ca);
+				cs = 0;
+				sp = 1;
+				if (ca.grid_area_idx >= 0)
+					for (m = 0; m < zcss_gacount[g]; m++)
+						if (!StrCompare(zcss_carea[ca.grid_area_idx],
+										zcss_ganame[g][m]))
+						{
+							cs = zcss_gacol[g][m];
+							sp = zcss_gaspan[g][m];
+							break;
+						}
+				if (cs >= kt)
+					cs = kt - 1;
+				if (cs + sp > kt)
+					sp = kt - cs;
+				if (sp < 1)
+					sp = 1;
+				if (i > 0 && (cs <= lastcol || sp >= kt))
+					y0 = ymax; // wrap to a new grid row
+				itx = colx[cs];
+				itw = colx[cs + sp] - colx[cs] - gapv;
+				if (itw < 24)
+					itw = 24;
+				gx.y = y0;
+				gx.indent = itx - GX_MARGIN;
+				gx.wrap_w = itx + itw;
+				gx.x = GX_MARGIN + gx.indent;
+				gx.line_start_op = gx.op_count;
+				L2Node(items[i], &kid);
+				GxRunFlush;
+				GxLineAlign;
+				if (gx.x > GX_MARGIN + gx.indent)
+					gx.y += gx.line_h;
+				ymax = MaxI64(ymax, gx.y);
+				lastcol = cs;
+			}
+			gx.indent = save_indent;
+			gx.wrap_w = save_wrap;
+			gx.y = ymax;
+			gx.x = GX_MARGIN + gx.indent;
+			gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+			while (rest)
+			{ // children past the item cap: normal stacked flow
+				L2Node(rest, &kid);
+				rest = rest->next;
+			}
+			return;
+		}
+		for (i = 0; i < n; i++)
+			basis[i] = trackw[i % kt];
+	}
+	else if (author->grid_cols > 1)
+	{ // count-only fallback: equal fixed columns of grid_cols per row
 		k = author->grid_cols;
 		if (k > n)
 			k = n;

@@ -30,7 +30,9 @@
 
 #define ZCSS_OFF_UNSET		-9999	// position offset sentinel
 
-#define ZCSS_MAX_RULES		4096	// big framework bundles bring thousands
+#define ZCSS_MAX_RULES		8192	// big framework bundles bring thousands
+									// (Wikipedia's Vector skin alone is >4k rules;
+									// overflowing silently drops late resets/nav CSS)
 
 class CZStyle
 {
@@ -55,6 +57,8 @@ class CZStyle
 	I8	list_none;				// list-style: none
 	I8	flex_col;				// flex-direction: -1 unset, 0 row, 1 column
 	I8	grid_cols;				// grid-template-columns track count; -1 unset
+	I16 grid_idx;				// index into zcss_gtrk_* track table; -1 unset
+	I16 grid_area_idx;			// child grid-area: zcss_carea name index; -1 unset
 	I8	float_side;				// float: 0 none, 1 left, 2 right
 	I8	clear_side;				// clear: 0 none, 1 left, 2 right, 3 both
 	I16 bg_img;					// background-image: zcss_bgimg index; -1 unset
@@ -130,6 +134,8 @@ U0 ZStyleReset(CZStyle *s)
 	s->grow = -1;
 	s->pos = -1;
 	s->grid_cols = -1;	// was missing: merge reads it, so garbage leaked in
+	s->grid_idx = -1;
+	s->grid_area_idx = -1;
 	s->float_side = 0;
 	s->clear_side = 0;
 	s->bg_img = -1;
@@ -179,6 +185,8 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	if (src->list_none >= 0) dst->list_none = src->list_none;
 	if (src->flex_col  >= 0) dst->flex_col	= src->flex_col;
 	if (src->grid_cols >= 0) dst->grid_cols = src->grid_cols;
+	if (src->grid_idx  >= 0) dst->grid_idx	= src->grid_idx;
+	if (src->grid_area_idx >= 0) dst->grid_area_idx = src->grid_area_idx;
 	if (src->float_side)	 dst->float_side = src->float_side;
 	if (src->clear_side)	 dst->clear_side = src->clear_side;
 	if (src->mr		   >= 0) dst->mr		= src->mr;
@@ -246,6 +254,8 @@ U0 ZStyleStripBox(CZStyle *s)
 	s->grow = -1;
 	s->pos = -1;
 	s->grid_cols = -1;
+	s->grid_idx = -1;
+	s->grid_area_idx = -1;
 	s->float_side = 0;
 	s->clear_side = 0;
 	s->bg_img = -1;		// a background image never inherits
@@ -302,6 +312,10 @@ public U8	zcss_bgimg[ZCSS_BGIMG_MAX][192];
 public U8  zcss_content[ZCSS_CONTENT_MAX][48];
 public I64 zcss_content_count = 0; // reset per page
 public Bool zcss_has_gen = FALSE;  // any ::before/::after rule present
+// System theme, detected from the ZealOS palette (dark desktop -> dark).
+// Drives prefers-color-scheme exactly like a real browser: a dark system
+// applies the site's dark blocks and skips its light overrides, and v.v.
+public Bool zcss_pref_dark = TRUE;
 I64			zcss_bgimg_count = 0; // reset per page; JIT zeroes nothing
 
 /* ---- linear-gradient backgrounds (storage) ----
@@ -321,6 +335,31 @@ public class CZGrad
 
 public CZGrad	zcss_grad[ZCSS_GRAD_MAX];
 public I64		zcss_grad_count = 0; // reset per page; JIT zeroes nothing
+
+/* Grid column tracks: parsed grid-template-columns / grid-template. Each track
+   is either a fixed pixel width (zcss_gtrk_px[g][i] > 0) OR a flexible fr track
+   (zcss_gtrk_fr[g][i] > 0 = its fr weight). A CZStyle.grid_idx points at a row.
+   Fixed tracks keep their px; fr tracks share the leftover space by weight -
+   real 12.25rem-sidebar + 1fr-content sizing, not equal columns. */
+#define ZCSS_GRID_MAX	96
+#define ZCSS_GRID_TRK	12
+public I64	zcss_gtrk_px[ZCSS_GRID_MAX][ZCSS_GRID_TRK];
+public I64	zcss_gtrk_fr[ZCSS_GRID_MAX][ZCSS_GRID_TRK];
+public I64	zcss_gtrk_n[ZCSS_GRID_MAX];
+public I64	zcss_grid_count = 0; // reset per page
+
+/* grid-template-areas: per grid, each named area's column start + span (rows
+   flow naturally, so only column placement is tracked). A child's grid-area
+   name is interned in zcss_carea; its CZStyle.grid_area_idx points at it and
+   layout matches the name against the container grid's area table. */
+#define ZCSS_GAREA_MAX	10		// distinct named areas per grid
+#define ZCSS_CAREA_MAX	128		// interned child grid-area names, page-wide
+public U8	zcss_ganame[ZCSS_GRID_MAX][ZCSS_GAREA_MAX][24];
+public I64	zcss_gacol[ZCSS_GRID_MAX][ZCSS_GAREA_MAX];  // start column
+public I64	zcss_gaspan[ZCSS_GRID_MAX][ZCSS_GAREA_MAX]; // column span
+public I64	zcss_gacount[ZCSS_GRID_MAX];                // areas in this grid
+public U8	zcss_carea[ZCSS_CAREA_MAX][24];             // child grid-area names
+public I64	zcss_carea_count = 0;
 
 I64 ZCssBgImgAdd(U8 *url)
 { // intern a background-image URL; -1 if full/unusable
@@ -492,6 +531,12 @@ U0 ZCssReset()
 	zcss_grad_count = 0;
 	zcss_content_count = 0;
 	zcss_has_gen = FALSE;
+	zcss_grid_count = 0;
+	zcss_carea_count = 0;
+	// system theme from the desktop background luminance (dark palette -> dark).
+	zcss_pref_dark = (((de_theme.win_bg >> 16 & 0xFF) * 3 +
+					   (de_theme.win_bg >> 8 & 0xFF) * 6 +
+					   (de_theme.win_bg & 0xFF)) / 10) < 110;
 	zcss_rem_px = 16; // page may rebase via html{font-size:%}
 	zh_dom_gen++; // stylesheet set changed: invalidate memoized styles
 }
@@ -991,11 +1036,13 @@ U0 ZCssParseRegion(U8 *p, U8 *end)
 				{
 					if (!StrNICompare(scan, "print", 5))
 						is_print = TRUE;
-					if (!StrNICompare(scan, "dark", 4))
-						is_print = TRUE; // prefers-color-scheme: dark - we render
-										 // LIGHT (browser default, matches Chrome),
-										 // so SKIP the dark block. Entering it applied
-										 // Wikipedia's dark vars -> black page.
+					// prefers-color-scheme: honor the detected system theme.
+					// Dark system -> apply dark blocks, skip light blocks.
+					// Light system -> the reverse. Same as any real browser.
+					if (!StrNICompare(scan, "dark", 4) && !zcss_pref_dark)
+						is_print = TRUE;
+					if (!StrNICompare(scan, "light", 5) && zcss_pref_dark)
+						is_print = TRUE;
 					if (!StrNICompare(scan, "min-width", 9))
 						mq_min = ZCssMediaWidth(scan + 9, at_e);
 					if (!StrNICompare(scan, "max-width", 9))
