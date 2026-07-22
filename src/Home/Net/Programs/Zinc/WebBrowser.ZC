@@ -576,6 +576,13 @@ U0 ZincLoad(U8 *url)
 	if (!is_html && response->body[0] == '<')
 		is_html = TRUE; // servers lie
 
+	// Resolve relative links/images against the URL that ACTUALLY served the
+	// page (after redirects), not what was typed: wikipedia.org 301s to
+	// www.wikipedia.org, so a bare-host base leaves every relative resource
+	// pointing at a redirect (the logo etc silently failed to load).
+	if (response->final_url)
+		url = response->final_url;
+
 	if (is_html)
 		ZincSetPage(url, response->body);
 	else

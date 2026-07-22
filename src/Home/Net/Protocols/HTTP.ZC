@@ -29,6 +29,7 @@ class CHttpResponse
 	U8	*headers;     // raw header block, NUL-terminated
 	U8	*body;        // NUL-terminated for convenience
 	I64	 body_length; // actual byte count (body may contain NULs)
+	U8	*final_url;   // URL after redirects (HttpNav sets it); NULL if none
 };
 
 U0 HttpResponseFree(CHttpResponse *response)
@@ -38,6 +39,7 @@ U0 HttpResponseFree(CHttpResponse *response)
 
 	Free(response->headers);
 	Free(response->body);
+	Free(response->final_url);
 	Free(response);
 }
 
@@ -1182,6 +1184,8 @@ CHttpResponse *HttpNav(U8 *url, U8 *method, U8 *content_type, U8 *body, I64 body
 		}
 	}
 
+	if (response)
+		response->final_url = StrNew(current); // the URL that actually served it
 	Free(current);
 	return response;
 }
