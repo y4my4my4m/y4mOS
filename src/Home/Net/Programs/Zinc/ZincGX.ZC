@@ -346,10 +346,22 @@ CGxOp *GxOpAdd(I64 type, I64 x, I64 y, I64 w, I64 h)
 }
 
 //--- Layout ------------------------------------------------------------------
+// While measuring intrinsic content width (V3Measure/L2Measure) we must NOT
+// center/right-align: alignment shifts ops toward the middle/right of the
+// scratch width, so maxx came back as ~half the container and centered flex
+// items measured ~2x too wide (100r's .nav_link stacked 1 per row).
+public Bool zinc_no_align = FALSE;
+
 U0 GxLineAlign()
 {//Close the current line: shift its ops for text-align center/right.
 	I64 i, right = 0, shift;
 
+	if (zinc_no_align)
+	{
+		gx.line_start_op = gx.op_count;
+		gx.line_align = 0;
+		return;
+	}
 	if (gx.line_align > 0 && gx.op_count > gx.line_start_op)
 	{
 		for (i = gx.line_start_op; i < gx.op_count; i++)
@@ -594,8 +606,9 @@ U0 GxWord(U8 *word, I64 len, CZStyle *style, I64 scale)
 		cw	 = FONT_WIDTH * scale;
 		need = len * cw;
 	}
-	//First content on a fresh line decides that line's text-align.
-	if (gx.x <= lstart && style->align > 0)
+	//First content on a fresh line decides that line's text-align (never while
+	//measuring intrinsic width - see zinc_no_align).
+	if (!zinc_no_align && gx.x <= lstart && style->align > 0)
 		gx.line_align = style->align;
 	//Style/link/scale change or wrap breaks the run.
 	if (gx.run_len &&

@@ -52,14 +52,16 @@ U0 V3Measure(CZNode *node, CZStyle *inh, I64 avail, I64 *w_out, I64 *h_out)
 	y0 = gx.y;
 	gx.wrap_w = x0 + avail;
 
-	// measure LEFT-aligned: text-align:center/right would otherwise push ops to
-	// the middle/right of `avail`, so the measured "content width" came back as
-	// ~half the container instead of the intrinsic width. That made centered
-	// flex items (100r's .nav_link) measure ~2x too wide -> 1 per row.
+	// measure LEFT-aligned: text-align:center/right (including the measured
+	// node's OWN align, e.g. 100r's .nav_link) would push ops to the middle so
+	// maxx came back ~2x the intrinsic width -> centered flex items stacked 1
+	// per row. zinc_no_align disables the shift for the whole measure subtree.
 	MemCopy(&mi, inh, sizeof(CZStyle));
 	mi.align = 0;
+	zinc_no_align = TRUE;
 	V3Node(node, &mi);
 	GxRunFlush;
+	zinc_no_align = FALSE;
 
 	maxx = x0;
 	for (i = sv.op_count; i < gx.op_count; i++)
