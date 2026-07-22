@@ -50,13 +50,21 @@ $FG,2$#include "C:/Home/Net/Programs/Git/GitSSH"$FG$
 
 $FG,3$4.2 Clone$FG$
 
-$FG,2$SSHKeyLoad;$FG$                                          Load your key (once per boot).
-$FG,2$GitCloneSSH("192.168.1.10", 22, "git", "user/repo.git");$FG$
+GitCloneSSH does NOT take a git@host:repo URL string -- split it:
+
+$ID,2$// normal git:  git clone git@github.com:username/repository.git
+//              └user┘ └────host────┘ └───────repo────────┘
+SSHKeyLoad;   // load your key (once per boot)
+GitCloneSSH("github.com", 22, "git", "username/repository.git");
+
+// git clone git@192.168.1.10:user/repo.git
+GitCloneSSH("192.168.1.10", 22, "git", "user/repo.git");$ID,-2$
 
 $ID,2$Arguments:  GitCloneSSH(host, port, user, repo, dir=NULL, password=NULL)
-  user     the SSH login (often "git", or "root").
-  repo     the SERVER-SIDE PATH to the bare repo, e.g. /srv/git/project.git
-           or user/project.git relative to the login's home.  Not a URL.
+  host     after @, before :  (e.g. github.com)
+  port     22 unless the server uses a custom port
+  user     before @  (almost always "git" on GitHub/gitea)
+  repo     after :  (e.g. username/repository.git, or /srv/git/project.git)
   dir      target directory (default <cwd>/<repo-name>).
   password optional; only if you have no key on the server.$ID,-2$
 
@@ -107,8 +115,9 @@ $FG,2$SSHKeyGen;$FG$   (paste the printed line into the server's authorized_keys
 $FG,2$#include "C:/Home/Net/Programs/Git/Git"$FG$
 $FG,2$#include "C:/Home/Net/Programs/Git/GitSSH"$FG$
 $FG,2$Cd("::/Home");;$FG$
-$FG,2$GitCloneSSH("192.168.1.10", 22, "git", "myproject.git");$FG$
-$FG,2$Dir("::/Home/myproject");$FG$
+$FG,2$// like: git clone git@github.com:username/repository.git$FG$
+$FG,2$GitCloneSSH("github.com", 22, "git", "username/repository.git");$FG$
+$FG,2$Dir("::/Home/procpixel");$FG$
 
 Or a public repo over HTTPS:
 

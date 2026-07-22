@@ -90,6 +90,7 @@ class CZCssRule
 	U8		anc_id[32];
 	Bool	has_anc;
 	Bool	anc_child;		// TRUE: '>', ancestor must be the direct parent
+	I8		anc_comb;		// 0 descendant, 1 child '>', 2 adjacent '+', 3 general '~'
 	U8		sel_attr[24];	// [attr] / [attr=val] selector part; "" = none
 	U8		sel_attr_val[32];
 	I8		pseudo;			// 0 none, 1 :first-child, 2 :last-child,
@@ -869,9 +870,34 @@ zcss_not_done:;
 				pseudo = 6;
 				p = q;
 			}
+			else if (!StrCompare(pname, "is") || !StrCompare(pname, "where") ||
+					 !StrCompare(pname, "matches") || !StrCompare(pname, "has"))
+			{ // :is()/:where()/:matches()/:has(): skip the argument, keep the base
+			  // selector (over-applies vs. exact list membership, but retains the
+			  // rule instead of dropping it). Same tactic as :not() above.
+				dep = 0;
+				while (q < sel_end)
+				{
+					if (*q == '(')
+						dep++;
+					else if (*q == ')')
+					{
+						dep--;
+						if (!dep)
+						{
+							q++;
+							goto zcss_fn_done;
+						}
+					}
+					q++;
+				}
+zcss_fn_done:;
+				p = q;
+			}
 			else
-				return; // state pseudos (:hover, :is, ...): statically never
-						// match - drop the rule (correct)
+				return; // dynamic-state pseudos (:hover, :focus, :active,
+						// :checked, :enabled ...): statically never match at rest,
+						// so drop the rule - the element keeps its base styling
 		}
 		else
 		{
@@ -902,10 +928,12 @@ zcss_not_done:;
 		{
 			if (cur_s)
 				in_gap = TRUE;
-			if (*p == '>' && pend < 1)
+			if (*p == '>')
 				pend = 1;
-			if ((*p == '+' || *p == '~') && pend < 2)
-				pend = 2;
+			if (*p == '+')
+				pend = 2; // adjacent sibling
+			if (*p == '~')
+				pend = 3; // general sibling
 		}
 		else
 		{
@@ -931,17 +959,19 @@ zcss_not_done:;
 	ZCssSimpleParse(cur_s, cur_e, rule->sel_tag, rule->sel_class, rule->sel_id);
 	rule->has_anc	= FALSE;
 	rule->anc_child = FALSE;
+	rule->anc_comb	= 0;
 	rule->anc_tag[0]   = 0;
 	rule->anc_class[0] = 0;
 	rule->anc_id[0]	   = 0;
-	if (prev_s && comb < 2)
-	{ // '+'/'~' siblings: fall back to the target part alone
+	if (prev_s)
+	{ // descendant / child / sibling: store the anchor part + its combinator
 		ZCssSimpleParse(prev_s, prev_e, rule->anc_tag, rule->anc_class,
 						rule->anc_id);
 		if (rule->anc_tag[0] || rule->anc_class[0] || rule->anc_id[0])
 		{
 			rule->has_anc	= TRUE;
 			rule->anc_child = (comb == 1);
+			rule->anc_comb	= comb; // 2 '+', 3 '~' now matched, not dropped
 		}
 	}
 
@@ -1212,6 +1242,36 @@ zcss_pseudo_ok:;
 	}
 	if (rule->has_anc)
 	{
+		if (rule->anc_comb == 2 || rule->anc_comb == 3)
+		{ // sibling: scan the element siblings BEFORE node in the same parent.
+		  // '+' adjacent = the immediately preceding element; '~' general = any
+		  // preceding element. (State like :checked on the anchor is ignored, so
+		  // the checkbox-hack "#cb:not(:checked) ~ .menu" applies at rest = the
+		  // default collapsed look, matching a real browser before interaction.)
+			if (!node->parent)
+				return FALSE;
+			sib = node->parent->first_child;
+			anc = NULL; // remembers the last element sibling seen before node
+			while (sib && sib != node)
+			{
+				if (sib->type == ZH_ELEM)
+					anc = sib;
+				sib = sib->next;
+			}
+			if (rule->anc_comb == 2)
+				return anc &&
+					ZCssSimpleMatch(rule->anc_tag, rule->anc_class, rule->anc_id, anc);
+			// general '~': any preceding element sibling matches
+			sib = node->parent->first_child;
+			while (sib && sib != node)
+			{
+				if (sib->type == ZH_ELEM &&
+					ZCssSimpleMatch(rule->anc_tag, rule->anc_class, rule->anc_id, sib))
+					return TRUE;
+				sib = sib->next;
+			}
+			return FALSE;
+		}
 		anc = node->parent;
 		if (rule->anc_child)
 			return anc &&
