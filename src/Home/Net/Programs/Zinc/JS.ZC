@@ -3187,6 +3187,20 @@ U8 *JsCtorName(CJsNode *n)
 	return "(expr)";
 }
 
+Bool JsArrMethod(U8 *nm)
+{ // methods that normally return an ARRAY - when the call target is missing we
+  // soft-return [] (not undefined) so a minified chain x.slice().map().filter()
+  // keeps flowing instead of collapsing at the first hop.
+	return !StrCompare(nm, "slice") || !StrCompare(nm, "map") ||
+		   !StrCompare(nm, "filter") || !StrCompare(nm, "concat") ||
+		   !StrCompare(nm, "splice") || !StrCompare(nm, "sort") ||
+		   !StrCompare(nm, "reverse") || !StrCompare(nm, "flat") ||
+		   !StrCompare(nm, "flatMap") || !StrCompare(nm, "split") ||
+		   !StrCompare(nm, "keys") || !StrCompare(nm, "values") ||
+		   !StrCompare(nm, "entries") || !StrCompare(nm, "from") ||
+		   !StrCompare(nm, "fill");
+}
+
 CJsVal *JsConstruct(CJsInterp *ji, CJsVal *fn, CJsVal **args, I64 argc, U8 *name)
 { // new-expression: fresh object, prototype link, constructor call with this
 	CJsVal *obj, *pr, *r;
@@ -3194,13 +3208,16 @@ CJsVal *JsConstruct(CJsInterp *ji, CJsVal *fn, CJsVal **args, I64 argc, U8 *name
 	I64		i;
 
 	if (!fn || (fn->type != JV_FUNC && fn->type != JV_NATIVE))
-	{ // name the missing constructor so the log says what to add next
-		StrPrint(buf, "'%s' is not a constructor", name);
+	{ // pragmatic leniency: `new <non-constructor>` yields a fresh empty object
+	  // instead of aborting the whole bundle. Minified code news up refs that
+	  // resolve to undefined/polyfills; a hard throw killed the entire script
+	  // (grok/chatgpt: "'e' is not a constructor" took the page down). Log it.
+		StrPrint(buf, "new: '%s' not a constructor (soft {})", name);
 		for (i = 0; buf[i]; i++)
 			if (buf[i] == 0x24)
 				buf[i] = '?';
-		JsErr(ji, buf);
-		return JsUndefV(ji);
+		NetLog("%s", buf);
+		return JsValNew(ji, JV_OBJ);
 	}
 	obj = JsValNew(ji, JV_OBJ);
 	pr = JsPropGet(fn, "prototype");
@@ -3552,6 +3569,8 @@ CJsVal *JsEval(CJsInterp *ji, CJsNode *node)
 					else
 						NetLog("JS: %s", nmbuf);
 				}
+				if (JsArrMethod(JsCtorName(node->a)))
+					return JsValNew(ji, JV_ARR); // keep array chains alive
 				return JsUndefV(ji);
 			}
 			return JsCall(ji, fn, obj, argv, argc);

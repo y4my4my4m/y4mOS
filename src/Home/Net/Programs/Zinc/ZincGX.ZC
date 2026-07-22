@@ -626,6 +626,17 @@ U0 GxWord(U8 *word, I64 len, CZStyle *style, I64 scale)
 		gx.run_y = gx.y;
 	}
 	MemCopy(&gx.run[gx.run_len], word, len);
+	if (style->uppercase == 1)
+	{ // text-transform:uppercase - ASCII a-z (leaves UTF-8/CJK bytes alone)
+		for (i = 0; i < len; i++)
+			if ('a' <= gx.run[gx.run_len + i] <= 'z')
+				gx.run[gx.run_len + i] -= 32;
+	}
+	else if (style->uppercase == 2)
+	{ // text-transform:capitalize - first letter of this word
+		if ('a' <= gx.run[gx.run_len] <= 'z')
+			gx.run[gx.run_len] -= 32;
+	}
 	gx.run_len += len;
 	gx.run[gx.run_len++] = ' ';
 	gx.x += need + cw;

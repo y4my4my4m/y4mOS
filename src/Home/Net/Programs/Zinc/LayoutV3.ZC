@@ -150,10 +150,10 @@ U0 V3Svg(CZNode *node, CZStyle *style)
 U0 V3Img(CZNode *node, CZStyle *style)
 { // raster image: cache hit blits real size; miss reserves an attr-sized
   // placeholder and queues the URL for GxImgTask
-	U8		*src = ZNodeAttr(node, "src"), *abs, *attr;
+	U8		*src = ZNodeAttr(node, "src"), *abs, *attr, *ai;
 	CGxImg	*ce;
 	CGxOp	*op;
-	I64		 iw, ih;
+	I64		 iw, ih, aw;
 	U8		 dkey[48];
 
 	if (!src || !*src)
@@ -208,6 +208,27 @@ U0 V3Img(CZNode *node, CZStyle *style)
 		{
 			iw = ce->dc->width;
 			ih = ce->dc->height;
+			// CSS width/height override the natural size AND the width= attr
+			// (CSS beats presentational attributes - 100r's nav sets width=200
+			// on the tag but nav a img{width:144px} in CSS, so 144 must win or
+			// the sprites render oversize, 2 per row not 6). Aspect preserved.
+			if (style->width > 0)
+				aw = style->width;
+			else if (style->width < 0)
+				aw = (gx.wrap_w - gx.x) * -style->width / 100;
+			else
+			{
+				ai = ZNodeAttr(node, "width");
+				if (ai)
+					aw = ClampI64(Str2I64(ai), 1, 2000);
+				else
+					aw = 0;
+			}
+			if (aw > 0 && iw > 0)
+			{
+				ih = ih * aw / iw;
+				iw = aw;
+			}
 			if (iw > gx.wrap_w - gx.x)
 			{
 				ih = ih * (gx.wrap_w - gx.x) / iw;
@@ -1024,7 +1045,7 @@ U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
 	I64		 box_op, op0, avail, bw, center_add, save_wrap, save_wrap2;
 	I64		 box_y0, dx, dy, mw, mh, x0, saved_y, saved_indent, saved_wrapa;
 	I64		 save_cbx, save_cby, save_cbw, save_cbh, save_curbg;
-	I64		 eff_h, eff_h_cb, save_anch;
+	I64		 eff_h, eff_h_cb, save_anch, flt_inset;
 	Bool	 boxed, is_body, is_abs, is_flex, is_flex_col, is_posn, spr_fixed;
 	Bool	 is_list, is_li, is_table;
 
@@ -1149,6 +1170,20 @@ U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
 	{
 		gx.y += mt_eff;
 		gx.indent += ml_eff;
+		flt_inset = 0;
+		if (gx_float_n)
+		{ // a block that FOLLOWS a narrow left float (a sidebar like lobste.rs's
+		  // 40px .voters) forms the column beside it: shift the whole block past
+		  // the float. Only for NARROW floats - wide image floats keep the normal
+		  // line-box wrap so following headings/paras still go full width below.
+			GxFloatRecompute(gx.y);
+			if (gx_float_lx > GX_MARGIN + gx.indent &&
+				gx_float_lx - GX_MARGIN < 160)
+			{
+				flt_inset = gx_float_lx - (GX_MARGIN + gx.indent);
+				gx.indent += flt_inset;
+			}
+		}
 		save_wrap2 = gx.wrap_w;
 		if (mr_eff + pr_eff > 0 &&
 			gx.wrap_w - (mr_eff + pr_eff) > GX_MARGIN + gx.indent + 40)
@@ -1320,7 +1355,7 @@ U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
 			gx.indent -= center_add;
 		}
 		gx.wrap_w = save_wrap2;
-		gx.indent -= ml_eff + pl_eff;
+		gx.indent -= ml_eff + pl_eff + flt_inset;
 		gx.x = GX_MARGIN + gx.indent;
 
 		if (author->pos == 1)
