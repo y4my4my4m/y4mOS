@@ -1,0 +1,351 @@
+// ============================================================================
+// Zinc JS engine - Regex module (split from JS.ZC).
+// Compact backtracking matcher + JsStrSlice helper. Included from JS.ZC via
+//   #include "Zinc/JSRegex"   (CWD is ~/Net/Programs at compile time).
+// Depends on earlier JS.ZC definitions: CJsInterp/CJsVal, JsAlloc, JsStrV,
+// JsUndefV, JsToStr, JsPropGet, JsToBool. Do not include standalone.
+// ============================================================================
+
+/* ---- regex engine: compact backtracking matcher ---- */
+// Supports: literals, . [set] [^set] ranges, \d\w\s\D\W\S + escaped literals,
+// anchors (start caret, end via 0x24), groups ( ) (grouping only), alternation,
+// quantifiers * + ? {n} {n,} {n,m}, case-insensitive. Whole-match only.
+#define JS_RE_MAXREP	200
+I64 js_re_icase = 0;
+// NOTE: capture-group extraction was attempted but hit a ZealC codegen issue
+// (a call/indexed-store in JsReSeq's return path corrupted the matched span,
+// making group patterns match zero-width). Reverted to whole-match-only regex;
+// captures need in-VM breadcrumb debugging to resolve. See git history.
+
+Bool JsReW(U8 c)
+{
+	if ('a' <= c <= 'z' || 'A' <= c <= 'Z' || '0' <= c <= '9')
+		return TRUE;
+	return c == '_';
+}
+
+Bool JsReMeta(U8 m, U8 c)
+{ // backslash-m tested against subject char c
+	if (m == 'd')	return '0' <= c <= '9';
+	if (m == 'D')	return !('0' <= c <= '9');
+	if (m == 'w')	return JsReW(c);
+	if (m == 'W')	return !JsReW(c);
+	if (m == 's')	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
+	if (m == 'S')	return !(c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f');
+	if (m == 'n')	return c == '\n';
+	if (m == 't')	return c == '\t';
+	if (m == 'r')	return c == '\r';
+	return c == m; // escaped literal (\. \* \/ \\ ...)
+}
+
+U8 JsReLo(U8 c)
+{
+	if (js_re_icase && 'A' <= c <= 'Z')
+		return c + 32;
+	return c;
+}
+
+Bool JsReEq(U8 a, U8 b)
+{
+	return JsReLo(a) == JsReLo(b);
+}
+
+Bool JsReClass(U8 *p, U8 *pe, U8 c)
+{ // p..pe is the class body (between [ and ]); returns whether c is in the set
+	Bool neg = FALSE, hit = FALSE;
+	U8	 lc = JsReLo(c);
+
+	if (p < pe && *p == '^')
+	{
+		neg = TRUE;
+		p++;
+	}
+	while (p < pe)
+	{
+		if (*p == '\\' && p + 1 < pe)
+		{
+			if (JsReMeta(p[1], c))
+				hit = TRUE;
+			p += 2;
+		}
+		else if (p + 2 < pe && p[1] == '-' && p[2] != ']')
+		{
+			if (JsReLo(*p) <= lc <= JsReLo(p[2]))
+				hit = TRUE;
+			p += 3;
+		}
+		else
+		{
+			if (JsReEq(*p, c))
+				hit = TRUE;
+			p++;
+		}
+	}
+	if (neg)
+		return !hit;
+	return hit;
+}
+
+U8 *JsReSeq(U8 *p, U8 *pe, U8 *s0, U8 *sp, U8 *se); // fwd (mutual recursion)
+
+U8 *JsReAtom1(U8 *as, U8 *ae, U8 *s0, U8 *sp, U8 *se)
+{ // match ONE instance of the atom [as,ae) at sp; returns new sp or NULL
+	if (*as == '(')
+		return JsReSeq(as + 1, ae - 1, s0, sp, se); // group content
+	if (sp >= se)
+		return NULL;
+	if (*as == '.')
+	{
+		if (*sp != '\n')
+			return sp + 1;
+		return NULL;
+	}
+	if (*as == '[')
+	{
+		if (JsReClass(as + 1, ae - 1, *sp))
+			return sp + 1;
+		return NULL;
+	}
+	if (*as == '\\')
+	{
+		if (JsReMeta(as[1], *sp))
+			return sp + 1;
+		return NULL;
+	}
+	if (JsReEq(*as, *sp))
+		return sp + 1;
+	return NULL;
+}
+
+U8 *JsReSeq(U8 *p, U8 *pe, U8 *s0, U8 *sp, U8 *se)
+{ // does pat[p,pe) match at sp? returns end pos in subject on success, else NULL
+	U8	*bar, *as, *ae, *np, *r, *m;
+	U8	*pos[JS_RE_MAXREP + 1];
+	I64	 depth = 0, mn = 1, mx = 1, cnt;
+
+	// top-level alternation
+	bar = NULL;
+	r	= p;
+	while (r < pe)
+	{
+		if (*r == '\\')
+			r++;
+		else if (*r == '(')
+			depth++;
+		else if (*r == ')')
+			depth--;
+		else if (*r == '[')
+		{
+			r++;
+			while (r < pe && *r != ']')
+			{
+				if (*r == '\\')
+					r++;
+				r++;
+			}
+		}
+		else if (*r == '|' && !depth)
+		{
+			bar = r;
+			r	= pe;
+		}
+		if (r < pe)
+			r++;
+	}
+	if (bar)
+	{
+		r = JsReSeq(p, bar, s0, sp, se);
+		if (r)
+			return r;
+		return JsReSeq(bar + 1, pe, s0, sp, se);
+	}
+	if (p >= pe)
+		return sp;
+	if (*p == '^')
+	{
+		if (sp != s0)
+			return NULL;
+		return JsReSeq(p + 1, pe, s0, sp, se);
+	}
+	if (*p == 0x24 && p + 1 == pe) // 0x24 = end anchor (never quote a bare dollar)
+	{
+		if (sp == se)
+			return sp;
+		return NULL;
+	}
+	// parse atom span [as,ae)
+	as = p;
+	if (*p == '\\')
+		ae = p + 2;
+	else if (*p == '(')
+	{
+		depth = 1;
+		ae	  = p + 1;
+		while (ae < pe && depth)
+		{
+			if (*ae == '\\')
+				ae++;
+			else if (*ae == '(')
+				depth++;
+			else if (*ae == ')')
+				depth--;
+			if (depth)
+				ae++;
+		}
+		ae++;
+	}
+	else if (*p == '[')
+	{
+		ae = p + 1;
+		while (ae < pe && *ae != ']')
+		{
+			if (*ae == '\\')
+				ae++;
+			ae++;
+		}
+		ae++;
+	}
+	else
+		ae = p + 1;
+	if (ae > pe)
+		ae = pe;
+	// quantifier
+	np = ae;
+	if (ae < pe && *ae == '*')
+	{
+		mn = 0;
+		mx = JS_RE_MAXREP;
+		np = ae + 1;
+	}
+	else if (ae < pe && *ae == '+')
+	{
+		mn = 1;
+		mx = JS_RE_MAXREP;
+		np = ae + 1;
+	}
+	else if (ae < pe && *ae == '?')
+	{
+		mn = 0;
+		mx = 1;
+		np = ae + 1;
+	}
+	else if (ae < pe && *ae == '{')
+	{
+		np = ae + 1;
+		mn = 0;
+		while (np < pe && '0' <= *np <= '9')
+		{
+			mn = mn * 10 + *np - '0';
+			np++;
+		}
+		mx = mn;
+		if (np < pe && *np == ',')
+		{
+			np++;
+			mx = JS_RE_MAXREP;
+			if (np < pe && *np != '}')
+			{
+				mx = 0;
+				while (np < pe && '0' <= *np <= '9')
+				{
+					mx = mx * 10 + *np - '0';
+					np++;
+				}
+			}
+		}
+		if (np < pe && *np == '}')
+			np++;
+	}
+	if (np < pe && *np == '?')
+		np++; // lazy quantifier -> approximate as greedy
+	// greedy: consume as many atom instances as possible, then backtrack
+	cnt	   = 0;
+	pos[0] = sp;
+	r	   = sp;
+	while (cnt < mx && cnt < JS_RE_MAXREP)
+	{
+		m = JsReAtom1(as, ae, s0, r, se);
+		if (!m || m == r)
+			cnt = cnt; // hit floor / zero-width: stop growing
+		if (!m || m == r)
+			mx = cnt; // force loop exit without a break statement
+		else
+		{
+			r		 = m;
+			cnt++;
+			pos[cnt] = r;
+		}
+	}
+	while (cnt >= mn)
+	{
+		r = JsReSeq(np, pe, s0, pos[cnt], se);
+		if (r)
+			return r;
+		cnt--;
+	}
+	return NULL;
+}
+
+Bool JsReSearch(U8 *pat, U8 *str, I64 start, Bool icase, I64 *ms, I64 *me)
+{ // find first match of pat in str at or after `start`. Fills byte offsets.
+	U8	*p	 = pat, *pe = pat + StrLen(pat);
+	U8	*s0	 = str, *se = str + StrLen(str), *sp, *r;
+
+	js_re_icase = icase;
+	sp = str + start;
+	if (start < 0)
+		sp = str;
+	while (sp <= se)
+	{
+		r = JsReSeq(p, pe, s0, sp, se);
+		if (r)
+		{
+			*ms = sp - str;
+			*me = r - str;
+			return TRUE;
+		}
+		sp++;
+	}
+	return FALSE;
+}
+
+Bool JsReValSearch(CJsInterp *ji, CJsVal *re, U8 *str, I64 start, I64 *ms, I64 *me)
+{ // extract source+ignoreCase from a regex value and search. re may be a string.
+	U8	*pat;
+	CJsVal *w;
+	Bool ic = FALSE;
+
+	if (re->type == JV_STR)
+		pat = re->str;
+	else
+	{
+		w = JsPropGet(re, "source");
+		if (!w)
+			return FALSE;
+		pat = JsToStr(ji, w);
+		w	= JsPropGet(re, "ignoreCase");
+		if (w && JsToBool(w))
+			ic = TRUE;
+	}
+	return JsReSearch(pat, str, start, ic, ms, me);
+}
+
+CJsVal *JsStrSlice(CJsInterp *ji, U8 *s, I64 a, I64 b)
+{ // s[a,b) as a fresh JV_STR. Hard-clamps to [0, StrLen(s)] so a bad offset can
+  // never read past the string (defense against out-of-range capture spans etc).
+	U8	*d;
+	I64	 ls = StrLen(s);
+
+	if (a < 0)
+		a = 0;
+	if (a > ls)
+		a = ls;
+	if (b < a)
+		b = a;
+	if (b > ls)
+		b = ls;
+	d = JsAlloc(ji, b - a + 1);
+	MemCopy(d, s + a, b - a);
+	d[b - a] = 0;
+	return JsStrV(ji, d);
+}
