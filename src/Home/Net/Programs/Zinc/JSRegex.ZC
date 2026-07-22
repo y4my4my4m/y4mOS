@@ -11,11 +11,58 @@
 // anchors (start caret, end via 0x24), groups ( ) (grouping only), alternation,
 // quantifiers * + ? {n} {n,} {n,m}, case-insensitive. Whole-match only.
 #define JS_RE_MAXREP	200
+#define JS_RE_MAXCAP	16
 I64 js_re_icase = 0;
-// NOTE: capture-group extraction was attempted but hit a ZealC codegen issue
-// (a call/indexed-store in JsReSeq's return path corrupted the matched span,
-// making group patterns match zero-width). Reverted to whole-match-only regex;
-// captures need in-VM breadcrumb debugging to resolve. See git history.
+U8 *js_re_pat0	= NULL;				// pattern start, for capture-group numbering
+I64 js_re_ncap	= 0;				// highest capturing group index recorded
+I64 js_re_cs[JS_RE_MAXCAP];			// capture start byte offset into subject; -1 unset
+I64 js_re_ce[JS_RE_MAXCAP];			// capture end byte offset
+
+U0 JsReRecord(I64 gi, I64 cs, I64 ce)
+{ // commit a capture span in its own frame (keeps the indexed global store out of
+  // JsReSeq's hot return path). Groups now match correctly (gotcha #26 fix), so the
+  // spans are valid.
+	if (gi >= 1 && gi < JS_RE_MAXCAP)
+	{
+		js_re_cs[gi] = cs;
+		js_re_ce[gi] = ce;
+		if (gi > js_re_ncap)
+			js_re_ncap = gi;
+	}
+}
+
+I64 JsReGroupIdx(U8 *gp)
+{ // 1-based capture index of the group opening at gp: count '(' from js_re_pat0 up
+  // to and including gp, skipping escapes and char classes. (?:...) not special.
+	U8	*q = js_re_pat0;
+	I64	 n = 0;
+	if (!q)
+		return 0;
+	while (q <= gp && *q)
+	{
+		if (*q == '\\')
+			q += 2;
+		else if (*q == '[')
+		{
+			q++;
+			while (*q && *q != ']')
+			{
+				if (*q == '\\')
+					q++;
+				q++;
+			}
+			if (*q)
+				q++;
+		}
+		else
+		{
+			if (*q == '(')
+				n++;
+			q++;
+		}
+	}
+	return n;
+}
 
 Bool JsReW(U8 c)
 {
@@ -89,9 +136,8 @@ Bool JsReClass(U8 *p, U8 *pe, U8 c)
 U8 *JsReSeq(U8 *p, U8 *pe, U8 *s0, U8 *sp, U8 *se); // fwd (mutual recursion)
 
 U8 *JsReAtom1(U8 *as, U8 *ae, U8 *s0, U8 *sp, U8 *se)
-{ // match ONE instance of the atom [as,ae) at sp; returns new sp or NULL
-	if (*as == '(')
-		return JsReSeq(as + 1, ae - 1, s0, sp, se); // group content
+{ // match ONE instance of a NON-group atom [as,ae) at sp; returns new sp or NULL.
+  // Group atoms are handled directly in JsReSeq's greedy loop (see there).
 	if (sp >= se)
 		return NULL;
 	if (*as == '.')
@@ -264,11 +310,12 @@ U8 *JsReSeq(U8 *p, U8 *pe, U8 *s0, U8 *sp, U8 *se)
 	r	   = sp;
 	while (cnt < mx && cnt < JS_RE_MAXREP)
 	{
-		m = JsReAtom1(as, ae, s0, r, se);
+		if (*as == '(')
+			m = JsReSeq(as + 1, ae - 1, s0, r, se); // group: DIRECT self-recursion
+		else						 // (same path multi-atom uses; the JsReAtom1
+			m = JsReAtom1(as, ae, s0, r, se); // forward-decl'd hop broke groups)
 		if (!m || m == r)
-			cnt = cnt; // hit floor / zero-width: stop growing
-		if (!m || m == r)
-			mx = cnt; // force loop exit without a break statement
+			mx = cnt; // hit floor / zero-width: force loop exit (no break stmt)
 		else
 		{
 			r		 = m;
@@ -280,7 +327,11 @@ U8 *JsReSeq(U8 *p, U8 *pe, U8 *s0, U8 *sp, U8 *se)
 	{
 		r = JsReSeq(np, pe, s0, pos[cnt], se);
 		if (r)
+		{ // winning path: if this atom is a capturing group, record its last span
+			if (*as == '(' && cnt >= 1)
+				JsReRecord(JsReGroupIdx(as), pos[cnt - 1] - s0, pos[cnt] - s0);
 			return r;
+		}
 		cnt--;
 	}
 	return NULL;
@@ -290,13 +341,21 @@ Bool JsReSearch(U8 *pat, U8 *str, I64 start, Bool icase, I64 *ms, I64 *me)
 { // find first match of pat in str at or after `start`. Fills byte offsets.
 	U8	*p	 = pat, *pe = pat + StrLen(pat);
 	U8	*s0	 = str, *se = str + StrLen(str), *sp, *r;
+	I64	 i;
 
 	js_re_icase = icase;
+	js_re_pat0	= pat; // capture-group numbering base
 	sp = str + start;
 	if (start < 0)
 		sp = str;
 	while (sp <= se)
 	{
+		js_re_ncap = 0; // reset captures for this start attempt
+		for (i = 0; i < JS_RE_MAXCAP; i++)
+		{
+			js_re_cs[i] = -1;
+			js_re_ce[i] = -1;
+		}
 		r = JsReSeq(p, pe, s0, sp, se);
 		if (r)
 		{
@@ -348,4 +407,18 @@ CJsVal *JsStrSlice(CJsInterp *ji, U8 *s, I64 a, I64 b)
 	MemCopy(d, s + a, b - a);
 	d[b - a] = 0;
 	return JsStrV(ji, d);
+}
+
+CJsVal *JsReCapV(CJsInterp *ji, U8 *s, I64 gi)
+{ // capture group gi (byte offsets in js_re_cs/ce) as a bounds-checked string, or
+  // undefined if the group is unset / out of range. JsStrSlice also clamps.
+	I64 a, b, ls;
+	if (gi < 1 || gi >= JS_RE_MAXCAP || js_re_cs[gi] < 0)
+		return JsUndefV(ji);
+	a  = js_re_cs[gi];
+	b  = js_re_ce[gi];
+	ls = StrLen(s);
+	if (a < 0 || b < a || b > ls)
+		return JsUndefV(ji);
+	return JsStrSlice(ji, s, a, b);
 }

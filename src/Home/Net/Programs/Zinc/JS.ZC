@@ -5346,6 +5346,8 @@ CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 			}
 			v = JsArrV(ji);
 			JsArrPush(ji, v, JsStrSlice(ji, s, b, len));
+			for (i = 1; i <= js_re_ncap && i < JS_RE_MAXCAP; i++)
+				JsArrPush(ji, v, JsReCapV(ji, s, i));
 			JsPropSet(ji, v, "index", JsNumV(ji, b));
 			if (pr && JsToBool(pr))
 				JsPropSet(ji, this_val, "lastIndex", JsNumV(ji, len));
@@ -6573,7 +6575,9 @@ CJsVal *JsCallNative(CJsInterp *ji, CJsVal *self, I64 id, CJsVal *this_val,
 			{
 				JsArrPush(ji, v, JsStrSlice(ji, s, b, len));
 				if (!pr || !JsToBool(pr))
-				{ // non-global: one match array with .index (captures not extracted)
+				{ // non-global: one match array [full, cap1, ...] + .index
+					for (i = 1; i <= js_re_ncap && i < JS_RE_MAXCAP; i++)
+						JsArrPush(ji, v, JsReCapV(ji, s, i));
 					JsPropSet(ji, v, "index", JsNumV(ji, b));
 					return v;
 				}

@@ -131,11 +131,12 @@ U8 *zinc_hipage =
 	"document.write('15:'+d.getUint16(0)+' ');"
 	"document.write('16:'+(new Headers({a:'1'}).get('a'))+' ');"
 	"document.write('17:'+([1,[2,3]].flat().join(''))+' ');"
-	"document.write('18multiatom:'+('ab'.match(/ab/)?'M0='+'ab'.match(/ab/)[0]:'NULL')+' ');"
-	"document.write('19group:'+('a1'.match(/(a)(1)/)?'M0='+'a1'.match(/(a)(1)/)[0]:'NULL')+' ');"
+	"var mm=('a1b2'.match(/([a-z])([0-9])/));"
+	"document.write('18full:'+mm[0]+' 18cap1:'+mm[1]+' 18cap2:'+mm[2]+' ');"
+	"document.write('19:'+('a1b2'.replace(/([a-z])([0-9])/g,'X'))+' ');"
 	"</script>"
 	"<p>expected: 10:3 11:T 12:3 13:14 14:098 15:258 16:1 17:123</p>"
-	"<p>diag: 18multiatom:M0=ab 19group:M0=a1  (isolates multi-atom vs group bug)</p>"
+	"<p>expected: 18full:a1 18cap1:a 18cap2:1  19:XX  (captures back)</p>"
 	"<p><a href=\"zinc:welcome\">back to welcome</a></p>"
 	"</body></html>";
 
