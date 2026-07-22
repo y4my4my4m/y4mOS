@@ -1007,6 +1007,15 @@ Bool JsLex(CJsInterp *ji, U8 *src)
 				else
 					sbuf[len++] = *p++;
 			}
+			while (*p && *p != quote)
+			{ // string longer than sbuf: keep consuming to the REAL closing quote,
+			  // discarding the overflow (content truncated, parse stays correct).
+			  // Without this the tail was lexed as JS code (gstatic's giant CSS-
+			  // keyframes strings -> "25% {" -> bad-object-key cascade).
+				if (*p == '\\' && p[1])
+					p++;
+				p++;
+			}
 			if (*p)
 				p++;
 			sbuf[len] = 0;
@@ -7554,6 +7563,14 @@ CJsInterp *JsInterpNew(CZNode *dom_root, U8 *url)
 	JsPropSet(ji, subtle, "digest", JsNativeV(ji, JSN_SUBTLE_DIGEST));
 	JsPropSet(ji, math, "subtle", subtle);
 	JsEnvDeclare(ji, ji->genv, "crypto", math);
+
+	math = JsValNew(ji, JV_OBJ); // performance: now() = Date.now (ms is what
+	JsPropSet(ji, math, "now",		  JsNativeV(ji, JSN_DATE_NOW)); // frame loops need)
+	JsPropSet(ji, math, "timeOrigin", JsNumV(ji, 0));
+	JsPropSet(ji, math, "mark",		  JsNativeV(ji, JSN_NOOP_UNDEF));
+	JsPropSet(ji, math, "measure",	  JsNativeV(ji, JSN_NOOP_UNDEF));
+	JsPropSet(ji, math, "getEntriesByType", JsNativeV(ji, JSN_NOOP_ARR));
+	JsEnvDeclare(ji, ji->genv, "performance", math);
 
 	math = JsValNew(ji, JV_OBJ); // Reflect (maps onto existing property/call semantics)
 	JsPropSet(ji, math, "get",		   JsNativeV(ji, JSN_REFLECT_GET));
