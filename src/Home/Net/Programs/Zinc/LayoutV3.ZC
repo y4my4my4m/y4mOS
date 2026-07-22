@@ -684,14 +684,19 @@ U0 V3FlexCol(CZNode *node, CZStyle *style, CZStyle *author)
 
 /* ---- tables ---- */
 
-U0 V3TableRow(CZNode *row, CZStyle *kid, I64 base, I64 u, I64 cw)
-{ // one <tr>: cells side by side, row height = tallest cell
+U0 V3TableRow(CZNode *row, CZStyle *kid, I64 *colx, I64 u)
+{ // one <tr>: cells at the precomputed column offsets, row height = tallest cell
 	CZNode	*cell;
-	CZStyle	 cellau;
+	CZStyle	 cellau, ckid;
 	CGxOp	*op;
 	U8		*attr;
 	I64		 k = 0, span, y0, ymax, save_indent, save_wrap, cell_box, save_cbg;
 
+	// cells start LEFT-aligned: a legacy <center> wrapping the table centers the
+	// TABLE box, it must NOT center every cell's text (HN's titles are left; the
+	// rank cell's own align="right" still wins via the cell's re-applied style).
+	MemCopy(&ckid, kid, sizeof(CZStyle));
+	ckid.align = 0;
 	save_indent = gx.indent;
 	save_wrap	= gx.wrap_w;
 	save_cbg	= gx.cur_bg;
@@ -708,8 +713,8 @@ U0 V3TableRow(CZNode *row, CZStyle *kid, I64 base, I64 u, I64 cw)
 			if (attr)
 				span = ClampI64(Str2I64(attr), 1, 8);
 			gx.y	  = y0;
-			gx.indent = save_indent + k * cw;
-			gx.wrap_w = base + MinI64(k + span, u) * cw - 6;
+			gx.indent = colx[k] - GX_MARGIN;
+			gx.wrap_w = colx[MinI64(k + span, u)] - 6;
 			gx.x	  = GX_MARGIN + gx.indent;
 			gx.line_start_op = gx.op_count;
 			ZCssApply(cell, &cellau);
@@ -726,7 +731,7 @@ U0 V3TableRow(CZNode *row, CZStyle *kid, I64 base, I64 u, I64 cw)
 				gx.line_start_op = gx.op_count;
 				gx.cur_bg = cellau.bg;
 			}
-			V3Node(cell, kid);
+			V3Node(cell, &ckid);
 			GxRunFlush;
 			GxLineAlign;
 			if (gx.x > GX_MARGIN + gx.indent)
@@ -747,12 +752,41 @@ U0 V3TableRow(CZNode *row, CZStyle *kid, I64 base, I64 u, I64 cw)
 	gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
 }
 
+U0 V3RowMeasure(CZNode *row, CZStyle *kid, I64 u, I64 avail, I64 *colnat)
+{ // grow each column's natural (single-line) width from this row's cells
+	CZNode	*cell = row->first_child;
+	U8		*attr;
+	I64		 k = 0, span, mw, mh;
+
+	while (cell && k < u)
+	{
+		if (cell->type == ZH_ELEM &&
+			(!StrCompare(cell->tag, "td") || !StrCompare(cell->tag, "th")))
+		{
+			span = 1;
+			attr = ZNodeAttr(cell, "colspan");
+			if (attr)
+				span = ClampI64(Str2I64(attr), 1, 8);
+			if (span == 1)
+			{ // spanning cells don't pin a single column's width
+				V3Measure(cell, kid, avail, &mw, &mh);
+				if (mw > colnat[k])
+					colnat[k] = MinI64(mw, avail);
+			}
+			k += span;
+		}
+		cell = cell->next;
+	}
+}
+
 U0 V3TableRows(CZNode *tbl, CZStyle *kid)
-{ // table content: count the first row's cells, split the width evenly,
-  // then lay every row (through thead/tbody wrappers)
+{ // table content: size columns to their content (narrow cols stay narrow, the
+  // widest content column absorbs the slack - like a real browser), then lay
+  // every row (through thead/tbody wrappers)
 	CZNode	*child, *row, *cell;
 	U8		*attr;
-	I64		 u = 0, base, avail, cw, span;
+	I64		 u = 0, base, avail, span, c, natsum, widest, cwid, rows_seen;
+	I64		 colnat[9], colx[9];
 
 	// find the first row anywhere under table/thead/tbody and count cells
 	row = NULL;
@@ -801,7 +835,63 @@ U0 V3TableRows(CZNode *tbl, CZStyle *kid)
 	avail = gx.wrap_w - base;
 	if (avail < 60)
 		avail = 60;
-	cw = avail / u;
+
+	// --- content-based column widths (scan up to 24 rows) ---
+	for (c = 0; c < u; c++)
+		colnat[c] = 0;
+	rows_seen = 0;
+	child = tbl->first_child;
+	while (child && rows_seen < 24)
+	{
+		if (child->type == ZH_ELEM)
+		{
+			if (!StrCompare(child->tag, "tr"))
+			{
+				V3RowMeasure(child, kid, u, avail, colnat);
+				rows_seen++;
+			}
+			else if (!StrCompare(child->tag, "thead") ||
+					 !StrCompare(child->tag, "tbody") ||
+					 !StrCompare(child->tag, "tfoot"))
+			{
+				row = child->first_child;
+				while (row && rows_seen < 24)
+				{
+					if (row->type == ZH_ELEM && !StrCompare(row->tag, "tr"))
+					{
+						V3RowMeasure(row, kid, u, avail, colnat);
+						rows_seen++;
+					}
+					row = row->next;
+				}
+			}
+		}
+		child = child->next;
+	}
+	natsum = 0;
+	widest = 0;
+	for (c = 0; c < u; c++)
+	{
+		colnat[c] += 10; // cell padding/gutter
+		natsum += colnat[c];
+		if (colnat[c] > colnat[widest])
+			widest = c;
+	}
+	if (natsum < 1)
+		natsum = 1;
+	colx[0] = base;
+	for (c = 0; c < u; c++)
+	{
+		if (natsum <= avail)
+		{ // room to spare: narrow cols keep content width, widest takes slack
+			cwid = colnat[c];
+			if (c == widest)
+				cwid += avail - natsum;
+		}
+		else // overflow: scale every column down proportionally
+			cwid = MaxI64(24, colnat[c] * avail / natsum);
+		colx[c + 1] = colx[c] + cwid;
+	}
 
 	GxRunFlush;
 	if (gx.x > base)
@@ -812,7 +902,7 @@ U0 V3TableRows(CZNode *tbl, CZStyle *kid)
 		if (child->type == ZH_ELEM)
 		{
 			if (!StrCompare(child->tag, "tr"))
-				V3TableRow(child, kid, base, u, cw);
+				V3TableRow(child, kid, colx, u);
 			else if (!StrCompare(child->tag, "thead") ||
 					 !StrCompare(child->tag, "tbody") ||
 					 !StrCompare(child->tag, "tfoot"))
@@ -821,7 +911,7 @@ U0 V3TableRows(CZNode *tbl, CZStyle *kid)
 				while (row)
 				{
 					if (row->type == ZH_ELEM && !StrCompare(row->tag, "tr"))
-						V3TableRow(row, kid, base, u, cw);
+						V3TableRow(row, kid, colx, u);
 					row = row->next;
 				}
 			}
@@ -1074,7 +1164,10 @@ U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
 				bw = avail * -style->width / 100;
 			if (bw >= 60 && bw < avail)
 			{
-				if (style->ml_auto == 1)
+				// margin:auto centers a sized block; so does a legacy <center>
+				// ancestor (inherited align==center) - that's how HN's 85% table
+				// sits centered while its cell text stays left.
+				if (style->ml_auto == 1 || style->align == 1)
 					center_add = (avail - bw) / 2;
 				gx.indent += center_add;
 				if (!save_wrap)
@@ -1362,6 +1455,13 @@ U0 V3Node(CZNode *node, CZStyle *inh)
 			i = ZCssColor(attr);
 			if (i >= 0)
 				style.fg = i;
+		}
+		attr = ZNodeAttr(node, "size");
+		if (attr)
+		{
+			i = Str2I64(attr);
+			if (1 <= i <= 7)
+				style.fsize = gx_font_sizes[i - 1];
 		}
 	}
 
