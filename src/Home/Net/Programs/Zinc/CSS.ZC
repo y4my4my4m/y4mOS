@@ -935,10 +935,16 @@ zcss_not_done:;
 // It replaced a separate zcss_viewport_w that could drift from the unit sizes.)
 
 I64 ZCssMediaWidth(U8 *p, U8 *end)
-{ // parse the number after "min-width"/"max-width" (":" then px); 0 if none
-	while (p < end && (*p == ':' || *p == ' ' || *p == '\t'))
+{ // px number after "min-width"/"max-width". Handles calc(): "max-width:
+  // calc(640px - 1px)" -> the FIRST number (640) is the breakpoint that matters.
+  // Skip any non-digit (colon, spaces, "calc(", "(") to reach it.
+	while (p < end && !('0' <= *p <= '9'))
+	{
+		if (*p == '{' || *p == '}') // safety: don't run past the query
+			return 0;
 		p++;
-	if (p >= end || !('0' <= *p <= '9'))
+	}
+	if (p >= end)
 		return 0;
 	return Str2I64(p);
 }
@@ -985,11 +991,11 @@ U0 ZCssParseRegion(U8 *p, U8 *end)
 				{
 					if (!StrNICompare(scan, "print", 5))
 						is_print = TRUE;
-					if (!StrNICompare(scan, "light", 5))
-						is_print = TRUE; // prefers-color-scheme: light (or any
-										 // light-media query): we render dark,
-										 // so skip - entering both schemes'
-										 // blocks makes last-wins color soup
+					if (!StrNICompare(scan, "dark", 4))
+						is_print = TRUE; // prefers-color-scheme: dark - we render
+										 // LIGHT (browser default, matches Chrome),
+										 // so SKIP the dark block. Entering it applied
+										 // Wikipedia's dark vars -> black page.
 					if (!StrNICompare(scan, "min-width", 9))
 						mq_min = ZCssMediaWidth(scan + 9, at_e);
 					if (!StrNICompare(scan, "max-width", 9))
