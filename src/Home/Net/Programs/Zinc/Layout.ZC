@@ -30,6 +30,26 @@ I64  l2_root_wrap  = 0;				// page right edge, set by GxLayout
 
 extern U0 L2Node(CZNode *node, CZStyle *inh);
 
+I64 L2HeightPx(I64 h)
+{ // decode a CZStyle height: >0 px (incl vh/calc). PERCENT heights (-(3000+pct))
+  // are intentionally NOT resolved into a forced box height - doing so spread
+  // real pages out (every 100%-height wrapper became viewport-tall and stacked).
+  // A % height only contributes as a containing-block reference (L2HeightPxCB).
+	if (h > 0)
+		return h;
+	return 0;
+}
+
+I64 L2HeightPxCB(I64 h)
+{ // like L2HeightPx but DOES resolve a % against the ancestor chain - used only
+  // where a reference height is safe (cb_h for abs children, flex-col centering).
+	if (h > 0)
+		return h;
+	if (h <= -3000 && gx.anc_h > 0)
+		return gx.anc_h * (-h - 3000) / 100;
+	return 0;
+}
+
 public U0 Layout2(Bool on)
 { // switch engines at runtime; takes effect on the next relayout
 	zinc_layout2 = on;
@@ -359,7 +379,7 @@ U0 L2FlexCol(CZNode *node, CZStyle *style, CZStyle *author)
 	CZStyle	 kid, ca;
 	CZNode	*child;
 	I64		 base, avail, gapv, cw, mw, mh, xc, save_indent, save_wrap;
-	I64		 content_top, pad_top, want_h;
+	I64		 content_top, pad_top, want_h, eff_h;
 	Bool	 first;
 
 	MemCopy(&kid, style, sizeof(CZStyle));
@@ -375,7 +395,8 @@ U0 L2FlexCol(CZNode *node, CZStyle *style, CZStyle *author)
 	// justify-content:center on the main (vertical) axis: if the flex box has an
 	// explicit height bigger than its content, push the stack down by half the slack.
 	pad_top = 0;
-	if (author->align == 1 && author->height > 0)
+	eff_h = L2HeightPx(author->height);
+	if (author->align == 1 && eff_h > 0)
 	{
 		want_h = 0;
 		child  = node->first_child;
@@ -392,8 +413,8 @@ U0 L2FlexCol(CZNode *node, CZStyle *style, CZStyle *author)
 			}
 			child = child->next;
 		}
-		if (author->height > want_h)
-			pad_top = (author->height - want_h) / 2;
+		if (eff_h > want_h)
+			pad_top = (eff_h - want_h) / 2;
 	}
 	gx.y += pad_top;
 
@@ -478,6 +499,7 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	I64		 box_op, op0, avail, bw, center_add, save_wrap, save_wrap2;
 	I64		 box_y0, dx, dy, mw, mh, x0, saved_y, saved_indent, saved_wrapa;
 	I64		 save_cbx, save_cby, save_cbw, save_cbh, save_curbg;
+	I64		 eff_h, eff_h_cb, save_anch;
 	Bool	 boxed, is_body, is_abs, is_flex, is_flex_col, is_posn, spr_fixed;
 
 	is_body = L2IsBody(node->tag);
@@ -486,6 +508,11 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	is_abs	= author->pos == 2 || author->pos == 3;
 	is_posn	= author->pos >= 1; // relative/absolute/fixed establish a containing
 								// block for descendant abs elements
+	eff_h = L2HeightPx(author->height);   // px/vh only: forces the box (min-height)
+	eff_h_cb = L2HeightPxCB(author->height); // px OR % : reference height only
+	save_anch  = gx.anc_h;
+	if (eff_h_cb > 0)
+		gx.anc_h = eff_h_cb; // children's % heights resolve against this box
 	save_curbg = gx.cur_bg;
 	save_cbx = gx.cb_x;
 	save_cby = gx.cb_y;
@@ -683,7 +710,7 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 		//Percent top offsets need the CB height: knowable up front only from
 		//an explicit CSS height (wikipedia's globe ring sets 32.5rem). 0 =
 		//unknown; top:N% then degrades to the container top.
-		gx.cb_h = MaxI64(0, author->height);
+		gx.cb_h = MaxI64(0, eff_h_cb);
 	}
 
 	if (is_flex)
@@ -700,6 +727,7 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 		}
 	}
 
+	gx.anc_h  = save_anch;  // restore the parent height context
 	gx.cur_bg = save_curbg; // restore parent background
 	gx.cb_x = save_cbx; // restore the parent containing block
 	gx.cb_y = save_cby;
@@ -710,8 +738,8 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	if (gx.x > GX_MARGIN + gx.indent)
 		GxNewline(0);
 	gx.y += pb_eff;
-	if (author->height > 0 && gx.y < box_y0 + author->height)
-		gx.y = box_y0 + author->height; // min-height floor
+	if (eff_h > 0 && gx.y < box_y0 + eff_h)
+		gx.y = box_y0 + eff_h; // min-height floor
 	if (box_op >= 0 && !spr_fixed)
 	{
 		gx.ops[box_op].h = MaxI64(8, gx.y + 2 - gx.ops[box_op].y);
@@ -791,12 +819,12 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 		}
 	}
 
-	if (author->ovf_hide == 1 && author->height > 0)
+	if (author->ovf_hide == 1 && eff_h > 0)
 	{ // overflow:hidden with a declared height: the box occupies EXACTLY that
 	  // height. Cull ops below the clip bottom, shrink straddling boxes, and
 	  // CLAMP THE FLOW back to the clip edge - without the flow clamp the page
 	  // kept the full (hidden) content height as a giant blank gap.
-		dy = box_y0 + author->height;
+		dy = box_y0 + eff_h;
 		for (bw = op0; bw < gx.op_count; bw++)
 		{
 			if (gx.ops[bw].y >= dy)

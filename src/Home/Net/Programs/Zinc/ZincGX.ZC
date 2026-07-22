@@ -120,6 +120,7 @@ class CGxGlobals
 	//offsets (top/left/right) resolve against this, not the page edge.
 	//cb_h: CB height for percent top offsets; 0 = unknown (no explicit height).
 	I64		 cb_x, cb_y, cb_w, cb_h;
+	I64		 anc_h;			//nearest ancestor's resolved height (percent-height base)
 	//flex-column stretch: width a stretched flex item should fill. L2FlexCol sets
 	//it around each child; GxWidget consumes it so buttons/inputs fill the column
 	//(the default flex behavior every modern menu relies on). 0 = inactive.
@@ -1989,6 +1990,7 @@ U0 GxLayout()
 	// viewport units (vw/vh/vmin/vmax in CSS.ZC) resolve against the real window
 	zcss_view_w = MaxI64(320, Fs->pix_width - GX_SBAR_W);
 	zcss_view_h = MaxI64(240, Fs->pix_height - GX_CHROME_H - GX_STATUS_H);
+	gx.anc_h = zcss_view_h; // html/body height:100% chain resolves to the viewport
 	gx.wrap_w = Fs->pix_width - GX_SBAR_W - GX_MARGIN;
 	gx.last_w = Fs->pix_width;
 	gx.x = GX_MARGIN;

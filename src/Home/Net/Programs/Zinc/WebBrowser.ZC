@@ -138,6 +138,12 @@ U8 *zinc_hipage =
 	"<p>expected: 10:3 11:T 12:3 13:14 14:098 15:258 16:1 17:123</p>"
 	"<p>expected: 18full:a1 18cap1:a 18cap2:1  19:XX  (captures back)</p>"
 	"<h1>SVG logo test</h1><p>the Google logo should render below:</p>"
+	"<p>arc diagnostics: A=red semicircle-bowl, B=blue quarter-arc wedge</p>"
+	"<svg viewBox=\"0 0 40 40\" width=\"40\" height=\"40\">"
+	"<path d=\"M5 20a15 15 0 0 0 30 0z\" fill=\"#f00\"/></svg>"
+	"<svg viewBox=\"0 0 40 40\" width=\"40\" height=\"40\">"
+	"<path d=\"M20 20m0-15a15 15 0 0 0-15 15l15 0z\" fill=\"#39f\"/></svg>"
+
 	"<svg class=\"lnXdpd\" aria-label=\"Google\" height=\"92\" role=\"img\" viewBox=\"0 0 272 92\" width="
 	"\"272\" xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M31.32 70.33c17.65.17 29.67-11.68 29.67-29.92"
 	"q.01-2.29-.43-5.08H31.2v8.76h20.6c-1.1 11.47-9.18 17.44-20.27 17.44-12.44 0-21.96-9.35-21.96-22.94 0"
@@ -469,7 +475,8 @@ U0 ZincSetPage(U8 *url, U8 *html)
 	ZincPageFree;
 	zinc_base_ok = (HttpUrlParse(url, &zinc_base) >= 0);
 	zinc_dom = ZHtmlParse(html);
-	zcss_viewport_w = MaxI64(320, Fs->pix_width - 30); // for @media width tests
+	zcss_view_w = MaxI64(320, Fs->pix_width - 30);  // @media widths + vw units
+	zcss_view_h = MaxI64(240, Fs->pix_height - 60); // vh units + % height root
 	ZincCollectCss(zinc_dom, &external_css);
 	ZincFormInit(zinc_dom);
 	zinc_js = JsInterpNew(zinc_dom, url);

@@ -357,13 +357,24 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 			out->pr = MinI64(n, ZCSS_SPACE_MAX);
 	}
 	else if (!StrICompare(name, "height") || !StrICompare(name, "min-height"))
-	{ // px/vh/calc()/min()/max()/clamp(). Percent heights are IGNORED: we don't
-	  // track ancestor height chains, and resolving them against the viewport
-	  // overshoots badly when the real parent is small (giant blank gaps).
-	  // Explicit vh means viewport intent and resolves fine.
-		n = ZCssLenPx(val);
-		if (15 < n <= 2000 && n > out->height)
-			out->height = n;
+	{ // px/vh/calc()/min()/max()/clamp(), plus REAL percent heights: N% encodes
+	  // as -(3000+N) and the layout resolves it against the nearest ancestor
+	  // with a resolved height (gx.anc_h chain; viewport at the root).
+		p = val;
+		while (*p && *p != '%')
+			p++;
+		if (*p == '%' && !StrFind("(", val))
+		{
+			n = Str2I64(val);
+			if (1 <= n <= 100)
+				out->height = -(3000 + n);
+		}
+		else
+		{
+			n = ZCssLenPx(val);
+			if (15 < n <= 2000 && n > out->height)
+				out->height = n;
+		}
 	}
 	else if (!StrICompare(name, "inset"))
 	{ // inset:0 = top/right/bottom/left all set - the full-bleed overlay idiom

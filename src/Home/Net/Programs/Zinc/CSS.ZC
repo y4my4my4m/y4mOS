@@ -183,7 +183,8 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	if (src->clear_side)	 dst->clear_side = src->clear_side;
 	if (src->mr		   >= 0) dst->mr		= src->mr;
 	if (src->pr		   >= 0) dst->pr		= src->pr;
-	if (src->height	   >  0) dst->height	= src->height;
+	if (src->height > 0 || src->height <= -3000)
+		dst->height = src->height; // px, or the percent sentinel -(3000+pct)
 	if (src->gap	   >= 0) dst->gap		= src->gap;
 	if (src->off_t > ZCSS_OFF_UNSET) dst->off_t = src->off_t;
 	if (src->off_l > ZCSS_OFF_UNSET) dst->off_l = src->off_l;
@@ -929,7 +930,9 @@ zcss_not_done:;
 
 // The browser sets this to its content width before stylesheets parse, so
 // @media (min-width/max-width) blocks evaluate against the real viewport.
-public I64 zcss_viewport_w = 1024; // statically initialized (JIT zeroes nothing)
+// (media width queries evaluate against zcss_view_w - the ONE viewport global,
+// set by WebBrowser before sheet parsing and by GxLayout before each layout.
+// It replaced a separate zcss_viewport_w that could drift from the unit sizes.)
 
 I64 ZCssMediaWidth(U8 *p, U8 *end)
 { // parse the number after "min-width"/"max-width" (":" then px); 0 if none
@@ -995,9 +998,9 @@ U0 ZCssParseRegion(U8 *p, U8 *end)
 				}
 				// evaluate width conditions against the real viewport, so
 				// mobile and desktop breakpoint blocks stop BOTH applying
-				if (mq_min > 0 && zcss_viewport_w < mq_min)
+				if (mq_min > 0 && zcss_view_w < mq_min)
 					is_print = TRUE;
-				if (mq_max > 0 && zcss_viewport_w > mq_max)
+				if (mq_max > 0 && zcss_view_w > mq_max)
 					is_print = TRUE;
 				body = p + 1;
 				depth = 0;
