@@ -151,6 +151,28 @@ U0 V3Svg(CZNode *node, CZStyle *style)
 		GxText(attr, style, 1, FALSE);
 }
 
+U0 V3DCInvert(CDC *dc)
+{ // filter: invert(1) - invert RGB of a truecolor DC in place, leaving
+  // transparent pixels alone (100r's dark-mode text logos + .invert icons are
+  // black-on-transparent PNGs that must flip to white on the black page).
+	I64	 x, y;
+	U32	*row, p;
+
+	if (!dc)
+		return;
+	for (y = 0; y < dc->height; y++)
+	{
+		row = dc->body + y * dc->width_internal;
+		for (x = 0; x < dc->width; x++)
+		{
+			p = row[x];
+			if (p != PIXF_TRANSPARENT)
+				row[x] = (p & 0xFF000000) | (~p & 0x00FFFFFF);
+		}
+	}
+	dc->flags &= ~DCF_NO_TRANSPARENTS; // keep skipping transparent pixels
+}
+
 U0 V3Img(CZNode *node, CZStyle *style)
 { // raster image: cache hit blits real size; miss reserves an attr-sized
   // placeholder and queues the URL for GxImgTask
@@ -245,14 +267,21 @@ U0 V3Img(CZNode *node, CZStyle *style)
 			}
 			if (gx.x + iw > gx.wrap_w && gx.x > GX_MARGIN)
 				GxNewline(0);
-			// GrBlot draws a DC at its NATURAL size, so a CSS-resized image needs
-			// an actually-scaled DC. Cache one per (base image, target size) so
-			// it's built once and freed with the page (GxImgCacheFree DCDel's it).
+			// GrBlot draws a DC at its NATURAL size, so a CSS-resized (and/or
+			// filter:invert'd) image needs its own derived DC. Cache one per
+			// (base, size, invert) so it's built once and freed with the page.
 			blit = ce->dc;
-			if (iw > 0 && ih > 0 &&
-				(iw != ce->dc->width || ih != ce->dc->height))
+			if (iw < 1)
+				iw = ce->dc->width;
+			if (ih < 1)
+				ih = ce->dc->height;
+			if (style->invert == 1 ||
+				iw != ce->dc->width || ih != ce->dc->height)
 			{
-				StrPrint(dkey, "sc:%X:%dx%d", ce->dc, iw, ih);
+				if (style->invert == 1)
+					StrPrint(dkey, "iv:%X:%dx%d", ce->dc, iw, ih);
+				else
+					StrPrint(dkey, "sc:%X:%dx%d", ce->dc, iw, ih);
 				se = GxImgFind(dkey);
 				if (!se)
 				{
@@ -261,6 +290,8 @@ U0 V3Img(CZNode *node, CZStyle *style)
 					{
 						se->fetched = TRUE;
 						se->dc = DEDCScaleNew(ce->dc, iw, ih, sys_task);
+						if (se->dc && style->invert == 1)
+							V3DCInvert(se->dc);
 					}
 				}
 				if (se && se->dc)
