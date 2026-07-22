@@ -266,7 +266,7 @@ U0 DEMenuTask()
 				Sys("ExeFile(\"::/DE/BrowserBoot\");");
 				de.net_up = TRUE;
 			}
-			User("ZincGX;\n");
+			User("ZincV3;\n"); //the unified v3 layout engine (LayoutV3.ZC)
 			break;
 		case 2:
 			if (!de.net_up)

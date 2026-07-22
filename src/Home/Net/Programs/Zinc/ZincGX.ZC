@@ -1675,6 +1675,9 @@ U0 GxPageStyle()
 //Layout v2: box-model engine (flex, position, 4-side box) built on the v1
 //inline flow above. Provides L2Node + the zinc_layout2/Layout2() toggle.
 #include "Layout"
+//Layout v3: UNIFIED engine (one dispatch + one box model, no v1<->v2 seam).
+//Selected via zinc_v3 (Layout3() / the ZincV3 entry).
+#include "LayoutV3"
 
 CDC *GxBgSpriteDC(CDC *src, I64 bw, I64 bh, I64 e_px, I64 e_py, I64 e_sw, I64 e_sh, I64 rep)
 {//Build a bw x bh DC showing the CSS-background image positioned / sized /
@@ -2013,7 +2016,14 @@ U0 GxLayout()
 	root.fsize = 16;
 	if (zinc_dom)
 	{
-		if (zinc_layout2)
+		if (zinc_v3)
+		{ // unified v3 engine; depth counters re-zeroed (a caught fault mid-
+		  // layout would otherwise leave them stuck above the caps)
+			v3_depth = 0;
+			v3_meas_depth = 0;
+			V3Node(zinc_dom, &root);
+		}
+		else if (zinc_layout2)
 			L2Node(zinc_dom, &root);
 		else
 			GxNode(zinc_dom, &root);
@@ -2572,6 +2582,10 @@ I64	 gx_fetch_status;
 I64	 gx_fetch_len;	//Body byte count: image bodies are binary (NULs inside).
 Bool gx_fetch_html, gx_fetch_ok;
 Bool gx_fetch_img;	//Response IS an image (content-type / magic): view it.
+U8	 gx_fetch_final[512]; //URL that ACTUALLY served the page (after redirects);
+					//"" = same as requested. Base for relative resources: with
+					//the typed wikipedia.org (301 -> www) every relative <img>
+					//resolved to a redirect body = silent broken images.
 
 U0 GxJsReset()
 {//Stop the background script fetcher and drop queued/fetched scripts.
@@ -2625,10 +2639,13 @@ U0 GxFetchTask()
 	gx_fetch_html = TRUE;
 	gx_fetch_img = FALSE;
 	gx_fetch_ok = FALSE;
+	gx_fetch_final[0] = 0;
 	r = ZincNavFetch(gx.load_url); // POSTs the pending form body if one is queued
 	if (r && r->body)
 	{
 		gx_fetch_status = r->status;
+		if (r->final_url && StrLen(r->final_url) < 511)
+			StrCopy(gx_fetch_final, r->final_url);
 		gx_fetch_len = r->body_length;
 		gx_fetch_body = MAlloc(r->body_length + 1, sys_task);
 		MemCopy(gx_fetch_body, r->body, r->body_length + 1);
@@ -2754,6 +2771,24 @@ U0 GxImgTask()
 					ce->dc = dc;
 					gx.img_dirty = TRUE;
 				}
+				else
+				{//diagnose silent image losses: status bar + Network Log
+					NetLog("IMG: undecodable %02X %02X %02X %02X len=%d %s",
+						   r->body[0], r->body[1], r->body[2], r->body[3],
+						   r->body_length, ce->url);
+					StrPrint(zinc_note, "img undecodable (%02X%02X) len=%d",
+							 r->body[0], r->body[1], r->body_length);
+				}
+			}
+			else if (r)
+			{
+				NetLog("IMG: HTTP %d len=%d %s", r->status, r->body_length, ce->url);
+				StrPrint(zinc_note, "img HTTP %d", r->status);
+			}
+			else
+			{
+				NetLog("IMG: no response %s", ce->url);
+				StrCopy(zinc_note, "img: no response");
 			}
 			if (r)
 				HttpResponseFree(r);
@@ -3488,8 +3523,10 @@ public U0 ZincGX(U8 *start_url=NULL)
 				{
 					while (msg = MessageScan(&a1, &a2))
 						if (msg == MESSAGE_MS_L_DOWN)
-						{//Stop button lives where Reload normally is.
-							if (GX_TAB_H <= a2 < GX_CHROME_H && 64 <= a1 < 90)
+						{//ANY chrome-strip click while loading = Stop. The old
+						//26px X-only zone felt dead - clicks on back/reload did
+						//nothing until the fetch resolved.
+							if (a2 < GX_CHROME_H)
 								gx.cancel = TRUE;
 						}
 						else if (msg == MESSAGE_KEY_DOWN && (a1 == CH_ESC || a1 == CH_SHIFT_ESC))
@@ -3502,7 +3539,7 @@ public U0 ZincGX(U8 *start_url=NULL)
 						// hard-Kill as a backstop if it doesn't stop in time.
 						net_abort = TRUE;
 						if (!cancel_deadline)
-							cancel_deadline = counts.jiffies + 2000 * JIFFY_FREQ / 1000;
+							cancel_deadline = counts.jiffies + 800 * JIFFY_FREQ / 1000;
 						else if (counts.jiffies > cancel_deadline)
 						{
 							Kill(gx.load_task);
@@ -3531,6 +3568,12 @@ public U0 ZincGX(U8 *start_url=NULL)
 				{
 					if (gx_fetch_status != 200)
 						StrPrint(zinc_note, "HTTP status %d", gx_fetch_status);
+					if (gx_fetch_final[0] && StrCompare(current, gx_fetch_final))
+					{//Redirected: adopt the REAL URL. Relative resources, the
+					//address bar and history all follow the serving host.
+						Free(current);
+						current = StrNew(gx_fetch_final);
+					}
 					zinc_base_ok = (HttpUrlParse(current, &zinc_base) >= 0);
 					if (gx_fetch_img)
 					{//The URL IS a picture: show it in the image view.
@@ -3561,19 +3604,23 @@ public U0 ZincGX(U8 *start_url=NULL)
 			if (nav_chain < 5)
 				meta_url = GxMetaRefresh(current); // <meta http-equiv=refresh url=..>
 			if (zinc_js && zinc_js->navigate && nav_chain < 5)
-			{
+			{//Script navigated DURING load = a redirect: REPLACE, don't push.
+			//Pushing put the redirector in history, so Back landed on it and
+			//it immediately bounced you forward again ("back doesn't work").
 				nav_chain++;
 				target = StrNew(zinc_js->navigate);
 				zinc_js->navigate = NULL;
 				if (meta_url)
 					Free(meta_url);
-				current = ZincNavPush(current, target);
+				Free(current);
+				current = target;
 				gx.fetch = TRUE;
 			}
 			else if (meta_url)
-			{//HTML meta-refresh redirect.
+			{//HTML meta-refresh redirect: same replace semantics.
 				nav_chain++;
-				current = ZincNavPush(current, meta_url);
+				Free(current);
+				current = meta_url;
 				gx.fetch = TRUE;
 			}
 			else
@@ -3759,13 +3806,17 @@ public U0 ZincGX(U8 *start_url=NULL)
 			}
 		}
 
-		//Wheel scroll.
+		//Wheel scroll - only when THIS window has focus (the wheel counter is
+		//global; without the gate an unfocused browser scrolled underneath).
 		view_h = Fs->pix_height - GX_CHROME_H - GX_STATUS_H;
 		if (mouse.pos.z != gx.last_wheel)
 		{
-			gx.scroll += (mouse.pos.z - gx.last_wheel) * 40;
-			gx.last_wheel = mouse.pos.z;
-			gx.scroll = ClampI64(gx.scroll, 0, MaxI64(0, gx.doc_h - view_h));
+			if (sys_focus_task == Fs)
+			{
+				gx.scroll += (mouse.pos.z - gx.last_wheel) * 40;
+				gx.scroll = ClampI64(gx.scroll, 0, MaxI64(0, gx.doc_h - view_h));
+			}
+			gx.last_wheel = mouse.pos.z; //always resync: no jump on refocus
 		}
 
 		//Text selection drag: track the end point live; on release copy to the
@@ -4055,4 +4106,13 @@ gx_next:
 	DocCursor(ON);
 	DocClear;
 	"ZincGX closed.\n";
+}
+
+public U0 ZincV3(U8 *start_url=NULL)
+{//Browser with the UNIFIED v3 layout engine (LayoutV3.ZC). Same chrome, same
+//fetch/paint pipeline - only the layout dispatch differs. Flag restored on
+//exit so a subsequent plain ZincGX gets the default engine.
+	zinc_v3 = TRUE;
+	ZincGX(start_url);
+	zinc_v3 = FALSE;
 }
