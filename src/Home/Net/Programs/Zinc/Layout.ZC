@@ -1089,6 +1089,7 @@ U0 L2Node(CZNode *node, CZStyle *inh)
 {
 	CZStyle style, author;
 	U8	   *gen;
+	I64		sv_x, sv_y, sv_ind, sv_wrap, ax, ay, aw;
 
 	if (!node || gx.op_count >= GX_OPS_MAX - 8)
 		return;
@@ -1133,6 +1134,44 @@ U0 L2Node(CZNode *node, CZStyle *inh)
 
 	if (!L2Handles(node, &author))
 	{ // v1 engine lays this subtree (inline runs, lists, tables, widgets...)
+		if ((author.pos == 2 || author.pos == 3) && !L2IsBody(node->tag))
+		{ // absolutely/fixed positioned leaf (e.g. an <img> logo): place it at
+		  // the containing block + inset offsets, THEN let v1 draw it there,
+		  // instead of letting it flow at the top of the page.
+			aw = gx.cb_w;
+			if (aw < 40)
+				aw = 40;
+			if (author.width > 0)
+				aw = MinI64(author.width, gx.cb_w);
+			else if (author.width < 0)
+				aw = gx.cb_w * -author.width / 100;
+			if (author.off_l > ZCSS_OFF_UNSET)
+				ax = gx.cb_x + L2OffPx(author.off_l, gx.cb_w);
+			else if (author.off_r > ZCSS_OFF_UNSET)
+				ax = gx.cb_x + gx.cb_w - L2OffPx(author.off_r, gx.cb_w) - aw;
+			else
+				ax = gx.cb_x;
+			if (author.off_t > ZCSS_OFF_UNSET)
+				ay = gx.cb_y + L2OffPx(author.off_t, gx.cb_h);
+			else
+				ay = gx.y;
+			if (ax < 0)
+				ax = 0;
+			sv_x = gx.x;
+			sv_y = gx.y;
+			sv_ind = gx.indent;
+			sv_wrap = gx.wrap_w;
+			gx.indent = ax - GX_MARGIN;
+			gx.wrap_w = ax + aw;
+			gx.x = GX_MARGIN + gx.indent;
+			gx.y = ay;
+			GxNode(node, inh);
+			gx.x = sv_x;
+			gx.y = sv_y;
+			gx.indent = sv_ind;
+			gx.wrap_w = sv_wrap;
+			return;
+		}
 		GxNode(node, inh);
 		gen = NULL;
 		if (zcss_has_gen)

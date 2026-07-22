@@ -93,6 +93,7 @@ class upng_t {
   upng_source source;
   U8 pal[1024];   //PLTE as RGBA (tRNS fills alpha; default opaque).
   I64 pal_count;
+  I64 interlace;  //0 = none, 1 = Adam7 (deinterlaced in post_process_scanlines).
 };
 
 
@@ -236,10 +237,82 @@ U0 remove_padding_bits(U8 *out, U8 *in, U64 olinebits, U64 ilinebits, U64 h) {
     ibp += diff;
   }
 }
+//Adam7 pass origins/steps (x-start, y-start, x-step, y-step for passes 0..6).
+U0 upng_adam7_params(I64 *xs, I64 *ys, I64 *xd, I64 *yd) {
+  xs[0]=0; xs[1]=4; xs[2]=0; xs[3]=2; xs[4]=0; xs[5]=1; xs[6]=0;
+  ys[0]=0; ys[1]=0; ys[2]=4; ys[3]=0; ys[4]=2; ys[5]=0; ys[6]=1;
+  xd[0]=8; xd[1]=8; xd[2]=4; xd[3]=4; xd[4]=2; xd[5]=2; xd[6]=1;
+  yd[0]=8; yd[1]=8; yd[2]=8; yd[3]=4; yd[4]=4; yd[5]=2; yd[6]=2;
+}
+//Total filtered bytes of all 7 Adam7 passes (1 filter byte + packed line each).
+U64 upng_adam7_rawsize(U64 w, U64 h, U64 bpp) {
+  I64 xs[7], ys[7], xd[7], yd[7], p;
+  U64 pw, ph, linebytes, total;
+  total = 0;
+  upng_adam7_params(xs, ys, xd, yd);
+  for (p = 0; p < 7; p++) {
+    if (w > xs[p]) pw = (w - xs[p] + xd[p] - 1) / xd[p]; else pw = 0;
+    if (h > ys[p]) ph = (h - ys[p] + yd[p] - 1) / yd[p]; else ph = 0;
+    if (pw > 0 && ph > 0) {
+      linebytes = (pw * bpp + 7) / 8;
+      total += ph * (1 + linebytes);
+    }
+  }
+  return total;
+}
+//Deinterlace Adam7 into a full-resolution byte-packed buffer. Byte-aligned
+//pixels only (bpp >= 8: RGB/RGBA/gray8/palette8 - every interlaced web PNG in
+//practice). Each pass is unfiltered on its own, then scattered to its grid.
+U0 upng_adam7_deinterlace(upng_t *upng, U8 *out, U8 *in, U64 bpp) {
+  I64 xs[7], ys[7], xd[7], yd[7], p, row, col, b;
+  U64 w, h, bytewidth;
+  U64 pw, ph, linebytes, srcbyte, dstpix, dstbyte;
+  U8 *passbuf, *inp;
+  w = upng->width;
+  h = upng->height;
+  bytewidth = bpp / 8;
+  inp = in;
+  upng_adam7_params(xs, ys, xd, yd);
+  for (p = 0; p < 7; p++) {
+    if (w > xs[p]) pw = (w - xs[p] + xd[p] - 1) / xd[p]; else pw = 0;
+    if (h > ys[p]) ph = (h - ys[p] + yd[p] - 1) / yd[p]; else ph = 0;
+    if (pw > 0 && ph > 0) { //skip empty passes (no continue keyword in ZealC)
+      linebytes = (pw * bpp + 7) / 8;
+      passbuf = MAlloc(ph * linebytes)(U8 *);
+      if (passbuf == NULL) {
+        upng->error = UPNG_ENOMEM;
+        return;
+      }
+      unfilter(upng, passbuf, inp, pw, ph, bpp); //inp has a filter byte per row
+      if (upng->error != UPNG_EOK) {
+        Free(passbuf);
+        return;
+      }
+      for (row = 0; row < ph; row++)
+        for (col = 0; col < pw; col++) {
+          srcbyte = row * linebytes + col * bytewidth;
+          dstpix = (ys[p] + row * yd[p]) * w + (xs[p] + col * xd[p]);
+          dstbyte = dstpix * bytewidth;
+          for (b = 0; b < bytewidth; b++)
+            out[dstbyte + b] = passbuf[srcbyte + b];
+        }
+      Free(passbuf);
+      inp += ph * (1 + linebytes);
+    }
+  }
+}
 U0 post_process_scanlines(upng_t *upng, U8 *out, U8 *in, upng_t *info_png) {
   U64 bpp = upng_get_bpp(info_png);
   U64 w = info_png->width;
   U64 h = info_png->height;
+  if (info_png->interlace == 1) {
+    if (bpp < 8) { //sub-byte Adam7 (rare): not handled - graceful failure
+      upng->error = UPNG_EUNINTERLACED;
+      return;
+    }
+    upng_adam7_deinterlace(upng, out, in, bpp);
+    return;
+  }
   if (bpp == 0) {
     do {
       (upng)->error = (UPNG_EMALFORMED);
@@ -396,7 +469,8 @@ I64 upng_header(upng_t *upng) {
     } while (0);
     return upng->error;
   }
-  if (upng->source.buffer[28] != 0) {
+  upng->interlace = upng->source.buffer[28]; //0 none, 1 Adam7 (now supported)
+  if (upng->interlace != 0 && upng->interlace != 1) {
     do {
       (upng)->error = (UPNG_EUNINTERLACED);
       (upng)->error_line = 955;
@@ -588,9 +662,16 @@ I64 upng_decode(upng_t *upng) {
               ((((chunk)[2]) & 0xFF) << 8) | (((chunk)[3]) & 0xFF)) +
              12;
   }
-  inflated_size =
-      ((upng->width * (upng->height * upng_get_bpp(upng) + 7)) / 8) +
-      upng->height;
+  if (upng->interlace == 1)
+    //+height+slack: uz_inflate can overshoot on LZ77 back-copies, so the raw
+    //buffer needs headroom past the exact pass total (same reason the
+    //non-interlaced branch adds +height). Exact-fit here corrupted the heap.
+    inflated_size = upng_adam7_rawsize(upng->width, upng->height,
+                                       upng_get_bpp(upng)) + upng->height + 64;
+  else
+    inflated_size =
+        ((upng->width * (upng->height * upng_get_bpp(upng) + 7)) / 8) +
+        upng->height;
   inflated = MAlloc(inflated_size)(U8 *);
   if (inflated == NULL) {
     Free(compressed);
@@ -656,6 +737,7 @@ upng_t *upng_new() {
   upng->source.size = 0;
   upng->source.owning = 0;
   upng->pal_count = 0;
+  upng->interlace = 0;
   return upng;
 }
 upng_t *upng_new_from_bytes(U8 *buffer, U64 size) {

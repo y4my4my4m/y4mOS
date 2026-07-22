@@ -2726,7 +2726,7 @@ U0 GxImgTask()
 			{//Sniff by content: PNG (0x89 P N G) or JPEG (FFD8).
 				dc = NULL;
 				if (r->body[1] == 'P' && r->body[2] == 'N' && r->body[3] == 'G')
-					dc = PNGReadBuf(r->body, r->body_length, 255, sys_task);
+					dc = PNGReadBuf(r->body, r->body_length, 128, sys_task);
 				else if (r->body[0] == 0xFF && r->body[1] == 0xD8)
 					dc = JPGReadBuf(r->body, r->body_length, sys_task);
 				else if (r->body[0] == 'G' && r->body[1] == 'I' && r->body[2] == 'F')
