@@ -3102,8 +3102,8 @@ U0 GxClickContent(I64 x, I64 y)
 		op = &gx.ops[i];
 		if (!(op->x <= x < op->x + op->w && op->y <= cy < op->y + op->h))
 			goto gx_click_next;
-		if (op->type == GXO_TEXT && op->href)
-		{
+		if ((op->type == GXO_TEXT || op->type == GXO_IMG) && op->href)
+		{ // a linked image (<a><img></a>, e.g. 100r's rabbit nav) navigates too
 			GxNavTo(ZincResolveLink(op->href));
 			return;
 		}

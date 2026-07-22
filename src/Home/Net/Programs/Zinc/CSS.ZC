@@ -78,6 +78,10 @@ class CZStyle
 	I8	ovf_hide;				// overflow: -1 unset, 1 hidden/clip, 0 visible
 	I16 zidx;					// z-index; 0 = auto/unset, >0 paints late (on top)
 	I16 content_idx;			// content:"str" intern index (::before/::after); -1
+	I8	columns;				// CSS multi-column count; 0 unset. Not inherited.
+	I8	invert;					// filter: invert(1) on images; -1 unset. Inherits.
+	I8	list_num;				// list-style-type: 0 disc, 1 decimal, 2 decimal-
+								// leading-zero; -1 unset. Inherits (like list-style).
 };
 
 class CZCssRule
@@ -123,6 +127,9 @@ U0 ZStyleReset(CZStyle *s)
 	s->pre = -1;
 	s->align = -1;
 	s->list_none = -1;
+	s->columns = 0;
+	s->invert = -1;
+	s->list_num = -1;
 	s->flex_col = -1;
 	s->mr = -1;
 	s->pr = -1;
@@ -161,6 +168,7 @@ U0 ZStyleReset(CZStyle *s)
 	s->ovf_hide = -1;
 	s->zidx = 0;
 	s->content_idx = -1;
+	s->columns = 0; // multi-column is a box property, not inherited
 }
 
 U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
@@ -184,6 +192,9 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	if (src->pre	   >= 0) dst->pre		= src->pre;
 	if (src->align	   >= 0) dst->align		= src->align;
 	if (src->list_none >= 0) dst->list_none = src->list_none;
+	if (src->columns  >  0) dst->columns  = src->columns;
+	if (src->invert   >= 0) dst->invert   = src->invert;
+	if (src->list_num >= 0) dst->list_num = src->list_num;
 	if (src->flex_col  >= 0) dst->flex_col	= src->flex_col;
 	if (src->grid_cols >= 0) dst->grid_cols = src->grid_cols;
 	if (src->grid_idx  >= 0) dst->grid_idx	= src->grid_idx;
@@ -279,6 +290,7 @@ U0 ZStyleStripBox(CZStyle *s)
 	s->ovf_hide = -1;
 	s->zidx = 0;
 	s->content_idx = -1;
+	s->columns = 0; // multi-column is a box property, not inherited
 }
 
 /* ---- CSS custom properties (variables) ----

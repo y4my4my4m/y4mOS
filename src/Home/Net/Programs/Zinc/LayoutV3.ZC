@@ -134,7 +134,11 @@ U0 V3Svg(CZNode *node, CZStyle *style)
 			GxNewline(0);
 		op = GxOpAdd(GXO_IMG, gx.x, gx.y, sw, sh);
 		if (op)
+		{
 			op->sc = ge->dc;
+			if (gx.link_depth > 0)
+				op->href = gx.cur_href;
+		}
 		gx.x += sw + FONT_WIDTH;
 		if (sh + GX_LINE_LEAD > gx.line_h)
 			gx.line_h = sh + GX_LINE_LEAD;
@@ -151,8 +155,9 @@ U0 V3Img(CZNode *node, CZStyle *style)
 { // raster image: cache hit blits real size; miss reserves an attr-sized
   // placeholder and queues the URL for GxImgTask
 	U8		*src = ZNodeAttr(node, "src"), *abs, *attr, *ai;
-	CGxImg	*ce;
+	CGxImg	*ce, *se;
 	CGxOp	*op;
+	CDC		*blit;
 	I64		 iw, ih, aw;
 	U8		 dkey[48];
 
@@ -189,7 +194,11 @@ U0 V3Img(CZNode *node, CZStyle *style)
 				GxNewline(0);
 			op = GxOpAdd(GXO_IMG, gx.x, gx.y, iw, ih);
 			if (op)
+			{
 				op->sc = ce->dc;
+				if (gx.link_depth > 0)
+					op->href = gx.cur_href;
+			}
 			gx.x += iw + FONT_WIDTH;
 			if (ih + GX_LINE_LEAD > gx.line_h)
 				gx.line_h = ih + GX_LINE_LEAD;
@@ -236,9 +245,34 @@ U0 V3Img(CZNode *node, CZStyle *style)
 			}
 			if (gx.x + iw > gx.wrap_w && gx.x > GX_MARGIN)
 				GxNewline(0);
+			// GrBlot draws a DC at its NATURAL size, so a CSS-resized image needs
+			// an actually-scaled DC. Cache one per (base image, target size) so
+			// it's built once and freed with the page (GxImgCacheFree DCDel's it).
+			blit = ce->dc;
+			if (iw > 0 && ih > 0 &&
+				(iw != ce->dc->width || ih != ce->dc->height))
+			{
+				StrPrint(dkey, "sc:%X:%dx%d", ce->dc, iw, ih);
+				se = GxImgFind(dkey);
+				if (!se)
+				{
+					se = GxImgGet(dkey);
+					if (se)
+					{
+						se->fetched = TRUE;
+						se->dc = DEDCScaleNew(ce->dc, iw, ih, sys_task);
+					}
+				}
+				if (se && se->dc)
+					blit = se->dc;
+			}
 			op = GxOpAdd(GXO_IMG, gx.x, gx.y, iw, ih);
 			if (op)
-				op->sc = ce->dc;
+			{
+				op->sc = blit;
+				if (gx.link_depth > 0) // <a><img></a>: image navigates the link
+					op->href = gx.cur_href;
+			}
 			gx.x += iw + FONT_WIDTH;
 			if (ih + GX_LINE_LEAD > gx.line_h)
 				gx.line_h = ih + GX_LINE_LEAD;
@@ -247,14 +281,17 @@ U0 V3Img(CZNode *node, CZStyle *style)
 		}
 		iw = 0;
 		ih = 0;
-		attr = ZNodeAttr(node, "width");
-		if (attr)
-			iw = ClampI64(Str2I64(attr), 0, 2000);
-		attr = ZNodeAttr(node, "height");
-		if (attr)
-			ih = ClampI64(Str2I64(attr), 0, 2000);
-		if (!iw && style->width > 0)
+		if (style->width > 0) // CSS width beats the width= attr (as above)
 			iw = style->width;
+		else
+		{
+			attr = ZNodeAttr(node, "width");
+			if (attr)
+				iw = ClampI64(Str2I64(attr), 0, 2000);
+		}
+		attr = ZNodeAttr(node, "height");
+		if (attr && !ih)
+			ih = ClampI64(Str2I64(attr), 0, 2000);
 		if (iw && !ih)
 			ih = iw * 3 / 4;
 		if (!iw)
@@ -272,6 +309,8 @@ U0 V3Img(CZNode *node, CZStyle *style)
 		{
 			op->img_url = abs; //queued for GxImgTask; owned by the op
 			op->fg = ColorRGB(0xE8, 0xE8, 0xEA);
+			if (gx.link_depth > 0) // link placeholder stays clickable
+				op->href = gx.cur_href;
 		}
 		else
 			Free(abs);
@@ -318,6 +357,93 @@ U0 V3Sprite(CZNode *node, CZStyle *author)
 	gx.x += author->width + 4;
 	if (author->height + GX_LINE_LEAD > gx.line_h)
 		gx.line_h = author->height + GX_LINE_LEAD;
+}
+
+U0 V3Pill(CZNode *node, CZStyle *style, CZStyle *author)
+{ // an INLINE element with a background/border: buttons, tags, <kbd>, <code>,
+  // badges. Rendered inline-block: measure the content, draw a rounded box
+  // behind it, then flow the text on top (AA'd against the pill bg). This is
+  // the primitive behind nearly every "styled span/link" on the modern web.
+	CZStyle	 kid;
+	CZNode	*child;
+	CGxOp	*op;
+	U8		*href;
+	I64		 mw, mh, padx, pady, bw, bh, sx, sy;
+	I64		 save_bg, save_ind, save_wrap, box_op;
+	Bool	 is_link;
+
+	GxRunFlush;
+	MemCopy(&kid, style, sizeof(CZStyle));
+	ZStyleStripBox(&kid);
+	padx = MaxI64(author->pl, author->pr);
+	if (padx < 4)
+		padx = 6;
+	pady = MaxI64(author->pt, author->pb);
+	if (pady < 1)
+		pady = 2;
+
+	V3Measure(node, &kid, gx.wrap_w - (GX_MARGIN + gx.indent), &mw, &mh);
+	bw = mw + 2 * padx;
+	bh = MaxI64(mh, FONT_HEIGHT) + 2 * pady;
+	if (author->width > 0)
+		bw = author->width + 2 * padx;
+	if (gx.x + bw > gx.wrap_w && gx.x > GX_MARGIN + gx.indent)
+		GxNewline(0);
+	sx = gx.x;
+	sy = gx.y;
+
+	op = GxOpAdd(GXO_BOX, sx, sy, bw, bh);
+	box_op = -1;
+	if (op)
+	{
+		box_op = gx.op_count - 1;
+		op->has_bg = author->bg >= 0;
+		op->fg = GxPenBg(author->bg, de_theme.win_bg);
+		op->ul = author->border >= 0;
+		op->bg = GxPenBg(author->border, de_theme.panel_edge);
+		if (author->radius > 0)
+			op->wkind = author->radius;
+	}
+	gx.line_start_op = gx.op_count;
+
+	save_bg = gx.cur_bg;
+	save_ind = gx.indent;
+	save_wrap = gx.wrap_w;
+	if (author->bg >= 0)
+	{
+		gx.cur_bg = author->bg; // pill text AA's against the pill fill
+		kid.bg = -1;
+	}
+	gx.indent = sx + padx - GX_MARGIN;
+	gx.x = GX_MARGIN + gx.indent;
+	gx.y = sy + pady;
+	gx.wrap_w = sx + bw;
+
+	is_link = FALSE;
+	href = ZNodeAttr(node, "href");
+	if (!StrCompare(node->tag, "a") && href && *href)
+	{
+		is_link = TRUE;
+		gx.link_depth++;
+		gx.cur_href = href;
+	}
+	child = node->first_child;
+	while (child)
+	{
+		V3Node(child, &kid);
+		child = child->next;
+	}
+	GxRunFlush;
+	if (is_link)
+		gx.link_depth--;
+
+	gx.cur_bg = save_bg;
+	gx.indent = save_ind;
+	gx.wrap_w = save_wrap;
+	gx.x = sx + bw + FONT_WIDTH;
+	gx.y = sy;
+	if (bh + GX_LINE_LEAD > gx.line_h)
+		gx.line_h = bh + GX_LINE_LEAD;
 }
 
 /* ---- flex + grid ---- */
@@ -1031,6 +1157,83 @@ U0 V3Float(CZNode *node, CZStyle *style, CZStyle *author)
 	gx.line_start_op = gx.op_count;
 }
 
+U0 V3Columns(CZNode *node, CZStyle *kid, I64 ncols)
+{ // CSS multi-column: balance the children across ncols equal columns, filling
+  // top-to-bottom then moving right (newspaper flow) at ~total_height/ncols.
+	CZNode	*child;
+	I64		 base, avail, gapv, colw, colx, coltop, coly, colbot, ci;
+	I64		 mw, mh, totalh, target, save_indent, save_wrap;
+
+	base = GX_MARGIN + gx.indent;
+	avail = gx.wrap_w - base;
+	gapv = 24;
+	if (ncols < 2 || avail < 160)
+	{ // too narrow to split: normal single-column flow
+		child = node->first_child;
+		while (child)
+		{
+			V3Node(child, kid);
+			child = child->next;
+		}
+		return;
+	}
+	colw = (avail - gapv * (ncols - 1)) / ncols;
+	if (colw < 60)
+		colw = 60;
+
+	totalh = 0;
+	child = node->first_child;
+	while (child)
+	{
+		if (child->type == ZH_ELEM || (child->type == ZH_TEXT && child->text))
+		{
+			V3Measure(child, kid, colw, &mw, &mh);
+			totalh += mh;
+		}
+		child = child->next;
+	}
+	target = totalh / ncols + 1;
+
+	save_indent = gx.indent;
+	save_wrap = gx.wrap_w;
+	coltop = gx.y;
+	coly = coltop;
+	colbot = coltop;
+	ci = 0;
+	colx = base;
+	child = node->first_child;
+	while (child)
+	{
+		if (child->type == ZH_ELEM || (child->type == ZH_TEXT && child->text))
+		{
+			gx.indent = colx - GX_MARGIN;
+			gx.wrap_w = colx + colw;
+			gx.x = GX_MARGIN + gx.indent;
+			gx.y = coly;
+			gx.line_start_op = gx.op_count;
+			V3Node(child, kid);
+			GxRunFlush;
+			if (gx.x > GX_MARGIN + gx.indent)
+				gx.y += gx.line_h;
+			coly = gx.y;
+			if (coly > colbot)
+				colbot = coly;
+			if (coly - coltop >= target && ci < ncols - 1)
+			{ // column full: advance to the next one
+				ci++;
+				colx = base + ci * (colw + gapv);
+				coly = coltop;
+			}
+		}
+		child = child->next;
+	}
+	gx.indent = save_indent;
+	gx.wrap_w = save_wrap;
+	gx.y = colbot;
+	gx.x = GX_MARGIN + gx.indent;
+	gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+}
+
 /* ---- the unified box ---- */
 
 U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
@@ -1281,11 +1484,16 @@ U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
 		gx.x = GX_MARGIN + gx.indent;
 	}
 	if (is_li && style->list_none != 1)
-	{ // marker: number for <ol>, bullet for <ul>
-		if (gx.list_sp > 0 && gx.list_typ[gx.list_sp - 1])
+	{ // marker: numbered for <ol> OR list-style-type:decimal[-leading-zero]
+	  // (100r's ul.jump numbers a <ul>); bullet otherwise.
+		if (gx.list_sp > 0 &&
+			(gx.list_typ[gx.list_sp - 1] || style->list_num >= 1))
 		{
 			gx.list_ctr[gx.list_sp - 1]++;
-			StrPrint(mark, "%d.", gx.list_ctr[gx.list_sp - 1] % 1000);
+			if (style->list_num == 2)
+				StrPrint(mark, "%02d.", gx.list_ctr[gx.list_sp - 1] % 100);
+			else
+				StrPrint(mark, "%d.", gx.list_ctr[gx.list_sp - 1] % 1000);
 		}
 		else
 		{
@@ -1301,6 +1509,8 @@ U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
 		V3FlexRow(node, style, author);
 	else if (is_flex_col)
 		V3FlexCol(node, style, author);
+	else if (author->columns > 1)
+		V3Columns(node, &kid, author->columns);
 	else
 	{
 		child = node->first_child;
@@ -1611,6 +1821,14 @@ U0 V3Node(CZNode *node, CZStyle *inh)
 	if (!StrCompare(node->tag, "textarea"))
 	{
 		GxWidget(node, GXW_AREA);
+		goto v3_after;
+	}
+	if ((author.bg >= 0 || author.border >= 0) &&
+		author.display == ZCSS_DISP_INLINE)
+	{ // inline element with a background/border -> a pill (button/tag/kbd/code).
+	  // Covers <a class=button>, <code>, <kbd>, <dt>, styled <span>. Block boxes
+	  // with a bg fall through to V3Block; this is only for inline-level ones.
+		V3Pill(node, &style, &author);
 		goto v3_after;
 	}
 	if (!StrCompare(node->tag, "a"))

@@ -706,6 +706,32 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 		else
 			out->uppercase = 0;
 	}
+	else if (!StrICompare(name, "columns") || !StrICompare(name, "column-count"))
+	{ // CSS multi-column: first integer is the column count
+		n = Str2I64(val);
+		if (val[0] && !('0' <= val[0] <= '9'))
+			n = 0; // "columns: 12em auto" width-only form: skip (no count)
+		if (1 <= n <= 6)
+			out->columns = n;
+	}
+	else if (!StrICompare(name, "filter"))
+	{ // only invert(...) is honored (dark-mode image/logo inversion)
+		if (StrFind("invert", val))
+			out->invert = 1;
+		else
+			out->invert = 0;
+	}
+	else if (!StrICompare(name, "list-style-type"))
+	{ // numbering style for the marker (only the count-format matters to us)
+		if (StrFind("decimal-leading-zero", val))
+			out->list_num = 2;
+		else if (StrFind("decimal", val))
+			out->list_num = 1;
+		else if (StrIMatch("none", val))
+			out->list_none = 1;
+		else
+			out->list_num = 0; // disc/circle/square -> bullet
+	}
 	else if (!StrICompare(name, "white-space"))
 	{
 		if (!StrNICompare(val, "pre", 3))
