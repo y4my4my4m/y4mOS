@@ -790,7 +790,7 @@ Bool JsIdentCh(I64 ch, Bool first)
 	return FALSE;
 }
 
-#include "Zinc/JSLex"
+#include "JSLex"
 
 /* ---- parser helpers ---- */
 
@@ -2437,7 +2437,7 @@ U0 JsTextContentSet(CJsInterp *ji, CZNode *node, U8 *s)
 	ji->dom_dirty = TRUE;
 }
 
-#include "Zinc/JSRegex"
+#include "JSRegex"
 
 
 U8 *JsCookieGet(CJsInterp *ji)
@@ -4827,7 +4827,7 @@ Bool JsNodeContains(CZNode *root, CZNode *target)
 	return FALSE;
 }
 
-#include "Zinc/JSNative"
+#include "JSNative"
 
 CJsVal *JsCall(CJsInterp *ji, CJsVal *fn, CJsVal *this_val,
 			   CJsVal **args, I64 argc)

@@ -187,7 +187,7 @@ U0 L2FlexRow(CZNode *node, CZStyle *style, CZStyle *author)
 	CZStyle	 kid, ca;
 	CZNode	*child, *rest;
 	I64		 n, i, k, m, row_start, base, avail, gapv, total, extra, gsum;
-	I64		 mw, mh, bw, x, xoff, y0, ymax, save_indent, save_wrap, room;
+	I64		 mw, mh, bw, x, xoff, y0, ymax, save_indent, save_wrap, room, jgap;
 
 	MemCopy(&kid, style, sizeof(CZStyle));
 	ZStyleStripBox(&kid);
@@ -293,11 +293,25 @@ U0 L2FlexRow(CZNode *node, CZStyle *style, CZStyle *author)
 		}
 
 		xoff = 0;
+		jgap = 0;
 		if (extra > 0)
-		{ // leftover with no growers: justify-content via the align mapping
-			if (author->align == 1)
+		{ // leftover with no growers: real justify-content when present,
+		  // else the legacy align mapping
+			if (author->justify == 3 && k > 1)		// space-between
+				jgap = extra / (k - 1);
+			else if (author->justify == 4 && k > 0)	// space-around
+			{
+				jgap = extra / k;
+				xoff = jgap / 2;
+			}
+			else if (author->justify == 5)			// space-evenly
+			{
+				jgap = extra / (k + 1);
+				xoff = jgap;
+			}
+			else if (author->justify == 1 || (author->justify < 0 && author->align == 1))
 				xoff = extra / 2;
-			else if (author->align == 2)
+			else if (author->justify == 2 || (author->justify < 0 && author->align == 2))
 				xoff = extra;
 		}
 
@@ -319,7 +333,7 @@ U0 L2FlexRow(CZNode *node, CZStyle *style, CZStyle *author)
 			if (gx.x > GX_MARGIN + gx.indent)
 				gx.y += gx.line_h; // inline item: close its open line
 			ymax = MaxI64(ymax, gx.y);
-			x += want[m] + gapv;
+			x += want[m] + gapv + jgap;
 		}
 		gx.indent = save_indent;
 		gx.wrap_w = save_wrap;
@@ -420,7 +434,14 @@ U0 L2FlexCol(CZNode *node, CZStyle *style, CZStyle *author)
 				gx.wrap_w = xc + cw;
 				gx.x	  = GX_MARGIN + gx.indent;
 				gx.line_start_op = gx.op_count;
+				if (author->align != 1 && author->align != 2 &&
+					(!StrCompare(child->tag, "button") ||
+					 !StrCompare(child->tag, "input") ||
+					 !StrCompare(child->tag, "select") ||
+					 !StrCompare(child->tag, "textarea")))
+					gx.flex_stretch_w = cw; // stretch: the item itself is a widget
 				L2Node(child, &kid);
+				gx.flex_stretch_w = 0;
 				GxRunFlush;
 				GxLineAlign;
 				if (gx.x > GX_MARGIN + gx.indent)
@@ -737,6 +758,56 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 				}
 			}
 		}
+	}
+
+	if (author->tf_set && gx.op_count > op0)
+	{ // transform: translate(...) - post-layout subtree shift. Percent resolves
+	  // against the element's own emitted box (the left:50% + translateX(-50%)
+	  // centering idiom lands exactly like in a real browser).
+		dx = author->tf_x;
+		dy = author->tf_y;
+		if (author->tf_xp)
+		{
+			if (box_op >= 0)
+				bw = gx.ops[box_op].w;
+			else
+				bw = gx.wrap_w - (GX_MARGIN + gx.indent);
+			dx = bw * author->tf_x / 100;
+		}
+		if (author->tf_yp)
+		{
+			if (box_op >= 0)
+				dy = gx.ops[box_op].h * author->tf_y / 100;
+			else
+				dy = 0; // own height unknown without a box: skip the shift
+		}
+		if (dx || dy)
+		{
+			for (bw = op0; bw < gx.op_count; bw++)
+			{
+				gx.ops[bw].x += dx;
+				gx.ops[bw].y += dy;
+			}
+		}
+	}
+
+	if (author->ovf_hide == 1 && author->height > 0)
+	{ // overflow:hidden with a declared height: cull ops fully below the clip
+	  // bottom (crude clip - no partial cuts, but stray overflow disappears).
+		dy = box_y0 + author->height;
+		for (bw = op0; bw < gx.op_count; bw++)
+			if (gx.ops[bw].y >= dy)
+			{
+				gx.ops[bw].w = 0;
+				gx.ops[bw].h = 0;
+			}
+	}
+	if (author->zidx > 0)
+	{ // z-index: mark the subtree's ops for the late paint pass. Children that
+	  // set their own z already did (they closed first) - don't overwrite.
+		for (bw = op0; bw < gx.op_count; bw++)
+			if (!gx.ops[bw].z)
+				gx.ops[bw].z = author->zidx;
 	}
 }
 

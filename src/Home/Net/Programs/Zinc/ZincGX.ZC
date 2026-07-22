@@ -66,6 +66,7 @@ class CGxOp
 	I16				 grad;							//GXO_BOX: CSS linear-gradient index (-1 = none).
 	I32				 sh_col;						//GXO_BOX: box-shadow color 0xRRGGBB (-1 = none).
 	I16				 sh_dx, sh_dy, sh_blur;			//GXO_BOX: box-shadow offset/blur px.
+	I16				 z;								//z-index paint bucket: 0 flow, >0 late (on top).
 };
 
 //Decoded-image cache, keyed by absolute URL. Persists across relayout so we
@@ -118,6 +119,10 @@ class CGxGlobals
 	//offsets (top/left/right) resolve against this, not the page edge.
 	//cb_h: CB height for percent top offsets; 0 = unknown (no explicit height).
 	I64		 cb_x, cb_y, cb_w, cb_h;
+	//flex-column stretch: width a stretched flex item should fill. L2FlexCol sets
+	//it around each child; GxWidget consumes it so buttons/inputs fill the column
+	//(the default flex behavior every modern menu relies on). 0 = inactive.
+	I64		 flex_stretch_w;
 	//Current visual background RGB under the cursor (-1 none): the nearest
 	//ancestor box's bg, so scalable-font text anti-aliases against the RIGHT
 	//color (background is not inherited, so run styles rarely carry it).
@@ -733,6 +738,8 @@ U0 GxWidget(CZNode *node, I64 kind)
 		w = MaxI64(60, StrLen(label) * FONT_WIDTH + 16);
 		if (kind == GXW_AREA)
 			h = 40;
+		if (gx.flex_stretch_w > w)
+			w = gx.flex_stretch_w; // stretched flex-column item: fill the column
 	}
 	if (gx.x + w > gx.wrap_w)
 		GxNewline(0);
@@ -1651,7 +1658,7 @@ U0 GxPageStyle()
 
 //Layout v2: box-model engine (flex, position, 4-side box) built on the v1
 //inline flow above. Provides L2Node + the zinc_layout2/Layout2() toggle.
-#include "Zinc/Layout"
+#include "Layout"
 
 CDC *GxBgSpriteDC(CDC *src, I64 bw, I64 bh, I64 e_px, I64 e_py, I64 e_sw, I64 e_sh, I64 rep)
 {//Build a bw x bh DC showing the CSS-background image positioned / sized /
@@ -1962,11 +1969,15 @@ U0 GxLayout()
 	GxOpsReset;
 	GxFloatReset;
 	GxPageStyle;
+	// viewport units (vw/vh/vmin/vmax in CSS.ZC) resolve against the real window
+	zcss_view_w = MaxI64(320, Fs->pix_width - GX_SBAR_W);
+	zcss_view_h = MaxI64(240, Fs->pix_height - GX_CHROME_H - GX_STATUS_H);
 	gx.wrap_w = Fs->pix_width - GX_SBAR_W - GX_MARGIN;
 	gx.last_w = Fs->pix_width;
 	gx.x = GX_MARGIN;
 	gx.y = 8;
 	gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+	gx.flex_stretch_w = 0;
 	gx.link_depth = 0;
 	gx.indent = 0;
 	gx.list_sp = 0;
@@ -2142,7 +2153,7 @@ U0 GxRoundRect(CDC *dc, I64 x, I64 y, I64 w, I64 h, I64 r, U32 fill, U32 border)
 
 U0 GxDrawIt(CTask *task, CDC *dc)
 {
-	I64	 i, oy, view_top = GX_CHROME_H, mx, my, wr;
+	I64	 i, oy, view_top = GX_CHROME_H, mx, my, wr, zpass;
 	I64	 view_h = task->pix_height - GX_CHROME_H - GX_STATUS_H, th, ty;
 	CGxOp *op;
 	U8	*hover = NULL;
@@ -2163,9 +2174,14 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 		return;
 	}
 
+	for (zpass = 0; zpass < 2; zpass++)
 	for (i = 0; i < gx.op_count; i++)
-	{
+	{ // two z buckets: flow content first, then z-index>0 late (on top)
 		op = &gx.ops[i];
+		if (zpass == 0 && op->z > 0)
+			goto gx_draw_next;
+		if (zpass == 1 && op->z <= 0)
+			goto gx_draw_next;
 		oy = op->y - gx.scroll + view_top;
 		if (oy + op->h < view_top || oy > view_top + view_h)
 			goto gx_draw_next;

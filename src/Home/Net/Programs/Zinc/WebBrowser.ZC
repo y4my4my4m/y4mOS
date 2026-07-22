@@ -25,11 +25,11 @@
 
 Cd(__DIR__);;
 
-#include "Zinc/HTML"
-#include "Zinc/CSS"
-#include "Zinc/JS"
-#include "Zinc/SVG"
-#include "Zinc/Render"
+#include "HTML"
+#include "CSS"
+#include "JS"
+#include "SVG"
+#include "Render"
 
 #define ZINC_HISTORY	64
 #define ZINC_BAR_WIDTH	60
