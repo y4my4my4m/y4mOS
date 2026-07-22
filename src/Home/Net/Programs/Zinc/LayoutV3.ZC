@@ -1320,7 +1320,7 @@ U0 V3Node(CZNode *node, CZStyle *inh)
 	CZNode	*child;
 	CGxOp	*op;
 	U8		*gen, *attr, *type;
-	I64		 i;
+	I64		 i, ax, ay, aw, sv_x, sv_y, sv_ind, sv_wrap;
 	Bool	 blockish;
 
 	if (!node || gx.op_count >= GX_OPS_MAX - 8)
@@ -1386,6 +1386,48 @@ U0 V3Node(CZNode *node, CZStyle *inh)
 		if (op)
 			op->fg = de_theme.panel_edge;
 		GxNewline(4);
+		goto v3_after;
+	}
+	if ((author.pos == 2 || author.pos == 3) &&
+		(!StrCompare(node->tag, "svg") || !StrCompare(node->tag, "img")))
+	{ // absolutely/fixed positioned image (Wikipedia's globe:
+	  //   .central-featured-logo{position:absolute;top:158px;left:35px})
+	  // - place it against the containing block + inset offsets, THEN draw.
+		aw = gx.cb_w;
+		if (aw < 40)
+			aw = 40;
+		if (author.width > 0)
+			aw = MinI64(author.width, gx.cb_w);
+		else if (author.width < 0)
+			aw = gx.cb_w * -author.width / 100;
+		if (author.off_l > ZCSS_OFF_UNSET)
+			ax = gx.cb_x + L2OffPx(author.off_l, gx.cb_w);
+		else if (author.off_r > ZCSS_OFF_UNSET)
+			ax = gx.cb_x + gx.cb_w - L2OffPx(author.off_r, gx.cb_w) - aw;
+		else
+			ax = gx.cb_x;
+		if (author.off_t > ZCSS_OFF_UNSET)
+			ay = gx.cb_y + L2OffPx(author.off_t, gx.cb_h);
+		else
+			ay = gx.y;
+		if (ax < 0)
+			ax = 0;
+		sv_x = gx.x;
+		sv_y = gx.y;
+		sv_ind = gx.indent;
+		sv_wrap = gx.wrap_w;
+		gx.indent = ax - GX_MARGIN;
+		gx.wrap_w = ax + MaxI64(aw, 200);
+		gx.x = GX_MARGIN + gx.indent;
+		gx.y = ay;
+		if (!StrCompare(node->tag, "img"))
+			V3Img(node, &style);
+		else
+			V3Svg(node, &style);
+		gx.x = sv_x;
+		gx.y = sv_y;
+		gx.indent = sv_ind;
+		gx.wrap_w = sv_wrap;
 		goto v3_after;
 	}
 	if (!StrCompare(node->tag, "svg"))
