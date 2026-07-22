@@ -335,6 +335,108 @@ U0 L2FlexRow(CZNode *node, CZStyle *style, CZStyle *author)
 	}
 }
 
+U0 L2FlexCol(CZNode *node, CZStyle *style, CZStyle *author)
+{ // flex-direction:column. Stack children vertically; the cross axis (horizontal)
+  // honors align-items via author->align (1 center, 2 end, else start/stretch).
+  // This is THE fix for centered hero layouts (min-height:100vh + flex column +
+  // align-items:center) that otherwise hugged the top-left as plain block flow.
+  // justify-content (vertical) centering: approximated - if the container has an
+  // explicit height taller than the content, the whole stack is offset down.
+	CZStyle	 kid, ca;
+	CZNode	*child;
+	I64		 base, avail, gapv, cw, mw, mh, xc, save_indent, save_wrap;
+	I64		 content_top, pad_top, want_h;
+	Bool	 first;
+
+	MemCopy(&kid, style, sizeof(CZStyle));
+	ZStyleStripBox(&kid);
+	base  = GX_MARGIN + gx.indent;
+	avail = gx.wrap_w - base;
+	if (avail < 60)
+		avail = 60;
+	gapv = author->gap;
+	if (gapv < 0)
+		gapv = 0;
+
+	// justify-content:center on the main (vertical) axis: if the flex box has an
+	// explicit height bigger than its content, push the stack down by half the slack.
+	pad_top = 0;
+	if (author->align == 1 && author->height > 0)
+	{
+		want_h = 0;
+		child  = node->first_child;
+		while (child)
+		{
+			if (child->type == ZH_ELEM && !ZnTagSkipped(child->tag))
+			{
+				ZCssApply(child, &ca);
+				if (ca.display != ZCSS_DISP_NONE)
+				{
+					L2Measure(child, &kid, avail, &mw, &mh);
+					want_h += mh + gapv;
+				}
+			}
+			child = child->next;
+		}
+		if (author->height > want_h)
+			pad_top = (author->height - want_h) / 2;
+	}
+	gx.y += pad_top;
+
+	save_indent = gx.indent;
+	save_wrap	= gx.wrap_w;
+	content_top = gx.y;
+	first = TRUE;
+	child = node->first_child;
+	while (child)
+	{
+		if (child->type == ZH_ELEM && !ZnTagSkipped(child->tag))
+		{
+			ZCssApply(child, &ca);
+			if (ca.display != ZCSS_DISP_NONE)
+			{
+				cw = 0; // cross-axis width of the child
+				if (ca.width > 0)
+					cw = MinI64(ca.width, avail);
+				else if (ca.width < 0)
+					cw = avail * -ca.width / 100;
+				else if (author->align == 1 || author->align == 2)
+				{ // center/end: size the item to its content so it can be offset
+					L2Measure(child, &kid, avail, &mw, &mh);
+					cw = MinI64(MaxI64(mw, 24), avail);
+				}
+				else
+					cw = avail; // stretch (default): fill the container
+				xc = base; // align-items: start / stretch
+				if (author->align == 1)
+					xc = base + (avail - cw) / 2;   // center
+				else if (author->align == 2)
+					xc = base + avail - cw;			// flex-end
+				if (xc < base)
+					xc = base;
+				if (!first)
+					gx.y += gapv;
+				gx.indent = xc - GX_MARGIN;
+				gx.wrap_w = xc + cw;
+				gx.x	  = GX_MARGIN + gx.indent;
+				gx.line_start_op = gx.op_count;
+				L2Node(child, &kid);
+				GxRunFlush;
+				GxLineAlign;
+				if (gx.x > GX_MARGIN + gx.indent)
+					gx.y += gx.line_h; // close an item that left its line open
+				first = FALSE;
+			}
+		}
+		child = child->next;
+	}
+	gx.indent = save_indent;
+	gx.wrap_w = save_wrap;
+	gx.x	  = GX_MARGIN + gx.indent;
+	if (content_top == gx.y) // never advanced: keep the box from collapsing to 0
+		gx.y += 1;
+}
+
 /* ---- block box ---- */
 
 I64 L2OffPx(I64 off, I64 span)
@@ -355,10 +457,11 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	I64		 box_op, op0, avail, bw, center_add, save_wrap, save_wrap2;
 	I64		 box_y0, dx, dy, mw, mh, x0, saved_y, saved_indent, saved_wrapa;
 	I64		 save_cbx, save_cby, save_cbw, save_cbh, save_curbg;
-	Bool	 boxed, is_body, is_abs, is_flex, is_posn, spr_fixed;
+	Bool	 boxed, is_body, is_abs, is_flex, is_flex_col, is_posn, spr_fixed;
 
 	is_body = L2IsBody(node->tag);
 	is_flex = author->display == ZCSS_DISP_FLEX && author->flex_col != 1;
+	is_flex_col = author->display == ZCSS_DISP_FLEX && author->flex_col == 1;
 	is_abs	= author->pos == 2 || author->pos == 3;
 	is_posn	= author->pos >= 1; // relative/absolute/fixed establish a containing
 								// block for descendant abs elements
@@ -564,6 +667,8 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 
 	if (is_flex)
 		L2FlexRow(node, style, author);
+	else if (is_flex_col)
+		L2FlexCol(node, style, author);
 	else
 	{
 		child = node->first_child;

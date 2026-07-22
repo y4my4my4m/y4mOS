@@ -22,7 +22,7 @@ if (ipv4_globals.local_ip == 0)
 #include "/Apps/ZealAmp/MP3"
 
 Cd("Programs");;
-#include "ZincAudio"
-#include "WebBrowser"
-#include "ZincGX"
+#include "Zinc/ZincAudio"
+#include "Zinc/WebBrowser"
+#include "Zinc/ZincGX"
 Cd("/");;
