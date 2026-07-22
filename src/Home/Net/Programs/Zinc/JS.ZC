@@ -1116,6 +1116,12 @@ js_tpl_part:
 			t->type = JT_STR;
 			t->str = JsStrDup(ji, sbuf);
 		}
+		if (*p && *p != 0x60 && !(*p == 0x24 && p[1] == '{'))
+			goto js_tpl_part; // part longer than one sbuf chunk: keep scanning the
+							  // SAME part, emitting more "+ chunk" tokens. Without
+							  // this, a >1020-char template (CSS keyframes, long
+							  // prose) fell into the interpolation branch and its
+							  // tail was lexed as JS code - total desync.
 		if (*p == 0x60)
 		{ // template ends
 			t = &ji->toks[n++];
@@ -1388,7 +1394,7 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 	CJsTok	*t = JsTok(ji);
 	CJsNode *node, *item, *tail;
 	U8		 numkey[24], embuf[96], emtk[16];
-	I64		 emk;
+	I64		 emk, open_pos;
 
 	if (t->type == JT_NUM)
 	{
@@ -1481,6 +1487,7 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 	}
 	if (JsEatPunct(ji, '('))
 	{
+		open_pos = ji->pos - 1; // the '(' token, for root-cause logging below
 		node = JsParseExpr(ji); // ( a, b ) sequence, and (0, fn)() idiom
 		if (!JsEatPunct(ji, ')'))
 		{ // desync RECOVERY: balanced-skip to this group's ) instead of a hard
@@ -1500,8 +1507,10 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 			if (++js_soft_errs <= 12)
 			{
 				NetLog("JS: %s", embuf);
+				JsSrcSnippet(ji, open_pos, embuf);
+				NetLog("JS:  open( at: %s", embuf); // the unclosed '(' = the ROOT
 				JsSrcSnippet(ji, ji->pos, embuf);
-				NetLog("JS:  src: %s", embuf); // raw source at the desync
+				NetLog("JS:  stop@: %s", embuf); // where ')' was expected
 			}
 			emk = 1;
 			while (emk > 0 && JsTok(ji)->type != JT_EOF)
@@ -2428,7 +2437,7 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 	if (JsEatKw(ji, "throw"))
 	{
 		node = JsNode(ji, JN_THROW);
-		node->a = JsParseAssign(ji);
+		node->a = JsParseExpr(ji); // full expr: minifiers emit `throw a(),Error(b)`
 		JsEatPunct(ji, ';');
 		return node;
 	}
