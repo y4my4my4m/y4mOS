@@ -357,22 +357,11 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 			out->pr = MinI64(n, ZCSS_SPACE_MAX);
 	}
 	else if (!StrICompare(name, "height") || !StrICompare(name, "min-height"))
-	{ // any length form: px/vh/calc()/min()/max()/clamp(). A percent height
-	  // approximates against the viewport (the html/body/#app 100% chain is
-	  // what actually matters on real pages; we don't track ancestor heights).
-		p = val;
-		while (*p && *p != '%')
-			p++;
-		if (*p == '%' && !StrFind("(", val))
-		{
-			n = Str2I64(val);
-			if (1 <= n <= 100)
-				n = zcss_view_h * n / 100;
-			else
-				n = -1;
-		}
-		else
-			n = ZCssLenPx(val);
+	{ // px/vh/calc()/min()/max()/clamp(). Percent heights are IGNORED: we don't
+	  // track ancestor height chains, and resolving them against the viewport
+	  // overshoots badly when the real parent is small (giant blank gaps).
+	  // Explicit vh means viewport intent and resolves fine.
+		n = ZCssLenPx(val);
 		if (15 < n <= 2000 && n > out->height)
 			out->height = n;
 	}
@@ -388,6 +377,9 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 			out->off_r = n;
 			if (n == 0 && out->width == 0)
 				out->width = -100; // span the containing block
+			if (n == 0 && !out->height)
+				out->height = zcss_view_h; // full-bleed overlay: viewport tall,
+										   // so flex centering can center it
 		}
 	}
 	else if (!StrICompare(name, "gap") || !StrICompare(name, "column-gap") ||

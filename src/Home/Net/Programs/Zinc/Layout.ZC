@@ -792,8 +792,10 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 	}
 
 	if (author->ovf_hide == 1 && author->height > 0)
-	{ // overflow:hidden with a declared height: cull ops fully below the clip
-	  // bottom; boxes/rects straddling the edge are shrunk to it (partial clip).
+	{ // overflow:hidden with a declared height: the box occupies EXACTLY that
+	  // height. Cull ops below the clip bottom, shrink straddling boxes, and
+	  // CLAMP THE FLOW back to the clip edge - without the flow clamp the page
+	  // kept the full (hidden) content height as a giant blank gap.
 		dy = box_y0 + author->height;
 		for (bw = op0; bw < gx.op_count; bw++)
 		{
@@ -806,6 +808,10 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 					 (gx.ops[bw].type == GXO_BOX || gx.ops[bw].type == GXO_RECT))
 				gx.ops[bw].h = dy - gx.ops[bw].y;
 		}
+		if (gx.y > dy)
+			gx.y = dy;
+		if (box_op >= 0 && gx.ops[box_op].y + gx.ops[box_op].h > dy)
+			gx.ops[box_op].h = MaxI64(8, dy - gx.ops[box_op].y);
 	}
 	if (author->zidx > 0)
 	{ // z-index: mark the subtree's ops for the late paint pass. Children that

@@ -755,8 +755,19 @@ U0 GxWidget(CZNode *node, I64 kind)
 		op->node  = node;
 		op->wkind = kind;
 		op->text  = StrNew(label);
-		ZCssApply(node, &wa); // honor the page's border-radius (no default pill)
+		ZCssApply(node, &wa); // honor the page's own widget styling
 		op->radius = wa.radius;
+		if (wa.bg >= 0)
+		{ // author background wins over the light UA default
+			op->has_bg = TRUE;
+			op->fg = GxPenBg(wa.bg, de_theme.win_bg);
+		}
+		if (wa.border >= 0)
+			op->bg = GxPenBg(wa.border, de_theme.panel_edge);
+		else
+			op->bg = ColorRGB(0xC8, 0xCC, 0xD0); // UA border
+		op->sh_col = wa.fg; // widget TEXT color rides in sh_col (-1 = UA default;
+							// GXO_WIDGET has no box-shadow, the slot is free)
 	}
 	gx.x += w + FONT_WIDTH;
 	if (h + GX_LINE_LEAD > gx.line_h)
@@ -2157,12 +2168,19 @@ U0 GxRoundRect(CDC *dc, I64 x, I64 y, I64 w, I64 h, I64 r, U32 fill, U32 border)
 		GxRoundFill(dc, x + 1, y + 1, w - 2, h - 2, r - 1, fill);
 }
 
-Bool GxOpSelected(CGxOp *op)
-{ // is this text op inside the current selection? Band model: whole lines
-  // between the anchor and end lines; partial by x on the first/last line.
-	I64 x0, y0, x1, y1, t;
+Bool GxOpSelRange(CGxOp *op, I64 *c0, I64 *c1)
+{ // CHARACTER-granular selection, like a real browser. Returns the selected
+  // char span [c0,c1) of this text op: whole runs on middle lines, partial by
+  // x on the anchor/end lines (char width = run width / run length; exact for
+  // the 8x8 font, proportional approximation for TTF runs).
+	I64 x0, y0, x1, y1, t, len, cw;
 
+	*c0 = 0;
+	*c1 = 0;
 	if (!gx.sel_on || op->type != GXO_TEXT || !op->text)
+		return FALSE;
+	len = StrLen(op->text);
+	if (!len)
 		return FALSE;
 	x0 = gx.sel_x0;
 	y0 = gx.sel_y0;
@@ -2179,36 +2197,38 @@ Bool GxOpSelected(CGxOp *op)
 	}
 	if (op->y + op->h <= y0 || op->y > y1)
 		return FALSE;
-	if (y0 >= op->y && y0 < op->y + op->h && op->x + op->w <= x0)
-		return FALSE; // first selection line: op entirely before the anchor x
-	if (y1 >= op->y && y1 < op->y + op->h && op->x >= x1)
-		return FALSE; // last selection line: op entirely after the end x
-	return TRUE;
+	cw = MaxI64(1, op->w / len);
+	*c0 = 0;
+	*c1 = len;
+	if (y0 >= op->y && y0 < op->y + op->h)
+		*c0 = ClampI64((x0 - op->x + cw / 2) / cw, 0, len); // anchor line
+	if (y1 >= op->y && y1 < op->y + op->h)
+		*c1 = ClampI64((x1 - op->x + cw / 2) / cw, 0, len); // end line
+	return *c1 > *c0;
 }
 
 U0 GxSelCopy()
 { // put the selected text on the OS clipboard (sys_clip_doc): reuses the stock
   // DolDoc clip, so Ctrl-V pastes it in any editor/terminal in the system.
 	U8	*buf;
-	I64	 i, n = 0, last_y = I64_MIN;
+	I64	 i, n = 0, last_y = I64_MIN, c0, c1, k;
 	U8	*s;
 
 	buf = MAlloc(8192);
 	for (i = 0; i < gx.op_count && n < 8000; i++)
 	{
-		if (!GxOpSelected(&gx.ops[i]))
+		if (!GxOpSelRange(&gx.ops[i], &c0, &c1))
 			goto gx_selcopy_next;
 		if (last_y != I64_MIN && gx.ops[i].y >= last_y + FONT_HEIGHT)
 			buf[n++] = '\n'; // new layout line -> newline
 		else if (last_y != I64_MIN)
 			buf[n++] = ' ';	 // same line, separate run
 		s = gx.ops[i].text;
-		while (*s && n < 7996)
+		for (k = c0; k < c1 && s[k] && n < 7996; k++)
 		{
-			if (*s == 0x24)
+			if (s[k] == 0x24)
 				buf[n++] = 0x24; // literal dollars must be DOUBLED for DolDoc
-			buf[n++] = *s;
-			s++;
+			buf[n++] = s[k];
 		}
 		last_y = gx.ops[i].y;
 gx_selcopy_next:;
@@ -2223,9 +2243,41 @@ gx_selcopy_next:;
 	Free(buf);
 }
 
+I64 GxClipTextGet(U8 *out, I64 max)
+{ // plain text from the OS clipboard (sys_clip_doc): text entry tags + newlines.
+  // This is what makes Ctrl-V in the browser paste text copied ANYWHERE in the OS.
+	CDocEntry *e;
+	U8		  *s;
+	I64		   n = 0;
+	Bool	   unlock = DocLock(sys_clip_doc);
+
+	e = sys_clip_doc->head.next;
+	while (e != sys_clip_doc && n < max - 2)
+	{
+		if (e->type_u8 == DOCT_TEXT && e->tag)
+		{
+			s = e->tag;
+			while (*s && n < max - 2)
+			{
+				if (*s == 0x24 && s[1] == 0x24)
+					s++; // doubled dollar -> one literal
+				out[n++] = *s++;
+			}
+		}
+		else if (e->type_u8 == DOCT_NEW_LINE || e->type_u8 == DOCT_SOFT_NEW_LINE)
+			out[n++] = '\n';
+		e = e->next;
+	}
+	out[n] = 0;
+	if (unlock)
+		DocUnlock(sys_clip_doc);
+	return n;
+}
+
 U0 GxDrawIt(CTask *task, CDC *dc)
 {
 	I64	 i, oy, view_top = GX_CHROME_H, mx, my, wr, zpass;
+	I64	 selc0, selc1, selcw, selx, selw;
 	I64	 view_h = task->pix_height - GX_CHROME_H - GX_STATUS_H, th, ty;
 	CGxOp *op;
 	U8	*hover = NULL;
@@ -2320,15 +2372,18 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 					if (op->href && op->x <= mx < op->x + op->w &&
 						oy <= my < oy + op->h)
 						hover = op->href;
-					if (GxOpSelected(op))
-					{//selection: accent frame (run DC is opaque; no alpha fill)
-						dc->color = de_theme.accent;
-						GrRect(dc, op->x - 1, oy - 1, op->w + 2, 1);
-						GrRect(dc, op->x - 1, oy + op->h, op->w + 2, 1);
-						GrRect(dc, op->x - 1, oy - 1, 1, op->h + 2);
-						GrRect(dc, op->x + op->w, oy - 1, 1, op->h + 2);
-					}
 					GrBlot(dc, op->x, oy, op->sc);
+					if (GxOpSelRange(op, &selc0, &selc1))
+					{//selection tint OVER the selected chars: alternate scanlines
+					 //(the run DC is opaque - stripes read as a translucent
+					 //highlight while the glyphs stay visible between them)
+						selcw = MaxI64(1, op->w / MaxI64(1, StrLen(op->text)));
+						selx = op->x + selc0 * selcw;
+						selw = (selc1 - selc0) * selcw;
+						dc->color = de_theme.accent;
+						for (wr = 0; wr < op->h; wr += 2)
+							GrRect(dc, selx, oy + wr, selw, 1);
+					}
 					if (op->ul)
 					{//underline sits ~at the baseline (~4/5 down the line box)
 						dc->color = op->fg;
@@ -2336,15 +2391,16 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 					}
 					break;
 				}
-				if (GxOpSelected(op))
-				{//selection highlight behind the glyphs
-					dc->color = de_theme.bttn_focus;
-					GrRect(dc, op->x, oy, op->w, op->h);
-				}
-				else if (op->has_bg)
+				if (op->has_bg)
 				{
 					dc->color = op->bg;
 					GrRect(dc, op->x, oy, op->w, op->h);
+				}
+				if (GxOpSelRange(op, &selc0, &selc1))
+				{//selection highlight behind the SELECTED chars only (8x8: exact)
+					dc->color = de_theme.bttn_focus;
+					GrRect(dc, op->x + selc0 * FONT_WIDTH, oy,
+						   (selc1 - selc0) * FONT_WIDTH, op->h);
 				}
 				if (op->href && op->x <= mx < op->x + op->w && oy <= my < oy + FONT_HEIGHT)
 				{
@@ -2385,14 +2441,23 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 				if (op->radius >= 0)
 					wr = MinI64(op->radius, op->h / 2);
 				if (op->wkind == GXW_SUBMIT || op->wkind == GXW_BUTTON)
-					// browser-native form buttons: LIGHT gray fill (was de_theme.bttn
-					// dark-navy = Google's search/Lucky/+ buttons rendered as dark pills)
-					GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
-								ColorRGB(0xF1, 0xF3, 0xF4), ColorRGB(0xC8, 0xCC, 0xD0));
+				{ // author background/border when styled, light UA default else
+					if (op->has_bg)
+						GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
+									op->fg, op->bg);
+					else
+						GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
+									ColorRGB(0xF1, 0xF3, 0xF4), op->bg);
+				}
 				else if (op->wkind == GXW_TEXT || op->wkind == GXW_AREA)
-					// text fields: WHITE (browser default), not dark de_theme.win_bg
-					GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
-								ColorRGB(0xFF, 0xFF, 0xFF), ColorRGB(0xC8, 0xCC, 0xD0));
+				{
+					if (op->has_bg)
+						GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
+									op->fg, op->bg);
+					else // UA default: white field
+						GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
+									ColorRGB(0xFF, 0xFF, 0xFF), op->bg);
+				}
 				else
 				{//check / radio / select: keep the crisp square look.
 					dc->color = de_theme.win_bg;
@@ -2441,8 +2506,11 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 					}
 				}
 				else if (op->wkind != GXW_CHECK && op->wkind != GXW_RADIO)
-				{ // dark text: form fields/buttons now have light backgrounds
-					dc->color = ColorRGB(0x20, 0x21, 0x24);
+				{ // author color if styled, else dark UA text on the light default
+					if (op->sh_col >= 0)
+						dc->color = GxPenBg(op->sh_col, de_theme.text);
+					else
+						dc->color = ColorRGB(0x20, 0x21, 0x24);
 					GrPrint(dc, op->x + 6, oy + (op->h - FONT_HEIGHT) / 2, "%s", op->text);
 				}
 				break;
@@ -3708,13 +3776,11 @@ public U0 ZincGX(U8 *start_url=NULL)
 			gx.sel_y1 = mouse.pos.y - Fs->pix_top - Fs->scroll_y
 						- GX_CHROME_H + gx.scroll;
 			if (!mouse.lb)
-			{
+			{ // release: selection STAYS highlighted; Ctrl-C copies it
 				gx.sel_drag = FALSE;
 				if (AbsI64(gx.sel_x1 - gx.sel_x0) +
 					AbsI64(gx.sel_y1 - gx.sel_y0) < 8)
 					gx.sel_on = FALSE; // just a click
-				else
-					GxSelCopy;
 			}
 		}
 
@@ -3850,12 +3916,14 @@ public U0 ZincGX(U8 *start_url=NULL)
 							gx.url_focus = FALSE;
 						else if (a1 == 1)  //Ctrl+A: select all.
 							gx.url_selall = TRUE;
-						else if (a1 == 3)  //Ctrl+C: copy the URL.
+						else if (a1 == 3)  //Ctrl+C: copy the URL to the OS clipboard.
 						{
 							MemCopy(gx_clip, gx.url, gx.url_len + 1);
 							gx_clip_len = gx.url_len;
+							ClipDel;
+							DocPrint(sys_clip_doc, "%s", gx.url);
 						}
-						else if (a1 == 22) //Ctrl+V: paste.
+						else if (a1 == 22) //Ctrl+V: paste from the OS clipboard.
 						{
 							if (gx.url_selall)
 							{
@@ -3864,6 +3932,7 @@ public U0 ZincGX(U8 *start_url=NULL)
 								gx.url[0] = 0;
 								gx.url_selall = FALSE;
 							}
+							gx_clip_len = GxClipTextGet(gx_clip, 250);
 							for (vi = 0; vi < gx_clip_len; vi++)
 								if (' ' <= gx_clip[vi] < 0x7F)
 									GxUrlIns(gx_clip[vi]);
@@ -3905,6 +3974,10 @@ public U0 ZincGX(U8 *start_url=NULL)
 						case CH_ESC:
 						case CH_SHIFT_ESC:
 							gx.quit = TRUE;
+							break;
+						case 3: //Ctrl+C: copy the page text selection.
+							if (gx.sel_on)
+								GxSelCopy;
 							break;
 						case 12: //Ctrl+L: focus the URL bar, all selected.
 							gx.url_focus = TRUE;
