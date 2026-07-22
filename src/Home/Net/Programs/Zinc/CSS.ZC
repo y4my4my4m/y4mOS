@@ -662,8 +662,17 @@ I64 ZCssColor(U8 *val)
 			num[num_count++] = cur;
 		if (num_count == 3)
 		{
-			if (ZCssAlphaAfter(p) < 12)
-				return -1;
+			n = ZCssAlphaAfter(p); // alpha 0-255
+			if (n < 12)
+				return -1; // effectively transparent
+			if (n < 245)
+			{ // partial alpha: composite over WHITE (light-page assumption). Without
+			  // this, Material's rgba(0,0,0,.05)-style subtle fills render solid black
+			  // (Google's search-box buttons). Blended = a*c + (1-a)*255 per channel.
+				num[0] = (num[0] * n + 255 * (255 - n)) / 255;
+				num[1] = (num[1] * n + 255 * (255 - n)) / 255;
+				num[2] = (num[2] * n + 255 * (255 - n)) / 255;
+			}
 			return (num[0] & 0xFF) << 16 | (num[1] & 0xFF) << 8 | (num[2] & 0xFF);
 		}
 		return -1;

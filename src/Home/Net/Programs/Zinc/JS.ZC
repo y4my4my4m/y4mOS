@@ -468,6 +468,7 @@ class CJsTok
 	F64	 num;
 	U8	*str;
 	I64	 punct;
+	I64	 src;	// byte offset of this token in the source (for parse-error logs)
 };
 
 class CJsEnv
@@ -492,6 +493,7 @@ class CJsInterp
 	U8		 err[144];
 	Bool	 has_err;
 	CJsTok	*toks;
+	U8		*src_text;	// original source (for raw-source parse-error logging)
 	I64		 tok_count, pos;
 	CJsTimer	*timers;		// setTimeout/setInterval/async-XHR queue
 	CJsListener	*listeners;		// addEventListener + el.onX handlers
@@ -868,8 +870,11 @@ Bool JsLex(CJsInterp *ji, U8 *src)
 {
 	U8	*p = src;
 	I64	 cap = StrLen(src) + 16, n = 0, punct, len, quote;
+	I64	 tok_off, n_before;
 	U8	 sbuf[1024];
 	CJsTok *t;
+
+	ji->src_text = src; // for raw-source parse-error logging
 	I64	 tpl_brace[8], tpl_sp = 0;	// template-literal nesting state
 
 	// template literals desugar into extra tokens ( str + ( expr ) ... )
@@ -889,6 +894,8 @@ Bool JsLex(CJsInterp *ji, U8 *src)
 
 	while (*p)
 	{
+		tok_off  = p - src; // source offset of whatever token(s) this iteration adds
+		n_before = n;
 		if (!(n & 2047))
 			Yield; // big bundles: stay cooperative while tokenizing
 		if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
@@ -1021,10 +1028,18 @@ Bool JsLex(CJsInterp *ji, U8 *src)
 		{
 			punct = 0;
 			if (!StrNCompare(p, "...", 3))		{ punct = JP_SPREAD; p += 3; }
-			else if (!StrNCompare(p, "?.", 2))	{ punct = JP_OPTCHAIN; p += 2; }
+			// `?.` is optional chaining ONLY if not followed by a digit; `x?.5:y`
+			// is the ternary `x ? .5 : y` (0.5), NOT `x?.` then `5`. This bites hard
+			// in minified bundles: `(e.crawler?.8:1.35)` etc.
+			else if (!StrNCompare(p, "?.", 2) && !('0' <= p[2] <= '9'))
+												{ punct = JP_OPTCHAIN; p += 2; }
 			else if (!StrNCompare(p, "??", 2))	{ punct = JP_NULLISH; p += 2; }
 			else if (!StrNCompare(p, "===", 3))	{ punct = JP_EQ3;	p += 3; }
 			else if (!StrNCompare(p, "!==", 3))	{ punct = JP_NE3;	p += 3; }
+			// `>>>=` MUST be checked before `>>>` (longest match). Mapped to JP_SHREQ:
+			// parse-correct compound assign; only differs from true unsigned shift on
+			// negative operands (the common `x>>>=0` uint32-coercion is identical).
+			else if (!StrNCompare(p, ">>>=", 4)) { punct = JP_SHREQ; p += 4; }
 			else if (!StrNCompare(p, ">>>", 3))	{ punct = JP_SHR3;	p += 3; }
 			else if (!StrNCompare(p, "&&=", 3))	{ punct = JP_ANDEQ;	p += 3; }
 			else if (!StrNCompare(p, "||=", 3))	{ punct = JP_OREQ;	p += 3; }
@@ -1125,6 +1140,11 @@ js_tpl_part:
 			return FALSE;
 		}
 js_lex_next:;
+		while (n_before < n) // tag every token this iteration produced with its offset
+		{
+			ji->toks[n_before].src = tok_off;
+			n_before++;
+		}
 	}
 
 	t = &ji->toks[n++];
@@ -1315,6 +1335,25 @@ U8 *jp_desc[34] = {
 	">>=", "**=", "in", "instanceof"
 };
 
+U0 JsSrcSnippet(CJsInterp *ji, I64 pos, U8 *out)
+{ // ~56 chars of RAW source at token `pos` - pinpoints the exact failing construct
+  // (token-window logs only show where recovery lands, not the root). out >= 64.
+	U8	*s;
+	I64	 i;
+	out[0] = 0;
+	if (!ji->src_text || pos < 0 || pos >= ji->tok_count)
+		return;
+	s = ji->src_text + ji->toks[pos].src;
+	for (i = 0; i < 56 && s[i] && s[i] != '\n'; i++)
+	{
+		if (s[i] == 0x24)
+			out[i] = '?'; // dollar = live DolDoc command in the log
+		else
+			out[i] = s[i];
+	}
+	out[i] = 0;
+}
+
 U0 JsTokDesc(CJsInterp *ji, I64 idx, U8 *out)
 { // short printable form of one token, for parse diagnostics. out >= 16 bytes.
 	CJsTok *t;
@@ -1386,7 +1425,15 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 			return JsParseFunc(ji, FALSE);
 		}
 		if (JsEatKw(ji, "new"))
-		{ // real construction: JN_CALL sees the JN_NEW wrapper and constructs
+		{ // new.target meta-property: evaluate to undefined (we don't track it)
+			if (JsIsPunct(ji, '.'))
+			{
+				ji->pos++;			// eat '.'
+				if (JsTok(ji)->type == JT_IDENT)
+					ji->pos++;		// eat 'target'
+				return JsNode(ji, JN_UNDEFLIT);
+			}
+			// real construction: JN_CALL sees the JN_NEW wrapper and constructs
 			node = JsNode(ji, JN_NEW);
 			node->a = JsParsePrimary(ji);
 			return node;
@@ -1451,7 +1498,11 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 				if (embuf[emk] == 0x24)
 					embuf[emk] = '?';
 			if (++js_soft_errs <= 12)
+			{
 				NetLog("JS: %s", embuf);
+				JsSrcSnippet(ji, ji->pos, embuf);
+				NetLog("JS:  src: %s", embuf); // raw source at the desync
+			}
 			emk = 1;
 			while (emk > 0 && JsTok(ji)->type != JT_EOF)
 			{
@@ -1624,7 +1675,11 @@ CJsNode *JsParsePrimary(CJsInterp *ji)
 		if (embuf[emk] == 0x24)
 			embuf[emk] = '?'; // dollars are live DolDoc commands in the log
 	if (++js_soft_errs <= 12)
+	{
 		NetLog("JS: %s", embuf);
+		JsSrcSnippet(ji, ji->pos, embuf);
+		NetLog("JS:  src: %s", embuf); // raw source at the desync
+	}
 	ji->pos++;
 
 	return NULL;
@@ -1920,8 +1975,8 @@ CJsNode *JsParseCond(CJsInterp *ji)
 CJsNode *JsParseAssign(CJsInterp *ji)
 {
 	CJsNode *node, *wrap, *fn, *param, *ptail, *ret, *blk;
-	I64		 op = -1, k, j;
-	Bool	 arrow = FALSE, plist = FALSE;
+	I64		 op = -1, k, j, dep;
+	Bool	 arrow = FALSE, plist = FALSE, is_rest;
 
 	if (JsIsKw(ji, "yield"))
 	{ // generators run eagerly (no suspension): yield x just produces x
@@ -1952,19 +2007,24 @@ CJsNode *JsParseAssign(CJsInterp *ji)
 		ji->toks[k + 1].punct == JP_ARROW)
 		arrow = TRUE;
 	else if (ji->toks[k].type == JT_PUNCT && ji->toks[k].punct == '(')
-	{ // commit only when the shape between parens is exactly idents + commas
+	{ // ANY balanced ( ... ) immediately followed by => is an arrow, regardless of
+	  // what the params look like: (a,b)=>, ([,l])=>, ({x})=>, (a=1)=>, (...r)=>, ()=>
 		j = k + 1;
-		while (j + 1 < ji->tok_count && ji->toks[j].type == JT_IDENT &&
-			   ji->toks[j + 1].type == JT_PUNCT && ji->toks[j + 1].punct == ',')
-			j += 2;
-		if (j + 1 < ji->tok_count && ji->toks[j].type == JT_IDENT &&
-			ji->toks[j + 1].type == JT_PUNCT && ji->toks[j + 1].punct == ')')
-			j += 2;
-		else if (ji->toks[j].type == JT_PUNCT && ji->toks[j].punct == ')')
+		dep = 1;
+		while (j < ji->tok_count && dep > 0)
+		{
+			if (ji->toks[j].type == JT_PUNCT)
+			{
+				if (ji->toks[j].punct == '(' || ji->toks[j].punct == '[' ||
+					ji->toks[j].punct == '{')
+					dep++;
+				else if (ji->toks[j].punct == ')' || ji->toks[j].punct == ']' ||
+						 ji->toks[j].punct == '}')
+					dep--;
+			}
 			j++;
-		else
-			j = 0;
-		if (j > 0 && j < ji->tok_count && ji->toks[j].type == JT_PUNCT &&
+		}
+		if (dep == 0 && j < ji->tok_count && ji->toks[j].type == JT_PUNCT &&
 			ji->toks[j].punct == JP_ARROW)
 		{
 			arrow = TRUE;
@@ -1976,18 +2036,44 @@ CJsNode *JsParseAssign(CJsInterp *ji)
 		fn = JsNode(ji, JN_FUNC);
 		ptail = NULL;
 		if (plist)
-		{
+		{ // tolerant params (same shapes as JsParseFunc): ident, ...rest, a=default,
+		  // and destructuring {..}/[..] (pattern skipped, names bind undefined).
 			ji->pos = k + 1;
-			while (JsTok(ji)->type == JT_IDENT)
+			while (!JsIsPunct(ji, ')') && JsTok(ji)->type != JT_EOF)
 			{
-				param = JsNode(ji, JN_IDENT);
-				param->str = JsTok(ji)->str;
-				ji->pos++;
-				if (ptail)
-					ptail->next = param;
+				is_rest = JsEatPunct(ji, JP_SPREAD);
+				if (JsIsPunct(ji, '{') || JsIsPunct(ji, '['))
+				{ // destructured param: balance-skip the pattern
+					dep = 0;
+					do
+					{
+						if (JsIsPunct(ji, '{') || JsIsPunct(ji, '['))
+							dep++;
+						else if (JsIsPunct(ji, '}') || JsIsPunct(ji, ']'))
+							dep--;
+						ji->pos++;
+					}
+					while (dep > 0 && JsTok(ji)->type != JT_EOF);
+					if (JsEatPunct(ji, '='))
+						JsParseAssign(ji); // pattern default, discarded
+				}
+				else if (JsTok(ji)->type == JT_IDENT)
+				{
+					param = JsNode(ji, JN_IDENT);
+					param->str = JsTok(ji)->str;
+					ji->pos++;
+					if (is_rest)
+						param->op = 1; // rest marker
+					else if (JsEatPunct(ji, '='))
+						param->a = JsParseAssign(ji); // default value
+					if (ptail)
+						ptail->next = param;
+					else
+						fn->a = param;
+					ptail = param;
+				}
 				else
-					fn->a = param;
-				ptail = param;
+					ji->pos++; // unexpected token in params: skip, keep going
 				if (!JsEatPunct(ji, ','))
 					break;
 			}
@@ -2325,7 +2411,7 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 {
 	CJsNode *node, *item, *mtail, *ctail, *stmt2;
 	CJsTok	*t;
-	I64		 k;
+	I64		 k, kp, dep;
 
 	if (JsEatPunct(ji, ';'))
 		return NULL;
@@ -2399,22 +2485,47 @@ CJsNode *JsParseStmt(CJsInterp *ji)
 		node = JsNode(ji, JN_FOR);
 		if (!JsEatPunct(ji, '('))
 			JsErr(ji, "expected ( after for");
-		// for ( [var|let|const] name of|in iterable ) body
+		// for ( [var|let|const] binding of|in iterable ) body
+		// binding may be a plain name OR a destructuring pattern [i,o] / {a,b}
 		k = ji->pos;
 		if (ji->toks[k].type == JT_IDENT &&
 			(!StrCompare(ji->toks[k].str, "var") ||
 			 !StrCompare(ji->toks[k].str, "let") ||
 			 !StrCompare(ji->toks[k].str, "const")))
 			k++;
-		if (ji->toks[k].type == JT_IDENT && ji->toks[k + 1].type == JT_IDENT &&
-			(!StrCompare(ji->toks[k + 1].str, "of") ||
-			 !StrCompare(ji->toks[k + 1].str, "in")))
+		kp = k; // binding start
+		if (ji->toks[k].type == JT_PUNCT &&
+			(ji->toks[k].punct == '[' || ji->toks[k].punct == '{'))
+		{ // destructuring pattern binding: balance-skip it to find the of/in after
+			dep = 0;
+			do
+			{
+				if (ji->toks[k].type == JT_PUNCT &&
+					(ji->toks[k].punct == '[' || ji->toks[k].punct == '{'))
+					dep++;
+				else if (ji->toks[k].type == JT_PUNCT &&
+						 (ji->toks[k].punct == ']' || ji->toks[k].punct == '}'))
+					dep--;
+				k++;
+			}
+			while (dep > 0 && ji->toks[k].type != JT_EOF);
+		}
+		else if (ji->toks[k].type == JT_IDENT)
+			k++;
+		if (ji->toks[k].type == JT_IDENT &&
+			(!StrCompare(ji->toks[k].str, "of") ||
+			 !StrCompare(ji->toks[k].str, "in")))
 		{
 			node->type = JN_FOROF;
-			node->str = ji->toks[k].str;
-			if (!StrCompare(ji->toks[k + 1].str, "in"))
+			// loop var: plain ident binds normally; a pattern binds a placeholder
+			// (its names resolve undefined - parse+run over full destructuring).
+			if (ji->toks[kp].type == JT_IDENT)
+				node->str = ji->toks[kp].str;
+			else
+				node->str = "_forof";
+			if (!StrCompare(ji->toks[k].str, "in"))
 				node->op = 1;
-			ji->pos = k + 2;
+			ji->pos = k + 1;
 			node->a = JsParseAssign(ji);
 			if (!JsEatPunct(ji, ')'))
 				JsErr(ji, "expected ) after for-of");
