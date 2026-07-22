@@ -67,6 +67,7 @@ class CGxOp
 	I32				 sh_col;						//GXO_BOX: box-shadow color 0xRRGGBB (-1 = none).
 	I16				 sh_dx, sh_dy, sh_blur;			//GXO_BOX: box-shadow offset/blur px.
 	I16				 z;								//z-index paint bucket: 0 flow, >0 late (on top).
+	Bool			 pinned;						//position:fixed - ignores scroll.
 };
 
 //Decoded-image cache, keyed by absolute URL. Persists across relayout so we
@@ -123,6 +124,10 @@ class CGxGlobals
 	//it around each child; GxWidget consumes it so buttons/inputs fill the column
 	//(the default flex behavior every modern menu relies on). 0 = inactive.
 	I64		 flex_stretch_w;
+	//Text selection: drag anchor/end in DOC coordinates. On release the selected
+	//run text goes to the OS clipboard (sys_clip_doc) - paste anywhere with Ctrl-V.
+	Bool	 sel_drag, sel_on;
+	I64		 sel_x0, sel_y0, sel_x1, sel_y1;
 	//Current visual background RGB under the cursor (-1 none): the nearest
 	//ancestor box's bg, so scalable-font text anti-aliases against the RIGHT
 	//color (background is not inherited, so run styles rarely carry it).
@@ -404,6 +409,7 @@ U0 GxRunFlush()
 			if (op)
 			{
 				op->sc	 = fdc;		//owned; freed on reset (type != GXO_IMG)
+				op->text = StrNew(gx.run); //kept for selection/clipboard copy
 				op->fg	 = GxPen(gx.run_style.fg, gx.text_pen);
 				op->ul	 = gx.run_style.underline == 1 ||
 						   (gx.run_link && gx.run_style.underline != 0);
@@ -2151,6 +2157,72 @@ U0 GxRoundRect(CDC *dc, I64 x, I64 y, I64 w, I64 h, I64 r, U32 fill, U32 border)
 		GxRoundFill(dc, x + 1, y + 1, w - 2, h - 2, r - 1, fill);
 }
 
+Bool GxOpSelected(CGxOp *op)
+{ // is this text op inside the current selection? Band model: whole lines
+  // between the anchor and end lines; partial by x on the first/last line.
+	I64 x0, y0, x1, y1, t;
+
+	if (!gx.sel_on || op->type != GXO_TEXT || !op->text)
+		return FALSE;
+	x0 = gx.sel_x0;
+	y0 = gx.sel_y0;
+	x1 = gx.sel_x1;
+	y1 = gx.sel_y1;
+	if (y1 < y0)
+	{ // normalize: anchor above end
+		t = y0; y0 = y1; y1 = t;
+		t = x0; x0 = x1; x1 = t;
+	}
+	else if (y1 - y0 < FONT_HEIGHT && x1 < x0)
+	{ // single line, dragged right-to-left
+		t = x0; x0 = x1; x1 = t;
+	}
+	if (op->y + op->h <= y0 || op->y > y1)
+		return FALSE;
+	if (y0 >= op->y && y0 < op->y + op->h && op->x + op->w <= x0)
+		return FALSE; // first selection line: op entirely before the anchor x
+	if (y1 >= op->y && y1 < op->y + op->h && op->x >= x1)
+		return FALSE; // last selection line: op entirely after the end x
+	return TRUE;
+}
+
+U0 GxSelCopy()
+{ // put the selected text on the OS clipboard (sys_clip_doc): reuses the stock
+  // DolDoc clip, so Ctrl-V pastes it in any editor/terminal in the system.
+	U8	*buf;
+	I64	 i, n = 0, last_y = I64_MIN;
+	U8	*s;
+
+	buf = MAlloc(8192);
+	for (i = 0; i < gx.op_count && n < 8000; i++)
+	{
+		if (!GxOpSelected(&gx.ops[i]))
+			goto gx_selcopy_next;
+		if (last_y != I64_MIN && gx.ops[i].y >= last_y + FONT_HEIGHT)
+			buf[n++] = '\n'; // new layout line -> newline
+		else if (last_y != I64_MIN)
+			buf[n++] = ' ';	 // same line, separate run
+		s = gx.ops[i].text;
+		while (*s && n < 7996)
+		{
+			if (*s == 0x24)
+				buf[n++] = 0x24; // literal dollars must be DOUBLED for DolDoc
+			buf[n++] = *s;
+			s++;
+		}
+		last_y = gx.ops[i].y;
+gx_selcopy_next:;
+	}
+	buf[n] = 0;
+	if (n)
+	{
+		ClipDel;
+		DocPrint(sys_clip_doc, "%s", buf);
+		StrCopy(zinc_note, "selection copied to clipboard (Ctrl-V to paste)");
+	}
+	Free(buf);
+}
+
 U0 GxDrawIt(CTask *task, CDC *dc)
 {
 	I64	 i, oy, view_top = GX_CHROME_H, mx, my, wr, zpass;
@@ -2182,7 +2254,10 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 			goto gx_draw_next;
 		if (zpass == 1 && op->z <= 0)
 			goto gx_draw_next;
-		oy = op->y - gx.scroll + view_top;
+		if (op->pinned)
+			oy = op->y + view_top; // position:fixed - viewport-pinned
+		else
+			oy = op->y - gx.scroll + view_top;
 		if (oy + op->h < view_top || oy > view_top + view_h)
 			goto gx_draw_next;
 		switch (op->type)
@@ -2245,6 +2320,14 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 					if (op->href && op->x <= mx < op->x + op->w &&
 						oy <= my < oy + op->h)
 						hover = op->href;
+					if (GxOpSelected(op))
+					{//selection: accent frame (run DC is opaque; no alpha fill)
+						dc->color = de_theme.accent;
+						GrRect(dc, op->x - 1, oy - 1, op->w + 2, 1);
+						GrRect(dc, op->x - 1, oy + op->h, op->w + 2, 1);
+						GrRect(dc, op->x - 1, oy - 1, 1, op->h + 2);
+						GrRect(dc, op->x + op->w, oy - 1, 1, op->h + 2);
+					}
 					GrBlot(dc, op->x, oy, op->sc);
 					if (op->ul)
 					{//underline sits ~at the baseline (~4/5 down the line box)
@@ -2253,7 +2336,12 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 					}
 					break;
 				}
-				if (op->has_bg)
+				if (GxOpSelected(op))
+				{//selection highlight behind the glyphs
+					dc->color = de_theme.bttn_focus;
+					GrRect(dc, op->x, oy, op->w, op->h);
+				}
+				else if (op->has_bg)
 				{
 					dc->color = op->bg;
 					GrRect(dc, op->x, oy, op->w, op->h);
@@ -3612,12 +3700,43 @@ public U0 ZincGX(U8 *start_url=NULL)
 			gx.scroll = ClampI64(gx.scroll, 0, MaxI64(0, gx.doc_h - view_h));
 		}
 
+		//Text selection drag: track the end point live; on release copy to the
+		//OS clipboard (a short drag counts as a plain click - no selection).
+		if (gx.sel_drag)
+		{
+			gx.sel_x1 = mouse.pos.x - Fs->pix_left - Fs->scroll_x;
+			gx.sel_y1 = mouse.pos.y - Fs->pix_top - Fs->scroll_y
+						- GX_CHROME_H + gx.scroll;
+			if (!mouse.lb)
+			{
+				gx.sel_drag = FALSE;
+				if (AbsI64(gx.sel_x1 - gx.sel_x0) +
+					AbsI64(gx.sel_y1 - gx.sel_y0) < 8)
+					gx.sel_on = FALSE; // just a click
+				else
+					GxSelCopy;
+			}
+		}
+
 		while (msg = MessageScan(&a1, &a2))
 		{
 			switch (msg)
 			{
 				case MESSAGE_MS_L_DOWN:
 					GxClick(a1, a2);
+					//Begin a potential text-selection drag in the page area.
+					gx.sel_x0 = mouse.pos.x - Fs->pix_left - Fs->scroll_x;
+					gx.sel_y0 = mouse.pos.y - Fs->pix_top - Fs->scroll_y
+								- GX_CHROME_H + gx.scroll;
+					if (gx.sel_y0 > 0)
+					{
+						gx.sel_x1  = gx.sel_x0;
+						gx.sel_y1  = gx.sel_y0;
+						gx.sel_drag = TRUE;
+						gx.sel_on	= TRUE;
+					}
+					else
+						gx.sel_on = FALSE;
 					break;
 				case MESSAGE_MS_R_DOWN:
 					GxRightClick(a1, a2);

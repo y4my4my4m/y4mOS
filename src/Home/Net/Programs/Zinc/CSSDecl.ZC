@@ -572,6 +572,27 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 				out->justify = 0;
 		}
 	}
+	else if (!StrICompare(name, "content"))
+	{ // ::before/::after generated content: plain quoted strings only
+	  // (counter()/attr()/url() forms are skipped)
+		if (*val == '"' || *val == 0x27)
+		{
+			if (zcss_content_count < ZCSS_CONTENT_MAX)
+			{
+				p = val + 1;
+				n = 0;
+				while (*p && *p != val[0] && n < 46)
+				{
+					if (*p == '\\' && p[1])
+						p++; // CSS escape: keep the escaped char
+					zcss_content[zcss_content_count][n++] = *p++;
+				}
+				zcss_content[zcss_content_count][n] = 0;
+				out->content_idx = zcss_content_count;
+				zcss_content_count++;
+			}
+		}
+	}
 	else if (!StrICompare(name, "overflow") || !StrICompare(name, "overflow-y"))
 	{ // hidden/clip cull content below the box's declared height. auto/scroll
 	  // render as visible (no scrollable inner boxes).

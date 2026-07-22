@@ -793,14 +793,19 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 
 	if (author->ovf_hide == 1 && author->height > 0)
 	{ // overflow:hidden with a declared height: cull ops fully below the clip
-	  // bottom (crude clip - no partial cuts, but stray overflow disappears).
+	  // bottom; boxes/rects straddling the edge are shrunk to it (partial clip).
 		dy = box_y0 + author->height;
 		for (bw = op0; bw < gx.op_count; bw++)
+		{
 			if (gx.ops[bw].y >= dy)
 			{
 				gx.ops[bw].w = 0;
 				gx.ops[bw].h = 0;
 			}
+			else if (gx.ops[bw].y + gx.ops[bw].h > dy &&
+					 (gx.ops[bw].type == GXO_BOX || gx.ops[bw].type == GXO_RECT))
+				gx.ops[bw].h = dy - gx.ops[bw].y;
+		}
 	}
 	if (author->zidx > 0)
 	{ // z-index: mark the subtree's ops for the late paint pass. Children that
@@ -808,6 +813,11 @@ U0 L2Block(CZNode *node, CZStyle *style, CZStyle *author)
 		for (bw = op0; bw < gx.op_count; bw++)
 			if (!gx.ops[bw].z)
 				gx.ops[bw].z = author->zidx;
+	}
+	if (author->pos == 3)
+	{ // position:fixed - the whole subtree pins to the viewport (no scroll)
+		for (bw = op0; bw < gx.op_count; bw++)
+			gx.ops[bw].pinned = TRUE;
 	}
 }
 
@@ -954,6 +964,7 @@ U0 L2SpriteInline(CZNode *node, CZStyle *author)
 U0 L2Node(CZNode *node, CZStyle *inh)
 {
 	CZStyle style, author;
+	U8	   *gen;
 
 	if (!node || gx.op_count >= GX_OPS_MAX - 8)
 		return;
@@ -970,6 +981,12 @@ U0 L2Node(CZNode *node, CZStyle *inh)
 	ZCssApply(node, &author);
 	if (author.display == ZCSS_DISP_NONE)
 		return;
+
+	gen = NULL;
+	if (zcss_has_gen)
+		gen = ZCssGenText(node, 5); // ::before generated content flows first
+	if (gen)
+		GxText(gen, inh, GxScaleOf(inh), FALSE);
 
 	if (author.bg_img >= 0 && author.width > 0 && author.width <= 64 &&
 		author.height > 0 && author.height <= 64 && !node->first_child)
@@ -993,10 +1010,20 @@ U0 L2Node(CZNode *node, CZStyle *inh)
 	if (!L2Handles(node, &author))
 	{ // v1 engine lays this subtree (inline runs, lists, tables, widgets...)
 		GxNode(node, inh);
+		gen = NULL;
+		if (zcss_has_gen)
+			gen = ZCssGenText(node, 6); // ::after content
+		if (gen)
+			GxText(gen, inh, GxScaleOf(inh), FALSE);
 		return;
 	}
 
 	ZStyleMerge(&style, &author);
 	style.display = -1;
 	L2Block(node, &style, &author);
+	gen = NULL;
+	if (zcss_has_gen)
+		gen = ZCssGenText(node, 6); // ::after content
+	if (gen)
+		GxText(gen, inh, GxScaleOf(inh), FALSE);
 }

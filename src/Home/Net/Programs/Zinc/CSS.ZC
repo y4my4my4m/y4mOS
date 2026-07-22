@@ -73,6 +73,7 @@ class CZStyle
 	I8	tf_set;					// 1 = transform translate present
 	I8	ovf_hide;				// overflow: -1 unset, 1 hidden/clip, 0 visible
 	I16 zidx;					// z-index; 0 = auto/unset, >0 paints late (on top)
+	I16 content_idx;			// content:"str" intern index (::before/::after); -1
 };
 
 class CZCssRule
@@ -152,6 +153,7 @@ U0 ZStyleReset(CZStyle *s)
 	s->tf_set = 0;
 	s->ovf_hide = -1;
 	s->zidx = 0;
+	s->content_idx = -1;
 }
 
 U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
@@ -216,6 +218,7 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	}
 	if (src->ovf_hide >= 0) dst->ovf_hide = src->ovf_hide;
 	if (src->zidx)			 dst->zidx	   = src->zidx;
+	if (src->content_idx >= 0) dst->content_idx = src->content_idx;
 }
 
 U0 ZStyleStripBox(CZStyle *s)
@@ -263,6 +266,7 @@ U0 ZStyleStripBox(CZStyle *s)
 	s->tf_set = 0;
 	s->ovf_hide = -1;
 	s->zidx = 0;
+	s->content_idx = -1;
 }
 
 /* ---- CSS custom properties (variables) ----
@@ -291,6 +295,12 @@ public I64 zcss_view_h = 700;
    stores an index into this per-page table instead of a string. */
 #define ZCSS_BGIMG_MAX	128
 public U8	zcss_bgimg[ZCSS_BGIMG_MAX][192];
+
+/* ---- ::before/::after generated content (plain strings only) ---- */
+#define ZCSS_CONTENT_MAX 64
+public U8  zcss_content[ZCSS_CONTENT_MAX][48];
+public I64 zcss_content_count = 0; // reset per page
+public Bool zcss_has_gen = FALSE;  // any ::before/::after rule present
 I64			zcss_bgimg_count = 0; // reset per page; JIT zeroes nothing
 
 /* ---- linear-gradient backgrounds (storage) ----
@@ -479,6 +489,8 @@ U0 ZCssReset()
 	zcss_var_count = 0;
 	zcss_bgimg_count = 0;
 	zcss_grad_count = 0;
+	zcss_content_count = 0;
+	zcss_has_gen = FALSE;
 	zcss_rem_px = 16; // page may rebase via html{font-size:%}
 	zh_dom_gen++; // stylesheet set changed: invalidate memoized styles
 }
@@ -800,9 +812,20 @@ zcss_nth_done:;
 zcss_not_done:;
 				p = q;
 			}
+			else if (!StrCompare(pname, "before"))
+			{ // generated content: special rule consulted by the layout, never
+			  // matched against the element itself
+				pseudo = 5;
+				p = q;
+			}
+			else if (!StrCompare(pname, "after"))
+			{
+				pseudo = 6;
+				p = q;
+			}
 			else
-				return; // state/generated pseudos (:hover, ::before, :is, ...):
-						// statically never match - drop the rule (correct)
+				return; // state pseudos (:hover, :is, ...): statically never
+						// match - drop the rule (correct)
 		}
 		else
 		{
@@ -879,6 +902,8 @@ zcss_not_done:;
 	StrCopy(rule->sel_attr, abuf);		// [attr(=val)] filter ("" = none)
 	StrCopy(rule->sel_attr_val, avbuf);
 	rule->pseudo = pseudo;
+	if (pseudo >= 5)
+		zcss_has_gen = TRUE;
 
 	rule->spec = ZCssSimpleSpec(rule->sel_tag, rule->sel_class, rule->sel_id);
 	if (rule->has_anc)
@@ -1080,6 +1105,8 @@ Bool ZCssRuleMatch(CZCssRule *rule, CZNode *node)
 	I64		idx;
 	Bool	is_last;
 
+	if (rule->pseudo >= 5)
+		return FALSE; // ::before/::after style generated content, not the element
 	if (!ZCssSimpleMatch(rule->sel_tag, rule->sel_class, rule->sel_id, node))
 		return FALSE;
 	if (rule->sel_attr[0])
@@ -1143,6 +1170,54 @@ zcss_pseudo_ok:;
 	}
 
 	return TRUE;
+}
+
+public U8 *ZCssGenText(CZNode *node, I64 where)
+{ // generated-content lookup: the ::before (where=5) / ::after (where=6) rule
+  // text for this element, or NULL. Highest specificity wins.
+	CZCssRule *r;
+	CZNode	  *anc;
+	I64		   i, best_spec = -1, best = -1;
+	Bool	   ok;
+
+	for (i = 0; i < zcss_rule_count; i++)
+	{
+		r = &zcss_rules[i];
+		if (r->pseudo != where || r->style.content_idx < 0)
+			goto zcss_gen_next;
+		if (!ZCssSimpleMatch(r->sel_tag, r->sel_class, r->sel_id, node))
+			goto zcss_gen_next;
+		if (r->has_anc)
+		{
+			ok = FALSE;
+			anc = node->parent;
+			if (r->anc_child)
+				ok = anc &&
+					 ZCssSimpleMatch(r->anc_tag, r->anc_class, r->anc_id, anc);
+			else
+				while (anc)
+				{
+					if (ZCssSimpleMatch(r->anc_tag, r->anc_class, r->anc_id, anc))
+					{
+						ok = TRUE;
+						anc = NULL;
+					}
+					else
+						anc = anc->parent;
+				}
+			if (!ok)
+				goto zcss_gen_next;
+		}
+		if (r->spec >= best_spec)
+		{
+			best_spec = r->spec;
+			best = r->style.content_idx;
+		}
+zcss_gen_next:;
+	}
+	if (best >= 0 && best < zcss_content_count && zcss_content[best][0])
+		return zcss_content[best];
+	return NULL;
 }
 
 #define ZCSS_MAX_MATCH 96
