@@ -1062,7 +1062,10 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 			if (op)
 			{
 				op->img_url = abs; //Owned by op; freed on reset.
-				op->fg = de_theme.panel;
+				// light placeholder: unloaded/failed images (e.g. Google's SVG icon
+				// buttons we can't fetch) were dark-navy de_theme.panel = looked like
+				// solid dark pills on a light page. Web pages expect a light canvas.
+				op->fg = ColorRGB(0xE8, 0xE8, 0xEA);
 			}
 			else
 				Free(abs);
@@ -1074,7 +1077,7 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 		attr = ZNodeAttr(node, "alt");
 		op = GxOpAdd(GXO_RECT, gx.x, gx.y, 60, 16);
 		if (op)
-			op->fg = de_theme.panel;
+			op->fg = ColorRGB(0xE8, 0xE8, 0xEA); // light broken-image box (was dark navy)
 		if (attr && *attr)
 			GxText(attr, &style, 1, FALSE);
 		else
@@ -2187,7 +2190,10 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 					if (gx.page_has_bg)
 						dc->color = GxPenBg(gx.page_bg, de_theme.win_bg);
 					else
-						dc->color = de_theme.win_bg;
+						dc->color = ColorRGB(0xFF, 0xFF, 0xFF); // border-only rounded
+						// boxes fill their interior to form the corners; when the page
+						// bg wasn't detected assume a WHITE canvas (web default) - was
+						// dark-navy de_theme.win_bg = Google's search pills went dark.
 					wr = dc->color; //fill for border-only rounded boxes
 					if (op->has_bg && op->ul)
 						GxRoundRect(dc, op->x, oy, op->w, op->h, op->wkind,
@@ -2275,11 +2281,14 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 				if (op->radius >= 0)
 					wr = MinI64(op->radius, op->h / 2);
 				if (op->wkind == GXW_SUBMIT || op->wkind == GXW_BUTTON)
+					// browser-native form buttons: LIGHT gray fill (was de_theme.bttn
+					// dark-navy = Google's search/Lucky/+ buttons rendered as dark pills)
 					GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
-								de_theme.bttn, de_theme.panel_edge);
+								ColorRGB(0xF1, 0xF3, 0xF4), ColorRGB(0xC8, 0xCC, 0xD0));
 				else if (op->wkind == GXW_TEXT || op->wkind == GXW_AREA)
+					// text fields: WHITE (browser default), not dark de_theme.win_bg
 					GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
-								de_theme.win_bg, de_theme.panel_edge);
+								ColorRGB(0xFF, 0xFF, 0xFF), ColorRGB(0xC8, 0xCC, 0xD0));
 				else
 				{//check / radio / select: keep the crisp square look.
 					dc->color = de_theme.win_bg;
@@ -2318,7 +2327,7 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 						dc->color = de_theme.bttn_focus;
 						GrRect(dc, op->x + 5, fy - 1, fn * FONT_WIDTH, FONT_HEIGHT + 2);
 					}
-					dc->color = de_theme.text;
+					dc->color = ColorRGB(0x20, 0x21, 0x24); // dark: field is white now
 					GrPrint(dc, op->x + 6, fy, "%s", buf);
 					if (!gx.field_selall && Blink)
 					{
@@ -2328,8 +2337,8 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 					}
 				}
 				else if (op->wkind != GXW_CHECK && op->wkind != GXW_RADIO)
-				{
-					dc->color = de_theme.text;
+				{ // dark text: form fields/buttons now have light backgrounds
+					dc->color = ColorRGB(0x20, 0x21, 0x24);
 					GrPrint(dc, op->x + 6, oy + (op->h - FONT_HEIGHT) / 2, "%s", op->text);
 				}
 				break;
