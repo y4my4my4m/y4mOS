@@ -346,15 +346,16 @@ U0 YhMsgTime(U8 *created_at, U8 *hh, U8 *mm)
 	}
 }
 
-U0 YhFetchProfiles(U8 *idlist)
-{//idlist = "uuid,uuid,...". Fills the cache.
+U0 YhFetchProfilesChunk(U8 *ids)
+{//One in.() batch, <=16 ids (CHttpUrl.path is 1024 bytes - a 40-id list
+//OVERFLOWS it and the query silently truncates; that broke avatars).
 	CYhJson	*json, *row;
 
-	if (!*idlist)
+	if (!*ids)
 		return;
 	json = YhRest("GET",
 		"/rest/v1/profiles?id=in.(%s)&select=id,username,display_name,avatar_url",
-		NULL, idlist);
+		NULL, ids);
 	if (!json)
 		return;
 	row = json->child;
@@ -372,6 +373,44 @@ U0 YhFetchProfiles(U8 *idlist)
 		row = row->next;
 	}
 	YhjFree(json);
+}
+
+U0 YhFetchProfiles(U8 *idlist)
+{//Split a long comma-separated uuid list into URL-safe chunks of 16.
+	U8	chunk[16 * 40 + 8];
+	I64	n = 0, len = 0, seg;
+	U8	*p = idlist, *e;
+
+	while (*p)
+	{
+		e = StrFirstOcc(p, ",");
+		if (e)
+			seg = e - p;
+		else
+			seg = StrLen(p);
+		if (seg > 0 && seg < 40)
+		{
+			if (n)
+				chunk[len++] = ',';
+			MemCopy(chunk + len, p, seg);
+			len += seg;
+			chunk[len] = 0;
+			n++;
+			if (n == 16)
+			{
+				YhFetchProfilesChunk(chunk);
+				n = 0;
+				len = 0;
+				chunk[0] = 0;
+			}
+		}
+		if (e)
+			p = e + 1;
+		else
+			p += seg;
+	}
+	if (n)
+		YhFetchProfilesChunk(chunk);
 }
 
 U0 YhMsgRowAdd(I64 ci, CYhJson *row, U8 *missing, I64 missing_max)
@@ -461,16 +500,20 @@ U0 YhFetchReactions(I64 ci)
 
 	if (!ch->lines)
 		return;
+	//Newest 20 message ids only: CHttpUrl.path is 1024 bytes, a 40-uuid
+	//in.() list overflows it and the whole query silently breaks.
 	ids[0] = 0;
+	cnt = 0;
 	first = MaxI64(0, ch->count - YH_MAX_LINES);
-	for (i = first; i < ch->count; i++)
+	for (i = ch->count - 1; i >= first && cnt < 20; i--)
 	{
 		ln = &ch->lines[i % YH_MAX_LINES];
-		if (ln->id[0] && StrLen(ids) + 40 < sizeof(ids))
+		if (ln->id[0] && (ln->kind == YH_LK_MSG || ln->kind == YH_LK_SELF))
 		{
 			if (*ids)
 				CatPrint(ids, ",");
 			CatPrint(ids, "%s", ln->id);
+			cnt++;
 		}
 	}
 	if (!*ids)
@@ -499,7 +542,7 @@ U0 YhFetchReactions(I64 ci)
 			for (j = 0; j < n_emoji; j++)
 				if (!StrCompare(eid_list[j], eid))
 					k = j;
-			if (k < 0 && n_emoji < 32)
+			if (k < 0 && n_emoji < 16)	//16 max: keeps the in.() URL under 1024.
 			{
 				StrCopy(eid_list[n_emoji], eid);
 				StrCopy(enames[n_emoji], "?");
@@ -651,11 +694,9 @@ U0 YhFetchMessages(I64 ci, Bool initial)
 
 U0 YhSendMessage(U8 *text)
 {
-	U8		 esc[YH_TEXT_LEN * 2];
-	U8		*body;
+	U8		 esc[YH_TEXT_LEN * 2], reply[80];
+	U8		*body, *col;
 	CYhJson	*json;
-
-	U8		*col;
 
 	if (yh.cur_chan < 0)
 		return;
@@ -663,12 +704,15 @@ U0 YhSendMessage(U8 *text)
 		col = "conversation_id";
 	else
 		col = "channel_id";
+	reply[0] = 0;
+	if (yh.reply_to[0])
+		StrPrint(reply, "\"reply_to\":\"%s\",", yh.reply_to);
 	YhJsonEsc(esc, text, sizeof(esc));
 	body = MStrPrint(
-		"{\"user_id\":\"%s\",\"%s\":\"%s\","
+		"{\"user_id\":\"%s\",\"%s\":\"%s\",%s"
 		"\"content\":[{\"type\":\"text\",\"text\":\"%s\"}],"
 		"\"metadata\":{\"created_via\":\"yharmony_zealos\"}}",
-		yh.prof_id, col, yh.chans[yh.cur_chan].id, esc);
+		yh.prof_id, col, yh.chans[yh.cur_chan].id, reply, esc);
 	json = YhRest("POST", "/rest/v1/messages", body);
 	Free(body);
 	if (json)
@@ -677,9 +721,94 @@ U0 YhSendMessage(U8 *text)
 		if (json->child)
 			YhMsgRowAdd(yh.cur_chan, json->child, esc, sizeof(esc));
 		YhjFree(json);
+		yh.reply_to[0] = 0;	//One-shot.
+		yh.reply_nick[0] = 0;
 	}
 	else
 		YhStatus("Send failed.");
+}
+
+U8 *YhListAdd(U8 *w, U8 *fmt, ...)
+{//Append one PopUpPickList item plus its NUL separator; returns new write ptr.
+	U8 *s = StrPrintJoin(NULL, fmt, argc, argv);
+
+	StrCopy(w, s);
+	w += StrLen(s) + 1;
+	Free(s);
+	return w;
+}
+
+U0 YhReactAdd(CYhLine *ln)
+{//Right-click -> React: pick a custom emoji from this server's set (plus
+//instance-scope ones) and insert a reactions row. Chip appended locally.
+	CYhJson	*json, *row;
+	U8		 list[24 * 34 + 4], *w;
+	U8		 eids[24][YH_UUID_LEN];
+	I64		 n = 0, sel;
+	U8		*body, *nm, chip[48];
+
+	if (!ln || !ln->id[0])
+		return;
+	if (yh.cur_srv >= 0)
+		json = YhRest("GET",
+			"/rest/v1/emojis?or=(server_id.eq.%s,scope.eq.instance)"
+			"&order=usage_count.desc&limit=24&select=id,name",
+			NULL, yh.servers[yh.cur_srv].id);
+	else
+		json = YhRest("GET",
+			"/rest/v1/emojis?order=usage_count.desc&limit=24&select=id,name",
+			NULL);
+	if (!json || !json->child)
+	{
+		YhjFree(json);
+		YhStatus("No emojis available to react with.");
+		return;
+	}
+	w = list;
+	row = json->child;
+	while (row && n < 24)
+	{
+		nm = YhjStr(YhjGet(row, "name"), "?");
+		if (*YhjStr(YhjGet(row, "id")))
+		{
+			StrCopy(eids[n], YhjStr(YhjGet(row, "id")));
+			w = YhListAdd(w, ":%s:", nm);
+			n++;
+		}
+		row = row->next;
+	}
+	*w = 0;
+	if (!n)
+	{
+		YhjFree(json);
+		return;
+	}
+	sel = PopUpPickList(list);
+	if (sel < 0 || sel >= n)
+	{
+		YhjFree(json);
+		return;
+	}
+
+	body = MStrPrint("{\"message_id\":\"%s\",\"emoji_id\":\"%s\",\"user_id\":\"%s\"}",
+					 ln->id, eids[sel], yh.prof_id);
+	//Reuse the parsed emoji name for the local chip before freeing.
+	row = json->child;
+	while (sel--)
+		row = row->next;
+	StrPrint(chip, " {%s}", YhjStr(YhjGet(row, "name"), "?"));
+	YhjFree(json);
+
+	json = YhRest("POST", "/rest/v1/reactions", body);
+	Free(body);
+	if (json)
+	{
+		YhjFree(json);
+		if (StrLen(ln->text) + StrLen(chip) < YH_TEXT_LEN - 1)
+			CatPrint(ln->text, "%s", chip);
+	}
+	else
+		YhStatus("Reaction failed.");
 }
 
 /***** servers + channels *****/

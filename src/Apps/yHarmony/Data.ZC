@@ -94,6 +94,16 @@ class CYhProfile
 	I16	av;						//Avatar image cache idx, -1 none.
 };
 
+class CYhHit
+{//One clickable message row, recorded by the draw pass each frame so the
+//click handlers don't have to replay the layout.
+	I64	y0, y1;					//Row extent.
+	I64	nx0, nx1;				//Nick/avatar x range (click -> mention).
+	I64	ci, ring;				//Channel + absolute ring index.
+};
+
+#define YH_HIT_MAX	96
+
 class CYhGlobals
 {
 	I64			 state;
@@ -117,6 +127,13 @@ class CYhGlobals
 	CTask		*ui_task;		//Owner of all image DCs.
 	I64			 feed_tab_x, feed_tab_w;
 	I64			 dm_tab_x, dm_tab_w;
+	I64			 tab_scroll;	//First visible server tab (overflow scrolling).
+	I64			 tl_x, tl_w, tr_x, tr_w;	//"<" / ">" tab-arrow hit zones.
+	//Click targets recorded by the draw pass (WinMgr task) each frame.
+	CYhHit		 hits[YH_HIT_MAX];
+	I64			 hit_count;
+	//Reply-in-progress (right-click menu sets; cleared after send).
+	U8			 reply_to[YH_UUID_LEN], reply_nick[YH_NAME_LEN];
 	//Realtime.
 	CWs			*ws;
 	Bool		 ws_ok;

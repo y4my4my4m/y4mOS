@@ -8,7 +8,7 @@
 //
 //UI: login form (instance domain + email + password; Supabase URL and anon
 //key are auto-discovered from the instance's public /instance-info endpoint
-//and cached) -> chat. Server tabs + DMs + the "monyverse" fediverse feed on
+//and cached) -> chat. Server tabs + DMs + the Fediverse feed on
 //top, channel panel on the left, wheel/<PGUP>/<PGDN> scroll, <UP>/<DOWN>
 //input history, <ESC> quits, /config for settings.
 //
@@ -57,7 +57,8 @@ public U0 YHarmony()
 	StrCopy(Fs->task_title, "yHarmony");
 	WinHorz(MaxI64(1, (TEXT_COLS - 116) / 2), MaxI64(1, (TEXT_COLS - 116) / 2) + 115);
 	WinVert(MaxI64(2, (TEXT_ROWS - 56) / 2), MaxI64(2, (TEXT_ROWS - 56) / 2) + 55);
-	Fs->win_inhibit = old_inhibit | WIF_FOCUS_TASK_MS_L_D;
+	//L/R-DOWN must deliver instantly (skip the double-click timeout).
+	Fs->win_inhibit = old_inhibit | WIF_FOCUS_TASK_MS_L_D | WIF_FOCUS_TASK_MS_R_D;
 	WinFocus;
 	DocCursor(OFF);
 	DocClear;

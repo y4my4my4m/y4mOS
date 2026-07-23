@@ -12,7 +12,7 @@ I64 YhFeedChan()
 		return -1;
 	ch = &yh.chans[yh.num_chans];
 	MemSet(ch, 0, sizeof(CYhChan));
-	StrCopy(ch->name, "monyverse");
+	StrCopy(ch->name, "fediverse");
 	ch->server = YH_SRV_FEED;
 	StrCopy(ch->last_ts, "1970-01-01T00:00:00");
 	return yh.num_chans++;

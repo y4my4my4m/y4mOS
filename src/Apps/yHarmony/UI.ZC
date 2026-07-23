@@ -154,6 +154,183 @@ U0 YhLineHead(CYhLine *ln, U8 *head, CColorROPU32 *head_pen, CColorROPU32 *body_
 	}
 }
 
+U0 YhHitPush(I64 y0, I64 y1, I64 nx0, I64 nx1, I64 ci, I64 ring)
+{//Record a clickable message row for this frame (read by click handlers).
+	CYhHit *h;
+
+	if (yh.hit_count >= YH_HIT_MAX)
+		return;
+	h = &yh.hits[yh.hit_count];
+	h->y0 = y0;
+	h->y1 = y1;
+	h->nx0 = nx0;
+	h->nx1 = nx1;
+	h->ci = ci;
+	h->ring = ring;
+	yh.hit_count++;
+}
+
+U0 YhCRect(CDC *dc, I64 x, I64 y, I64 w, I64 h, I64 y0, I64 y1)
+{//GrRect clipped to the vertical band [y0, y1).
+	I64 a = MaxI64(y, y0), b = MinI64(y + h, y1);
+
+	if (b > a)
+		GrRect(dc, x, a, w, b - a);
+}
+
+U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
+			  I64 log_x, I64 log_y, I64 log_w, I64 log_h, I64 mx, I64 my)
+{//Mastodon-style cards, newest at the bottom, scrolled by yh.scroll rows.
+	I64	 y = log_y + log_h - 4 + yh.scroll * YH_ROW_H;
+	I64	 first = MaxI64(0, cb->count - YH_MAX_LINES);
+	I64	 i = cb->count - 1, j, r, rows, avail, blen, seg, ytop, ih, ay, cardh;
+	I64	 imgn, imgi[4];
+	I64	 y0c = log_y, y1c = log_y + log_h;
+	I64	 cw = log_w - 4, tx = log_x + 12;
+	CYhLine	*ln, *boost, *il;
+	U8		 seg_buf[200], ts[8];
+	Bool	 hov;
+
+	avail = MaxI64(16, (cw - 20) / FONT_WIDTH);
+	imgn = 0;
+	while (i >= first && y > y0c)
+	{
+		ln = &cb->lines[i % YH_MAX_LINES];
+		if (ln->kind == YH_LK_IMG)
+		{//Media rides above its post in ring order; collect for the card.
+			if (imgn < 4)
+				imgi[imgn++] = i;
+			i--;
+		}
+		else if ((ln->kind == YH_LK_MSG || ln->kind == YH_LK_SELF) && ln->id[0])
+		{
+			boost = NULL;
+			if (i - 1 >= first)
+			{
+				il = &cb->lines[(i - 1) % YH_MAX_LINES];
+				if (il->kind == YH_LK_SYSTEM && !StrNCompare(il->text, "boosted", 7))
+					boost = il;
+			}
+			blen = StrLen(ln->text);
+			rows = MaxI64(1, (blen + avail - 1) / avail);
+			ih = 0;
+			for (j = 0; j < imgn; j++)
+			{
+				il = &cb->lines[imgi[j] % YH_MAX_LINES];
+				if (il->img >= 0 && yh.imgs[il->img].state == 2)
+					ih += yh.imgs[il->img].dc->height + 4;
+				else
+					ih += YH_ROW_H;
+			}
+			cardh = 10 + YH_ROW_H + rows * YH_ROW_H + ih;
+			if (boost)
+				cardh += YH_ROW_H;
+			ytop = y - cardh;
+
+			if (ytop < y1c && y > y0c)
+			{
+				hov = log_x <= mx < log_x + cw && ytop <= my < y;
+				dc->color = de_theme.panel;
+				YhCRect(dc, log_x, ytop, cw, cardh, y0c, y1c);
+				if (hov)
+					dc->color = de_theme.accent_dim;
+				else
+					dc->color = de_theme.panel_edge;
+				YhCRect(dc, log_x, ytop, cw, 1, y0c, y1c);
+				YhCRect(dc, log_x, ytop + cardh - 1, cw, 1, y0c, y1c);
+				YhCRect(dc, log_x, ytop, 1, cardh, y0c, y1c);
+				YhCRect(dc, log_x + cw - 1, ytop, 1, cardh, y0c, y1c);
+
+				ay = ytop + 5;
+				if (boost)
+				{
+					if (ay >= y0c && ay + FONT_HEIGHT <= y1c)
+					{
+						dc->color = de_theme.text_dim;
+						GrPrint(dc, tx, ay, "^ %s %s", boost->nick, boost->text);
+					}
+					ay += YH_ROW_H;
+				}
+				//Header: avatar chip + author + time.
+				if (ay >= y0c && ay + FONT_HEIGHT <= y1c)
+				{
+					if (ln->av >= 0 && yh.imgs[ln->av].state == 2)
+						GrBlot(dc, tx, ay - 1, yh.imgs[ln->av].dc);
+					else
+					{
+						dc->color = YhNickPen(ln->nick);
+						GrRect(dc, tx, ay - 1, 10, 10);
+					}
+					dc->color = YhNickPen(ln->nick);
+					GrPrint(dc, tx + 14, ay, "%s", ln->nick);
+					StrPrint(ts, "%02d:%02d", ln->hh, ln->mm);
+					dc->color = de_theme.text_dim;
+					GrPrint(dc, log_x + cw - 6 * FONT_WIDTH, ay, "%s", ts);
+					YhHitPush(ay, ay + YH_ROW_H, tx,
+							  tx + 14 + StrLen(ln->nick) * FONT_WIDTH,
+							  yh.cur_chan, i);
+				}
+				ay += YH_ROW_H;
+				//Body text.
+				dc->color = de_theme.text;
+				for (r = 0; r < rows; r++)
+				{
+					if (ay >= y0c && ay + FONT_HEIGHT <= y1c)
+					{
+						seg = MinI64(avail, blen - r * avail);
+						if (seg < 0)
+							seg = 0;
+						MemCopy(seg_buf, &ln->text[r * avail], seg);
+						seg_buf[seg] = 0;
+						GrPrint(dc, tx, ay, "%s", seg_buf);
+					}
+					ay += YH_ROW_H;
+				}
+				//Media (restore original order: collected newest-first).
+				for (j = imgn - 1; j >= 0; j--)
+				{
+					il = &cb->lines[imgi[j] % YH_MAX_LINES];
+					if (il->img >= 0 && yh.imgs[il->img].state == 2)
+					{
+						if (ay >= y0c && ay + yh.imgs[il->img].dc->height <= y1c)
+							GrBlot(dc, tx, ay, yh.imgs[il->img].dc);
+						ay += yh.imgs[il->img].dc->height + 4;
+					}
+					else
+					{
+						if (ay >= y0c && ay + FONT_HEIGHT <= y1c)
+						{
+							dc->color = de_theme.text_dim;
+							GrPrint(dc, tx, ay, "[media loading...]");
+						}
+						ay += YH_ROW_H;
+					}
+				}
+			}
+			y = ytop - 6;
+			imgn = 0;
+			if (boost)
+				i--;
+			i--;
+		}
+		else
+		{//Status / error lines: plain dim row.
+			y -= YH_ROW_H;
+			if (y >= y0c && y + FONT_HEIGHT <= y1c)
+			{
+				dc->color = de_theme.text_dim;
+				GrPrint(dc, log_x + 4, y, "%s", ln->text);
+			}
+			i--;
+		}
+	}
+	if (yh.scroll)
+	{
+		dc->color = de_theme.chip_hot;
+		GrPrint(dc, log_x + log_w - 10 * FONT_WIDTH, log_y, "(scrolled)");
+	}
+}
+
 U0 YhDrawChat(CTask *task, CDC *dc)
 {
 	CYhChan		*ch, *cb = NULL;
@@ -161,111 +338,132 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 	CYhLine		*ln;
 	CColorROPU32 head_pen, body_pen;
 	I64	 i, x, y, w, r, rows, avail, blen, hlen, first, seg, skip, cpl, ax;
-	I64	 tab_y = 4, tab_h = 20;
+	I64	 tab_y = 4, tab_h = 20, tab_lim;
 	I64	 in_h = 22;
 	I64	 in_y = task->pix_height - in_h - 4;
 	I64	 log_y = tab_h + 12;
 	I64	 log_x = YH_CHAN_PANEL_W + 16;
 	I64	 log_w = task->pix_width - log_x - 8;
 	I64	 log_h = in_y - 6 - log_y;
+	I64	 mx = mouse.pos.x - task->pix_left - task->scroll_x;
+	I64	 my = mouse.pos.y - task->pix_top - task->scroll_y;
+	Bool hov;
 	U8	 head[72], seg_buf[200], buf2[240];
 
 	if (yh.cur_chan >= 0)
 		cb = &yh.chans[yh.cur_chan];
 	cpl = MaxI64(16, log_w / FONT_WIDTH);
+	yh.hit_count = 0;	//Rebuilt below; read by the click handlers.
 
-	//Server tabs (16x16 icon when the loader has it, else an initial chip).
-	x = 8;
+	//Right-pinned: [Fediverse][DMs][live] from the right edge, always visible.
+	x = task->pix_width - 8 - 5 * FONT_WIDTH;	//Realtime state chip.
+	if (yh.ws_ok)
+	{
+		dc->color = yh.c_green;
+		GrPrint(dc, x, tab_y + 4, "live");
+	}
+	else
+	{
+		dc->color = de_theme.text_dim;
+		GrPrint(dc, x, tab_y + 4, "poll");
+	}
+	w = 3 * FONT_WIDTH + 16;	//DMs tab.
+	x -= w + 4;
+	yh.dm_tab_x = x;
+	yh.dm_tab_w = w;
+	if (yh.cur_srv == YH_SRV_DM)
+		dc->color = de_theme.accent_dim;
+	else
+		dc->color = de_theme.bttn;
+	GrRect(dc, x, tab_y, w, tab_h);
+	YhDrawEdge(dc, x, tab_y, w, tab_h);
+	if (yh.cur_srv == YH_SRV_DM)
+		dc->color = de_theme.text;
+	else
+		dc->color = de_theme.text_dim;
+	GrPrint(dc, x + 8, tab_y + (tab_h - FONT_HEIGHT) / 2, "DMs");
+	w = 9 * FONT_WIDTH + 16;	//Fediverse tab.
+	x -= w + 4;
+	yh.feed_tab_x = x;
+	yh.feed_tab_w = w;
+	if (yh.cur_srv == YH_SRV_FEED)
+		dc->color = de_theme.accent_dim;
+	else
+		dc->color = de_theme.bttn;
+	GrRect(dc, x, tab_y, w, tab_h);
+	YhDrawEdge(dc, x, tab_y, w, tab_h);
+	if (yh.cur_srv == YH_SRV_FEED)
+		dc->color = de_theme.text;
+	else
+		dc->color = de_theme.chip_hot;
+	GrPrint(dc, x + 8, tab_y + (tab_h - FONT_HEIGHT) / 2, "Fediverse");
+	tab_lim = x - 8;	//Server tabs must stay left of this.
+
+	//Server tabs, scrolling window starting at yh.tab_scroll; "<"/">" arrow
+	//chips appear when tabs overflow either side.
 	for (i = 0; i < yh.num_servers; i++)
+		yh.servers[i].tab_w = 0;	//Hidden unless drawn below.
+	yh.tab_scroll = ClampI64(yh.tab_scroll, 0, MaxI64(0, yh.num_servers - 1));
+	x = 8;
+	yh.tl_w = 0;
+	yh.tr_w = 0;
+	if (yh.tab_scroll > 0)
+	{
+		yh.tl_x = x;
+		yh.tl_w = 18;
+		dc->color = de_theme.bttn_hot;
+		GrRect(dc, x, tab_y, 18, tab_h);
+		YhDrawEdge(dc, x, tab_y, 18, tab_h);
+		dc->color = de_theme.text;
+		GrPrint(dc, x + 5, tab_y + (tab_h - FONT_HEIGHT) / 2, "<");
+		x += 22;
+	}
+	for (i = yh.tab_scroll; i < yh.num_servers; i++)
 	{
 		sv = &yh.servers[i];
 		w = StrLen(sv->name) * FONT_WIDTH + 16;
 		if (sv->icon >= 0)
 			w += 18;
 		sv->tab_x = x;
-		if (x + w > task->pix_width - 8)
-			sv->tab_w = 0;
-		else
-		{
-			sv->tab_w = w;
-			if (i == yh.cur_srv)
-				dc->color = de_theme.accent_dim;
-			else
-				dc->color = de_theme.bttn;
-			GrRect(dc, x, tab_y, w, tab_h);
-			YhDrawEdge(dc, x, tab_y, w, tab_h);
-			r = x + 8;	//Text start.
-			if (sv->icon >= 0)
-			{
-				if (yh.imgs[sv->icon].state == 2)
-					GrBlot(dc, x + 3, tab_y + 2, yh.imgs[sv->icon].dc);
-				else
-				{//Placeholder chip while loading / after webp fail.
-					dc->color = YhNickPen(sv->name);
-					GrRect(dc, x + 3, tab_y + 2, 16, 16);
-					dc->color = de_theme.win_bg;
-					GrPrint(dc, x + 3 + (16 - FONT_WIDTH) / 2, tab_y + 2 + (16 - FONT_HEIGHT) / 2,
-							"%c", sv->name[0]);
-				}
-				r = x + 22;
-			}
-			if (i == yh.cur_srv)
-				dc->color = de_theme.text;
-			else
-				dc->color = de_theme.text_dim;
-			GrPrint(dc, r, tab_y + (tab_h - FONT_HEIGHT) / 2, "%s", sv->name);
-			x += w + 4;
-		}
-	}
-	//Fediverse feed tab.
-	w = 9 * FONT_WIDTH + 16;
-	yh.feed_tab_x = x;
-	yh.feed_tab_w = 0;
-	if (x + w <= task->pix_width - 8 - 5 * FONT_WIDTH)
-	{
-		yh.feed_tab_w = w;
-		if (yh.cur_srv == YH_SRV_FEED)
-			dc->color = de_theme.accent_dim;
-		else
-			dc->color = de_theme.bttn;
-		GrRect(dc, x, tab_y, w, tab_h);
-		YhDrawEdge(dc, x, tab_y, w, tab_h);
-		if (yh.cur_srv == YH_SRV_FEED)
+		if (x + w > tab_lim - 22)
+		{//Out of room: show the ">" scroll chip and stop.
+			yh.tr_x = x;
+			yh.tr_w = 18;
+			dc->color = de_theme.bttn_hot;
+			GrRect(dc, x, tab_y, 18, tab_h);
+			YhDrawEdge(dc, x, tab_y, 18, tab_h);
 			dc->color = de_theme.text;
-		else
-			dc->color = de_theme.chip_hot;
-		GrPrint(dc, x + 8, tab_y + (tab_h - FONT_HEIGHT) / 2, "monyverse");
-		x += w + 4;
-	}
-	//DMs tab.
-	w = 3 * FONT_WIDTH + 16;
-	yh.dm_tab_x = x;
-	yh.dm_tab_w = 0;
-	if (x + w <= task->pix_width - 8 - 5 * FONT_WIDTH)
-	{
-		yh.dm_tab_w = w;
-		if (yh.cur_srv == YH_SRV_DM)
+			GrPrint(dc, x + 5, tab_y + (tab_h - FONT_HEIGHT) / 2, ">");
+			break;
+		}
+		sv->tab_w = w;
+		if (i == yh.cur_srv)
 			dc->color = de_theme.accent_dim;
 		else
 			dc->color = de_theme.bttn;
 		GrRect(dc, x, tab_y, w, tab_h);
 		YhDrawEdge(dc, x, tab_y, w, tab_h);
-		if (yh.cur_srv == YH_SRV_DM)
+		r = x + 8;	//Text start.
+		if (sv->icon >= 0)
+		{
+			if (yh.imgs[sv->icon].state == 2)
+				GrBlot(dc, x + 3, tab_y + 2, yh.imgs[sv->icon].dc);
+			else
+			{//Placeholder chip while loading / after webp fail.
+				dc->color = YhNickPen(sv->name);
+				GrRect(dc, x + 3, tab_y + 2, 16, 16);
+				dc->color = de_theme.win_bg;
+				GrPrint(dc, x + 3 + (16 - FONT_WIDTH) / 2, tab_y + 2 + (16 - FONT_HEIGHT) / 2,
+						"%c", sv->name[0]);
+			}
+			r = x + 22;
+		}
+		if (i == yh.cur_srv)
 			dc->color = de_theme.text;
 		else
 			dc->color = de_theme.text_dim;
-		GrPrint(dc, x + 8, tab_y + (tab_h - FONT_HEIGHT) / 2, "DMs");
-	}
-	//Realtime state chip on the right edge of the tab row.
-	if (yh.ws_ok)
-	{
-		dc->color = yh.c_green;
-		GrPrint(dc, task->pix_width - 5 * FONT_WIDTH, tab_y + 4, "live");
-	}
-	else
-	{
-		dc->color = de_theme.text_dim;
-		GrPrint(dc, task->pix_width - 5 * FONT_WIDTH, tab_y + 4, "poll");
+		GrPrint(dc, r, tab_y + (tab_h - FONT_HEIGHT) / 2, "%s", sv->name);
+		x += w + 4;
 	}
 
 	//Channel panel (left).
@@ -300,8 +498,10 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 		}
 	}
 
-	//Chat log, bottom-up.
-	if (cb && cb->lines)
+	//Chat log, bottom-up. The Fediverse feed gets card rendering instead.
+	if (cb && cb->lines && cb->server == YH_SRV_FEED)
+		YhDrawFeed(task, dc, cb, log_x, log_y, log_w, log_h, mx, my);
+	else if (cb && cb->lines)
 	{
 		skip = yh.scroll;
 		y = log_y + log_h - YH_ROW_H;
@@ -369,6 +569,13 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 						{
 							if (ln->kind == YH_LK_MSG || ln->kind == YH_LK_SELF)
 							{
+								hov = log_x <= mx < log_x + log_w &&
+									  y - 1 <= my < y + YH_ROW_H - 1;
+								if (hov)
+								{//Hover highlight behind the whole head row.
+									dc->color = de_theme.panel;
+									GrRect(dc, log_x - 2, y - 1, log_w + 2, YH_ROW_H);
+								}
 								if (ln->av >= 0 && yh.imgs[ln->av].state == 2)
 									GrBlot(dc, log_x, y - 1, yh.imgs[ln->av].dc);
 								else
@@ -376,6 +583,8 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 									dc->color = YhNickPen(ln->nick);
 									GrRect(dc, log_x, y - 1, 10, 10);
 								}
+								YhHitPush(y - 1, y + YH_ROW_H - 1, log_x,
+										  ax + hlen * FONT_WIDTH, yh.cur_chan, i);
 							}
 							dc->color = head_pen;
 							GrPrint(dc, ax, y, "%s", head);
@@ -404,7 +613,9 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 	dc->color = de_theme.panel;
 	GrRect(dc, 4, in_y, task->pix_width - 8, in_h);
 	YhDrawEdge(dc, 4, in_y, task->pix_width - 8, in_h);
-	if (cb)
+	if (cb && yh.reply_to[0])
+		StrPrint(buf2, "[#%s > @%s] ", cb->name, yh.reply_nick);
+	else if (cb)
 		StrPrint(buf2, "[#%s] ", cb->name);
 	else
 		StrCopy(buf2, "[-] ");
@@ -466,16 +677,6 @@ U0 YhLogin()
 }
 
 /***** settings *****/
-
-U8 *YhListAdd(U8 *w, U8 *fmt, ...)
-{//Append one PopUpPickList item plus its NUL separator; returns new write ptr.
-	U8 *s = StrPrintJoin(NULL, fmt, argc, argv);
-
-	StrCopy(w, s);
-	w += StrLen(s) + 1;
-	Free(s);
-	return w;
-}
 
 U0 YhConfigMenu()
 {//Blocking pop-up settings. Loops so toggles apply without reopening.
@@ -728,12 +929,24 @@ U0 YhChatKey(I64 ch, I64 sc)
 
 U0 YhChatClick(I64 mx, I64 my)
 {
-	I64	 i, y, r, log_y = 4 + 20 + 12;
-	I64	 log_h = Fs->pix_height - 22 - 4 - 6 - log_y;
+	I64		 i, y, r, log_y = 4 + 20 + 12;
+	I64		 log_h = Fs->pix_height - 22 - 4 - 6 - log_y;
+	CYhLine	*ln;
 
-	//Server tabs (+ the fediverse feed tab).
+	//Tab strip: scroll arrows, server tabs, pinned Fediverse/DMs tabs.
 	if (4 <= my < 24)
 	{
+		if (yh.tl_w && yh.tl_x <= mx < yh.tl_x + yh.tl_w)
+		{
+			yh.tab_scroll = MaxI64(0, yh.tab_scroll - 1);
+			return;
+		}
+		if (yh.tr_w && yh.tr_x <= mx < yh.tr_x + yh.tr_w)
+		{
+			yh.tab_scroll = ClampI64(yh.tab_scroll + 1, 0,
+									 MaxI64(0, yh.num_servers - 1));
+			return;
+		}
 		for (i = 0; i < yh.num_servers; i++)
 			if (yh.servers[i].tab_w &&
 				yh.servers[i].tab_x <= mx < yh.servers[i].tab_x + yh.servers[i].tab_w)
@@ -781,6 +994,99 @@ U0 YhChatClick(I64 mx, I64 my)
 				r++;
 			}
 		}
+		return;
+	}
+	//Click a name (or avatar): insert an @mention.
+	for (i = 0; i < yh.hit_count; i++)
+		if (yh.hits[i].y0 <= my < yh.hits[i].y1 &&
+			yh.hits[i].nx0 <= mx < yh.hits[i].nx1)
+		{
+			ln = &yh.chans[yh.hits[i].ci].lines[yh.hits[i].ring % YH_MAX_LINES];
+			if (ln->nick[0] &&
+				yh.input_len + StrLen(ln->nick) + 2 < YH_IN_MAX - 2)
+			{
+				CatPrint(yh.input, "@%s ", ln->nick);
+				yh.input_len = StrLen(yh.input);
+			}
+			return;
+		}
+}
+
+U0 YhClipSet(U8 *s)
+{//Copy text to the OS clipboard. The dollar byte (0x24) is doubled because
+//DocPrint treats it as a live DolDoc command. NOTE: 0x24 is used instead of
+//a char literal on purpose - a raw dollar in ZealC SOURCE also opens a
+//DolDoc command in the compiler's lexer and swallows the next lines.
+	U8	*esc = MAlloc(StrLen(s) * 2 + 1);
+	U8	*d = esc;
+
+	while (*s)
+	{
+		if (*s == 0x24)
+			*d++ = 0x24;
+		*d++ = *s++;
+	}
+	*d = 0;
+	ClipDel;
+	DocPrint(sys_clip_doc, "%s", esc);
+	Free(esc);
+}
+
+U0 YhChatRClick(I64 mx, I64 my)
+{//Right-click: message context menu; tab bar / empty space -> settings.
+	I64		 i, sel;
+	CYhLine	*ln = NULL;
+	U8		 list[320], *w;
+
+	for (i = 0; i < yh.hit_count && !ln; i++)
+		if (yh.hits[i].y0 <= my < yh.hits[i].y1)
+			ln = &yh.chans[yh.hits[i].ci].lines[yh.hits[i].ring % YH_MAX_LINES];
+	if (!ln)
+	{
+		YhConfigMenu;
+		return;
+	}
+
+	w = list;
+	w = YhListAdd(w, "React...");				//0
+	w = YhListAdd(w, "Reply to %s", ln->nick);	//1
+	w = YhListAdd(w, "Mention @%s", ln->nick);	//2
+	w = YhListAdd(w, "Copy text");				//3
+	w = YhListAdd(w, "Cancel reply");			//4
+	w = YhListAdd(w, "Close");					//5
+	*w = 0;
+	sel = PopUpPickList(list);
+	switch (sel)
+	{
+		case 0:
+			if (yh.cur_chan >= 0 && yh.chans[yh.cur_chan].server == YH_SRV_FEED)
+				YhStatus("Post reactions (favorites) aren't wired yet.");
+			else
+				YhReactAdd(ln);
+			break;
+		case 1:
+			if (ln->id[0])
+			{
+				StrCopy(yh.reply_to, ln->id);
+				StrCopy(yh.reply_nick, ln->nick);
+			}
+			break;
+		case 2:
+			if (ln->nick[0] &&
+				yh.input_len + StrLen(ln->nick) + 2 < YH_IN_MAX - 2)
+			{
+				CatPrint(yh.input, "@%s ", ln->nick);
+				yh.input_len = StrLen(yh.input);
+			}
+			break;
+		case 3:
+			YhClipSet(ln->text);
+			YhStatus("Copied.");
+			break;
+		case 4:
+			yh.reply_to[0] = 0;
+			yh.reply_nick[0] = 0;
+			break;
 	}
 }
 
@@ -805,6 +1111,10 @@ U0 YhPoll()
 					YhFormClick(a1, a2);
 				else
 					YhChatClick(a1, a2);
+				break;
+			case MESSAGE_MS_R_DOWN:
+				if (yh.state == YH_ST_CHAT)
+					YhChatRClick(a1, a2);
 				break;
 		}
 	}
