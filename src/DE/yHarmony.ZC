@@ -6,11 +6,12 @@
 //Needs the net stack (BrowserBoot: TCP/TLS/HTTP/WS) and the DE theme.
 //Launched from the YDE menu via ExeFile("::/DE/yHarmony").
 //
-//UI: login form -> chat. Server tabs on top, channel panel on the left,
-//wheel/<PGUP>/<PGDN> scroll, <UP>/<DOWN> input history, <ESC> quits.
+//UI: login form (instance domain + email + password; the Supabase URL and
+//anon key are auto-discovered from the instance's public /instance-info
+//endpoint and cached) -> chat. Server tabs on top, channel panel on the
+//left, wheel/<PGUP>/<PGDN> scroll, <UP>/<DOWN> input history, <ESC> quits.
 //Realtime: WebSocket postgres_changes subscription; falls back to polling
-//when the socket dies. Settings persist to ::/Home/YHARMONY.CFG (hand-edit
-//it - pasting the anon key there beats typing it in the form).
+//when the socket dies. Settings persist to ::/Home/YHARMONY.CFG.
 
 #define YH_MAX_SERVERS	8
 #define YH_MAX_CHANS	32
@@ -386,7 +387,10 @@ class CYhGlobals
 	U8			 hist[YH_HIST_MAX * YH_IN_MAX];
 	I64			 hist_count, hist_pos;
 	I64			 last_z;
-	//Login form.
+	//Login form. Only host/email/password are typed; the Supabase URL + anon
+	//key are auto-discovered from the instance's public /instance-info
+	//endpoint (federation backend) and cached in the config.
+	U8			 f_host[128];
 	U8			 f_url[128], f_anon[512], f_email[80], f_pass[80];
 	I64			 f_focus;
 	U8			 f_status[96];
@@ -405,13 +409,16 @@ U0 YhConfigSave()
 	if (!DriveIsWritable)
 		return;
 	buf = MStrPrint(
-		"# yHarmony settings - edit freely (easiest way to paste the anon key).\n"
+		"# yHarmony settings. host = your instance domain; url + anon are\n"
+		"# auto-discovered from https://host/instance-info and cached here.\n"
+		"host %s\n"
 		"url %s\n"
 		"anon %s\n"
 		"email %s\n"
 		"password %s\n"
 		"autoconnect %d\n",
-		yh.f_url, yh.f_anon, yh.f_email, yh.f_pass, yh.f_autoconn != 0);
+		yh.f_host, yh.f_url, yh.f_anon, yh.f_email, yh.f_pass,
+		yh.f_autoconn != 0);
 	FileWrite(YH_CFG_PATH, buf, StrLen(buf));
 	Free(buf);
 }
@@ -423,6 +430,7 @@ U0 YhConfigLoad()
 
 	if (!body)
 		return;
+	DEConfigValStr(body, "host",     yh.f_host,  sizeof(yh.f_host));
 	DEConfigValStr(body, "url",      yh.f_url,   sizeof(yh.f_url));
 	DEConfigValStr(body, "anon",     yh.f_anon,  sizeof(yh.f_anon));
 	DEConfigValStr(body, "email",    yh.f_email, sizeof(yh.f_email));
@@ -956,6 +964,74 @@ U0 YhFetchServers()
 
 /***** auth *****/
 
+Bool YhDiscoverTry(U8 *url)
+{//One /instance-info probe. Fills f_url + f_anon on success.
+	CHttpResponse *resp = HttpReq(url, "GET", NULL, "application/json", NULL);
+	CYhJson		  *json, *u, *k;
+	Bool		   ok = FALSE;
+
+	if (!resp)
+		return FALSE;
+	if (resp->status == 200 && resp->body)
+	{
+		json = YhjParse(resp->body);
+		if (json)
+		{
+			u = YhjGet(json, "supabaseUrl");
+			k = YhjGet(json, "supabaseAnonKey");
+			if (u && k && *YhjStr(u) && *YhjStr(k))
+			{
+				MemCopy(yh.f_url, YhjStr(u), MinI64(StrLen(YhjStr(u)), sizeof(yh.f_url) - 1));
+				yh.f_url[MinI64(StrLen(YhjStr(u)), sizeof(yh.f_url) - 1)] = 0;
+				MemCopy(yh.f_anon, YhjStr(k), MinI64(StrLen(YhjStr(k)), sizeof(yh.f_anon) - 1));
+				yh.f_anon[MinI64(StrLen(YhjStr(k)), sizeof(yh.f_anon) - 1)] = 0;
+				ok = TRUE;
+			}
+			YhjFree(json);
+		}
+	}
+	HttpResponseFree(resp);
+	return ok;
+}
+
+Bool YhDiscover()
+{//Resolve the instance domain -> Supabase url + anon key via the Harmony
+//federation backend's public discovery endpoint. Both mount points tried.
+	U8	 host[160];
+	U8	*url;
+	Bool ok;
+
+	if (!yh.f_host[0])
+		return yh.f_url[0] && yh.f_anon[0];	//Manual url+anon in the config.
+
+	//Strip any scheme + trailing slash the user typed.
+	if (!StrNICompare(yh.f_host, "https://", 8))
+		StrCopy(host, yh.f_host + 8);
+	else if (!StrNICompare(yh.f_host, "http://", 7))
+		StrCopy(host, yh.f_host + 7);
+	else
+		StrCopy(host, yh.f_host);
+	if (host[0] && host[StrLen(host) - 1] == '/')
+		host[StrLen(host) - 1] = 0;
+
+	YhStatus("Discovering instance...");
+	url = MStrPrint("https://%s/instance-info", host);
+	ok = YhDiscoverTry(url);
+	Free(url);
+	if (!ok)
+	{
+		url = MStrPrint("https://%s/api/federation/instance-info", host);
+		ok = YhDiscoverTry(url);
+		Free(url);
+	}
+	if (!ok)
+	{
+		YhStatus("Instance discovery failed (/instance-info).");
+		return FALSE;
+	}
+	return TRUE;
+}
+
 Bool YhAuth()
 {
 	U8		 esc_e[160], esc_p[160];
@@ -964,14 +1040,19 @@ Bool YhAuth()
 	CYhJson	*json, *f, *user;
 	I64		 expires;
 
+	if (!yh.f_email[0] || !yh.f_pass[0])
+	{
+		YhStatus("Email and password required.");
+		return FALSE;
+	}
+	if (!yh.f_url[0] || !yh.f_anon[0])
+	{//First run (or cache cleared): discover from the instance domain.
+		if (!YhDiscover)
+			return FALSE;
+	}
 	//Normalize the URL: no trailing slash.
 	if (yh.f_url[0] && yh.f_url[StrLen(yh.f_url) - 1] == '/')
 		yh.f_url[StrLen(yh.f_url) - 1] = 0;
-	if (!yh.f_url[0] || !yh.f_anon[0] || !yh.f_email[0] || !yh.f_pass[0])
-	{
-		YhStatus("URL, anon key, email and password all required.");
-		return FALSE;
-	}
 
 	StrPrint(yh.hdrs, "apikey: %s\r\n", yh.f_anon);	//Pre-auth: apikey only.
 	YhJsonEsc(esc_e, yh.f_email, sizeof(esc_e));
@@ -1296,23 +1377,23 @@ U0 YhDrawEdge(CDC *dc, I64 x, I64 y, I64 w, I64 h)
 
 //Login-form geometry, shared by draw + hit test.
 #define YH_FORM_W	420
-#define YH_FORM_H	266
-#define YH_CB_DY	174
+#define YH_FORM_H	234
+#define YH_NUM_F	3		//Instance / Email / Password.
+#define YH_CB_DY	142
 #define YH_CB_SZ	14
-#define YH_BTN_DY	202
+#define YH_BTN_DY	170
 
 U0 YhDrawForm(CTask *task, CDC *dc)
 {
 	I64	 fx = (task->pix_width - YH_FORM_W) / 2;
 	I64	 fy = (task->pix_height - YH_FORM_H) / 2;
 	I64	 i, y, off;
-	U8	*labels[4], *vals[4];
+	U8	*labels[YH_NUM_F], *vals[YH_NUM_F];
 	U8	 buf[96];
 
-	labels[0] = "URL";		vals[0] = yh.f_url;
-	labels[1] = "Anon key";	vals[1] = yh.f_anon;
-	labels[2] = "Email";	vals[2] = yh.f_email;
-	labels[3] = "Password";	vals[3] = yh.f_pass;
+	labels[0] = "Instance";	vals[0] = yh.f_host;
+	labels[1] = "Email";	vals[1] = yh.f_email;
+	labels[2] = "Password";	vals[2] = yh.f_pass;
 
 	dc->color = de_theme.panel;
 	GrRect(dc, fx, fy, YH_FORM_W, YH_FORM_H);
@@ -1320,7 +1401,7 @@ U0 YhDrawForm(CTask *task, CDC *dc)
 	dc->color = de_theme.accent;
 	GrPrint(dc, fx + (YH_FORM_W - 16 * FONT_WIDTH) / 2, fy + 12, "yHarmony - Login");
 
-	for (i = 0; i < 4; i++)
+	for (i = 0; i < YH_NUM_F; i++)
 	{
 		y = fy + 40 + i * 32;
 		dc->color = de_theme.text_dim;
@@ -1336,11 +1417,11 @@ U0 YhDrawForm(CTask *task, CDC *dc)
 		GrRect(dc, fx + 96, y, 1, 20);
 		GrRect(dc, fx + YH_FORM_W - 17, y, 1, 20);
 		dc->color = de_theme.text;
-		//Long values (anon key!) show the tail; password masked.
+		//Long values show the tail; password masked.
 		off = 0;
 		if (StrLen(vals[i]) > 36)
 			off = StrLen(vals[i]) - 36;
-		if (i == 3)
+		if (i == 2)
 		{
 			for (off = 0; off < MinI64(StrLen(vals[i]), 36); off++)
 				buf[off] = '*';
@@ -1368,7 +1449,7 @@ U0 YhDrawForm(CTask *task, CDC *dc)
 
 	//Buttons.
 	y = fy + YH_BTN_DY;
-	if (yh.f_focus == 4)
+	if (yh.f_focus == YH_NUM_F)
 		dc->color = de_theme.bttn_focus;
 	else
 		dc->color = de_theme.bttn_hot;
@@ -1384,7 +1465,7 @@ U0 YhDrawForm(CTask *task, CDC *dc)
 
 	dc->color = de_theme.text_dim;
 	GrPrint(dc, fx + 16, fy + YH_BTN_DY + 34,
-			"Tip: paste keys into ::/Home/YHARMONY.CFG instead of typing.");
+			"Instance = your Harmony domain (keys auto-discovered).");
 	if (yh.f_status[0])
 	{
 		dc->color = yh.c_red;
@@ -1606,7 +1687,18 @@ U0 YhLogin()
 {
 	StrCopy(yh.f_status, "Logging in...");
 	if (!YhAuth)
-		return;
+	{//Cached url/anon may be stale (instance redeployed with a new JWT
+	 //secret): rediscover once and retry before giving up.
+		if (!yh.f_host[0])
+			return;
+		yh.f_url[0] = 0;
+		yh.f_anon[0] = 0;
+		if (!YhDiscover)
+			return;
+		StrCopy(yh.f_status, "Retrying login...");
+		if (!YhAuth)
+			return;
+	}
 	YhConfigSave;
 	yh.state = YH_ST_CHAT;
 	StrPrint(Fs->task_title, "yHarmony - %s", yh.username);
@@ -1676,34 +1768,33 @@ U0 YhHistNav(I64 dir)
 
 U0 YhFormKey(I64 ch, I64 sc)
 {
-	U8	*vals[4];
-	I64	 max[4], len;
+	U8	*vals[YH_NUM_F];
+	I64	 max[YH_NUM_F], len;
 	U8	*f;
 
-	vals[0] = yh.f_url;		max[0] = 126;
-	vals[1] = yh.f_anon;	max[1] = 510;
-	vals[2] = yh.f_email;	max[2] = 78;
-	vals[3] = yh.f_pass;	max[3] = 78;
+	vals[0] = yh.f_host;	max[0] = 126;
+	vals[1] = yh.f_email;	max[1] = 78;
+	vals[2] = yh.f_pass;	max[2] = 78;
 
 	if (ch == '\t')
-		yh.f_focus = (yh.f_focus + 1) % 5;
+		yh.f_focus = (yh.f_focus + 1) % (YH_NUM_F + 1);
 	else if (ch == '\n')
 	{
-		if (yh.f_focus < 4)
+		if (yh.f_focus < YH_NUM_F)
 			yh.f_focus++;
-		if (yh.f_focus >= 4)
+		if (yh.f_focus >= YH_NUM_F)
 			YhLogin;
 	}
 	else if (ch == CH_ESC || ch == CH_SHIFT_ESC)
 		yh.quit = TRUE;
-	else if (ch == CH_BACKSPACE && yh.f_focus < 4)
+	else if (ch == CH_BACKSPACE && yh.f_focus < YH_NUM_F)
 	{
 		f = vals[yh.f_focus];
 		len = StrLen(f);
 		if (len)
 			f[len - 1] = 0;
 	}
-	else if (' ' <= ch < 0x7F && yh.f_focus < 4)
+	else if (' ' <= ch < 0x7F && yh.f_focus < YH_NUM_F)
 	{
 		f = vals[yh.f_focus];
 		len = StrLen(f);
@@ -1716,9 +1807,9 @@ U0 YhFormKey(I64 ch, I64 sc)
 	else if (!ch)
 	{
 		if (sc == SC_CURSOR_DOWN)
-			yh.f_focus = (yh.f_focus + 1) % 5;
+			yh.f_focus = (yh.f_focus + 1) % (YH_NUM_F + 1);
 		else if (sc == SC_CURSOR_UP)
-			yh.f_focus = (yh.f_focus + 4) % 5;
+			yh.f_focus = (yh.f_focus + YH_NUM_F) % (YH_NUM_F + 1);
 	}
 }
 
@@ -1728,7 +1819,7 @@ U0 YhFormClick(I64 mx, I64 my)
 	I64 fy = (Fs->pix_height - YH_FORM_H) / 2;
 	I64 i, y;
 
-	for (i = 0; i < 4; i++)
+	for (i = 0; i < YH_NUM_F; i++)
 	{
 		y = fy + 40 + i * 32;
 		if (fx + 96 <= mx < fx + YH_FORM_W - 16 && y <= my < y + 20)
@@ -1938,8 +2029,7 @@ public U0 YHarmony()
 	for (i = 0; i < 16; i++)
 		yh.c_nick[i] = DEHue2RGB(i * 360 / 16, 170, 210 + (i & 1) * 35);
 
-	StrCopy(yh.f_url, "https://");
-	YhConfigLoad;
+	YhConfigLoad;	//f_url/f_anon stay empty until discovery caches them.
 
 	SettingsPush;
 	old_inhibit = Fs->win_inhibit;
@@ -1952,7 +2042,8 @@ public U0 YHarmony()
 	DocClear;
 	Fs->draw_it = &YhDrawIt;
 
-	if (yh.f_autoconn && yh.f_anon[0] && yh.f_email[0])
+	if (yh.f_autoconn && yh.f_email[0] && yh.f_pass[0] &&
+		(yh.f_host[0] || (yh.f_url[0] && yh.f_anon[0])))
 		YhLogin;
 
 	while (!yh.quit)
