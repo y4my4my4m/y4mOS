@@ -59,6 +59,7 @@ class CZStyle
 	I8	grid_cols;				// grid-template-columns track count; -1 unset
 	I16 grid_idx;				// index into zcss_gtrk_* track table; -1 unset
 	I16 grid_area_idx;			// child grid-area: zcss_carea name index; -1 unset
+	I8	grid_span;				// grid-column: span N (or 1/-1 = full); 0 unset
 	I8	float_side;				// float: 0 none, 1 left, 2 right
 	I8	clear_side;				// clear: 0 none, 1 left, 2 right, 3 both
 	I16 bg_img;					// background-image: zcss_bgimg index; -1 unset
@@ -147,6 +148,7 @@ U0 ZStyleReset(CZStyle *s)
 	s->grid_cols = -1;	// was missing: merge reads it, so garbage leaked in
 	s->grid_idx = -1;
 	s->grid_area_idx = -1;
+	s->grid_span = 0;
 	s->float_side = 0;
 	s->clear_side = 0;
 	s->bg_img = -1;
@@ -202,6 +204,7 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	if (src->grid_cols >= 0) dst->grid_cols = src->grid_cols;
 	if (src->grid_idx  >= 0) dst->grid_idx	= src->grid_idx;
 	if (src->grid_area_idx >= 0) dst->grid_area_idx = src->grid_area_idx;
+	if (src->grid_span >  0) dst->grid_span = src->grid_span;
 	if (src->float_side)	 dst->float_side = src->float_side;
 	if (src->clear_side)	 dst->clear_side = src->clear_side;
 	if (src->mr		   >= 0) dst->mr		= src->mr;
@@ -271,6 +274,7 @@ U0 ZStyleStripBox(CZStyle *s)
 	s->grid_cols = -1;
 	s->grid_idx = -1;
 	s->grid_area_idx = -1;
+	s->grid_span = 0;
 	s->float_side = 0;
 	s->clear_side = 0;
 	s->bg_img = -1;		// a background image never inherits

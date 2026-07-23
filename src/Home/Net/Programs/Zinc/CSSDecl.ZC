@@ -571,6 +571,21 @@ U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
 		if (val[0] && !('0' <= val[0] <= '9') && val[0] != '.')
 			out->grid_area_idx = ZCssAreaIntern(val);
 	}
+	else if (!StrICompare(name, "grid-column") ||
+			 !StrICompare(name, "grid-column-start") ||
+			 !StrICompare(name, "grid-column-end"))
+	{ // how many columns this grid item occupies: "span N", or "1 / -1" = full.
+	  // Drives the responsive collapse (100r's @media sets .projects span 2 to
+	  // turn a repeat(4,1fr) grid into 2-up on narrow screens).
+		if (StrFind("span", val))
+		{
+			n = Str2I64(StrFind("span", val) + 4);
+			if (1 <= n <= 6)
+				out->grid_span = n;
+		}
+		else if (StrFind("-1", val))
+			out->grid_span = 99; // 1 / -1 : span every column
+	}
 	else if (!StrICompare(name, "justify-content") ||
 			 !StrICompare(name, "place-content") ||
 			 !StrICompare(name, "align-items") ||
