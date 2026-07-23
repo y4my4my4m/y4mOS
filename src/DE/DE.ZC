@@ -274,7 +274,7 @@ U0 DEMenuTask()
 				Sys("ExeFile(\"::/DE/BrowserBoot\");");
 				de.net_up = TRUE;
 			}
-			User("ExeFile(\"::/Home/Net/Programs/IRC\");\n");
+			User("ExeFile(\"::/DE/yIRC\");\n");
 			break;
 		case 3:
 			User("Cd(\"::/Apps/ZealAmp\");;ExeFile(\"Run\");\n");

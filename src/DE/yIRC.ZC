@@ -1,0 +1,1435 @@
+//yIRC - YDE-native IRC client. Single truecolor window (custom draw_it on
+//the YKD theme), replaces the two-term IRC.ZC layout. Needs the net stack
+//(BrowserBoot) and the DE theme compiled; launched from the YDE menu via
+//ExeFile("::/DE/yIRC").
+//
+//UI: connect form -> chat. Channel tabs (click or <TAB> to switch), nick
+//panel (click a nick to open a query), wheel/<PGUP>/<PGDN> scroll,
+//<UP>/<DOWN> input history, <ESC> quits.
+//
+//Commands: /join /part /close /msg /query /me /nick /topic /names /raw /quit
+
+#define YIRC_PORT		6667
+#define YIRC_RECV_BUF	4096
+#define YIRC_LINE_MAX	512
+
+#define YIRC_MAX_BUFS	8
+#define YIRC_MAX_LINES	300
+#define YIRC_TEXT_LEN	320
+#define YIRC_NICK_LEN	24
+#define YIRC_MAX_NICKS	96
+#define YIRC_HIST_MAX	10
+#define YIRC_IN_MAX		440
+
+//Line kinds.
+#define YIRC_LK_MSG		0
+#define YIRC_LK_SELF	1
+#define YIRC_LK_ACTION	2
+#define YIRC_LK_NOTICE	3
+#define YIRC_LK_STATUS	4
+#define YIRC_LK_JOIN	5
+#define YIRC_LK_PART	6
+#define YIRC_LK_ERROR	7
+#define YIRC_LK_TOPIC	8
+
+//App states.
+#define YIRC_ST_FORM	0
+#define YIRC_ST_CHAT	1
+
+#define YIRC_ROW_H		(FONT_HEIGHT + 2)
+#define YIRC_NICK_PANEL_W	124
+
+class CYIrcLine
+{
+	U8	kind, hh, mm;
+	U8	nick[YIRC_NICK_LEN];
+	U8	text[YIRC_TEXT_LEN];
+};
+
+class CYIrcBuf
+{
+	U8			 name[64];
+	U8			 topic[200];
+	CYIrcLine	*lines;			//Ring of YIRC_MAX_LINES.
+	I64			 count;			//Total lines ever added.
+	I64			 unread;
+	Bool		 is_chan;
+	Bool		 names_fresh;	//Inside a 353..366 NAMES burst.
+	U8			*nicks;			//Flat YIRC_MAX_NICKS * YIRC_NICK_LEN.
+	I64			 nick_count;
+	I64			 tab_x, tab_w;	//Set by the draw pass for hit tests.
+};
+
+class CYIrcGlobals
+{
+	I64			 state;
+	Bool		 quit, connected;
+	I64			 sock;			//CTCPSocket *
+	U8			 nick[40];
+	U8			 autojoin[80];
+	CYIrcBuf	*bufs[YIRC_MAX_BUFS];
+	I64			 num_bufs, cur;
+	I64			 scroll;		//Wrapped rows back from the bottom.
+	U8			 input[YIRC_IN_MAX];
+	I64			 input_len;
+	U8			 hist[YIRC_HIST_MAX * YIRC_IN_MAX];
+	I64			 hist_count, hist_pos;
+	U8			 lbuf[YIRC_LINE_MAX + 4]; //Partial protocol line.
+	I64			 lbuf_len;
+	I64			 last_z;		//Mouse wheel tracking.
+	//Connect form.
+	U8			 f_server[80], f_port[8], f_nick[40], f_chan[80];
+	I64			 f_focus;
+	U8			 f_status[80];
+	//Pens beyond the shared theme.
+	CColorROPU32 c_green, c_red, c_yellow, c_query;
+	CColorROPU32 c_nick[8];		//Nick hash palette.
+} yirc;
+
+/***** small helpers *****/
+
+U8 *YIrcNickAt(CYIrcBuf *buf, I64 i)
+{
+	return buf->nicks + i * YIRC_NICK_LEN;
+}
+
+U8 *YIrcNickStrip(U8 *nick)
+{//Skip IRC mode prefix sigils.
+	while (*nick == '@' || *nick == '+' || *nick == '%' ||
+		   *nick == '~' || *nick == '&')
+		nick++;
+	return nick;
+}
+
+CColorROPU32 YIrcNickPen(U8 *nick)
+{
+	I64 h = 0;
+
+	nick = YIrcNickStrip(nick);
+	while (*nick)
+		h = h * 31 + *nick++;
+	return yirc.c_nick[h & 7];
+}
+
+U0 YIrcClean(U8 *dst, U8 *src, I64 max)
+{//Strip mIRC color codes and control chars; clamp to max-1 chars.
+	I64 n = 0;
+
+	while (*src && n < max - 1)
+	{
+		if (*src == 3)
+		{//mIRC color: ^CNN[,NN]
+			src++;
+			if ('0' <= *src <= '9') src++;
+			if ('0' <= *src <= '9') src++;
+			if (*src == ',' && '0' <= src[1] <= '9')
+			{
+				src++;
+				if ('0' <= *src <= '9') src++;
+				if ('0' <= *src <= '9') src++;
+			}
+		}
+		else if (*src < 32)
+			src++;	//Bold/underline/reset/CR: drop.
+		else
+			dst[n++] = *src++;
+	}
+	dst[n] = 0;
+}
+
+/***** buffers *****/
+
+I64 YIrcBufFind(U8 *name)
+{
+	I64 i;
+
+	for (i = 0; i < yirc.num_bufs; i++)
+		if (!StrICompare(yirc.bufs[i]->name, name))
+			return i;
+	return -1;
+}
+
+I64 YIrcBufOpen(U8 *name, Bool is_chan)
+{
+	I64			 i = YIrcBufFind(name);
+	CYIrcBuf	*buf;
+
+	if (i >= 0)
+		return i;
+	if (yirc.num_bufs >= YIRC_MAX_BUFS)
+		return 0;
+	buf = CAlloc(sizeof(CYIrcBuf));
+	buf->lines = CAlloc(sizeof(CYIrcLine) * YIRC_MAX_LINES);
+	buf->nicks = CAlloc(YIRC_MAX_NICKS * YIRC_NICK_LEN);
+	StrCopy(buf->name, name);
+	buf->is_chan = is_chan;
+	yirc.bufs[yirc.num_bufs] = buf;
+	return yirc.num_bufs++;
+}
+
+U0 YIrcBufClose(I64 i)
+{//Never closes the status buffer 0.
+	CYIrcBuf	*buf;
+	I64			 j;
+
+	if (i <= 0 || i >= yirc.num_bufs)
+		return;
+	buf = yirc.bufs[i];
+	for (j = i; j < yirc.num_bufs - 1; j++)
+		yirc.bufs[j] = yirc.bufs[j + 1];
+	yirc.num_bufs--;
+	if (yirc.cur >= yirc.num_bufs)
+		yirc.cur = yirc.num_bufs - 1;
+	Free(buf->lines);
+	Free(buf->nicks);
+	Free(buf);
+}
+
+U0 YIrcAdd(I64 bi, I64 kind, U8 *nick, U8 *text)
+{//Append one line to a buffer ring; timestamps now.
+	CYIrcBuf	*buf;
+	CYIrcLine	*ln;
+	CDateStruct	 ds;
+
+	if (!yirc.num_bufs)
+		return;
+	if (bi < 0 || bi >= yirc.num_bufs)
+		bi = 0;
+	buf = yirc.bufs[bi];
+	ln = &buf->lines[buf->count % YIRC_MAX_LINES];
+	Date2Struct(&ds, Now);
+	ln->kind = kind;
+	ln->hh = ds.hour;
+	ln->mm = ds.min;
+	ln->nick[0] = 0;
+	if (nick)
+	{
+		YIrcClean(ln->nick, nick, YIRC_NICK_LEN);
+	}
+	YIrcClean(ln->text, text, YIRC_TEXT_LEN);
+	buf->count++;	//After the slot is filled: the WinMgr draw reads count.
+	if (bi != yirc.cur)
+		buf->unread++;
+}
+
+U0 YIrcStatus(U8 *text)
+{
+	YIrcAdd(0, YIRC_LK_STATUS, NULL, text);
+}
+
+U0 YIrcHere(U8 *text)
+{//Status line into the current buffer.
+	YIrcAdd(yirc.cur, YIRC_LK_STATUS, NULL, text);
+}
+
+/***** nick lists *****/
+
+I64 YIrcNickFind(CYIrcBuf *buf, U8 *nick)
+{
+	I64 i;
+
+	nick = YIrcNickStrip(nick);
+	for (i = 0; i < buf->nick_count; i++)
+		if (!StrICompare(YIrcNickStrip(YIrcNickAt(buf, i)), nick))
+			return i;
+	return -1;
+}
+
+U0 YIrcNickAdd(CYIrcBuf *buf, U8 *nick)
+{
+	U8 *slot;
+
+	if (buf->nick_count >= YIRC_MAX_NICKS || YIrcNickFind(buf, nick) >= 0)
+		return;
+	slot = YIrcNickAt(buf, buf->nick_count);
+	MemCopy(slot, nick, MinI64(StrLen(nick), YIRC_NICK_LEN - 1));
+	slot[YIRC_NICK_LEN - 1] = 0;
+	buf->nick_count++;
+}
+
+U0 YIrcNickDel(CYIrcBuf *buf, U8 *nick)
+{
+	I64 i = YIrcNickFind(buf, nick);
+
+	if (i < 0)
+		return;
+	while (i < buf->nick_count - 1)
+	{
+		MemCopy(YIrcNickAt(buf, i), YIrcNickAt(buf, i + 1), YIRC_NICK_LEN);
+		i++;
+	}
+	buf->nick_count--;
+}
+
+/***** protocol out *****/
+
+U0 YIrcSendF(U8 *fmt, ...)
+{//Raw IRC line out, CRLF appended.
+	U8 *line, *full;
+
+	if (!yirc.sock)
+		return;
+	line = StrPrintJoin(NULL, fmt, argc, argv);
+	full = MStrPrint("%s\r\n", line);
+	TCPSocketSendString(yirc.sock, full);
+	Free(line);
+	Free(full);
+}
+
+/***** protocol in *****/
+
+U0 YIrcHandleLine(U8 *line)
+{
+	U8	*prefix = NULL, *cmd, *params = "", *text = NULL, *nick = NULL,
+		*p, *target, *tok, *ms;
+	U8	 tmp[YIRC_TEXT_LEN];
+	I64	 bi, i;
+	Bool numeric;
+	CYIrcBuf *buf;
+
+	if (!*line)
+		return;
+
+	if (*line == ':')
+	{//:nick!user@host COMMAND params
+		prefix = line + 1;
+		p = StrFirstOcc(prefix, " ");
+		if (!p)
+			return;
+		*p = 0;
+		cmd = p + 1;
+	}
+	else
+		cmd = line;
+
+	p = StrFirstOcc(cmd, " ");
+	if (p)
+	{
+		*p = 0;
+		params = p + 1;
+	}
+
+	//Trailing ":text" parameter.
+	if (*params == ':')
+	{
+		text = params + 1;
+		params = "";
+	}
+	else
+	{
+		p = StrFind(" :", params);
+		if (p)
+		{
+			*p = 0;
+			text = p + 2;
+		}
+	}
+
+	if (prefix)
+	{//Sender nick = prefix up to '!'.
+		nick = prefix;
+		p = StrFirstOcc(prefix, "!");
+		if (p)
+			*p = 0;
+	}
+
+	if (!StrCompare(cmd, "PING"))
+	{
+		if (text)
+			YIrcSendF("PONG :%s", text);
+		else
+			YIrcSendF("PONG :%s", params);
+		return;
+	}
+
+	numeric = '0' <= cmd[0] <= '9' && '0' <= cmd[1] <= '9' &&
+			  '0' <= cmd[2] <= '9' && !cmd[3];
+	if (numeric)
+	{//Server numeric: first param is our nick, rest is payload.
+		p = StrFirstOcc(params, " ");
+		if (p)
+			params = p + 1;
+
+		if (!StrCompare(cmd, "001") || !StrCompare(cmd, "376") ||
+			!StrCompare(cmd, "422"))
+		{//Welcome / end of MOTD: registration done, run the autojoin.
+			yirc.connected = TRUE;
+			if (text)
+				YIrcStatus(text);
+			if (yirc.autojoin[0])
+			{
+				YIrcSendF("JOIN %s", yirc.autojoin);
+				yirc.autojoin[0] = 0;
+			}
+			return;
+		}
+		if (!StrCompare(cmd, "433"))
+		{//Nick in use: retry with a trailing underscore.
+			i = StrLen(yirc.nick);
+			if (i < 38)
+			{
+				yirc.nick[i] = '_';
+				yirc.nick[i + 1] = 0;
+			}
+			StrPrint(tmp, "Nick in use, trying %s", yirc.nick);
+			YIrcStatus(tmp);
+			YIrcSendF("NICK %s", yirc.nick);
+			return;
+		}
+		if (!StrCompare(cmd, "353"))
+		{//NAMES reply: params = "= #chan", text = space-split nicks.
+			p = StrFirstOcc(params, "#");
+			if (!p || !text)
+				return;
+			tok = StrFirstOcc(p, " ");
+			if (tok)
+				*tok = 0;
+			bi = YIrcBufOpen(p, TRUE);
+			buf = yirc.bufs[bi];
+			if (!buf->names_fresh)
+			{//First 353 of a burst replaces the old list.
+				buf->nick_count = 0;
+				buf->names_fresh = TRUE;
+			}
+			tok = text;	//Tokenize in place; line buffer is ours.
+			while (tok && *tok)
+			{
+				p = StrFirstOcc(tok, " ");
+				if (p)
+					*p = 0;
+				if (*tok)
+					YIrcNickAdd(buf, tok);
+				if (p)
+					tok = p + 1;
+				else
+					tok = NULL;
+			}
+			return;
+		}
+		if (!StrCompare(cmd, "366"))
+		{//End of NAMES.
+			p = StrFirstOcc(params, "#");
+			if (p)
+			{
+				tok = StrFirstOcc(p, " ");
+				if (tok)
+					*tok = 0;
+				bi = YIrcBufFind(p);
+				if (bi >= 0)
+				{
+					buf = yirc.bufs[bi];
+					buf->names_fresh = FALSE;
+					StrPrint(tmp, "%d users in %s", buf->nick_count, p);
+					YIrcAdd(bi, YIRC_LK_STATUS, NULL, tmp);
+				}
+			}
+			return;
+		}
+		if (!StrCompare(cmd, "332") || !StrCompare(cmd, "331"))
+		{//Topic / no topic.
+			p = StrFirstOcc(params, "#");
+			if (!p)
+				return;
+			tok = StrFirstOcc(p, " ");
+			if (tok)
+				*tok = 0;
+			bi = YIrcBufOpen(p, TRUE);
+			buf = yirc.bufs[bi];
+			if (text && !StrCompare(cmd, "332"))
+				YIrcClean(buf->topic, text, 200);
+			else
+				buf->topic[0] = 0;
+			if (text)
+				YIrcAdd(bi, YIRC_LK_TOPIC, NULL, text);
+			return;
+		}
+		if (cmd[0] == '4' || cmd[0] == '5')
+		{//Error numerics: show where the user is looking.
+			if (text)
+				YIrcAdd(yirc.cur, YIRC_LK_ERROR, NULL, text);
+			else
+				YIrcAdd(yirc.cur, YIRC_LK_ERROR, NULL, params);
+			return;
+		}
+		if (text)
+			YIrcStatus(text);
+		else if (*params)
+			YIrcStatus(params);
+		return;
+	}
+
+	if (!StrCompare(cmd, "PRIVMSG") || !StrCompare(cmd, "NOTICE"))
+	{
+		target = params;
+		if (!text || !nick)
+			return;
+		if (!StrNCompare(text, "\x01""ACTION ", 8))
+		{//CTCP action.
+			text += 8;
+			p = StrFirstOcc(text, "\x01");
+			if (p)
+				*p = 0;
+			if (!StrICompare(target, yirc.nick))
+				bi = YIrcBufOpen(nick, FALSE);
+			else
+				bi = YIrcBufOpen(target, TRUE);
+			YIrcAdd(bi, YIRC_LK_ACTION, nick, text);
+			return;
+		}
+		if (!StrCompare(cmd, "NOTICE"))
+		{//Notices land in the buffer they belong to, else status.
+			bi = YIrcBufFind(target);
+			if (bi < 0 && !StrICompare(target, yirc.nick))
+				bi = YIrcBufFind(nick);
+			if (bi < 0)
+				bi = 0;
+			YIrcAdd(bi, YIRC_LK_NOTICE, nick, text);
+			return;
+		}
+		if (!StrICompare(target, yirc.nick))
+			bi = YIrcBufOpen(nick, FALSE);	//Private query.
+		else
+			bi = YIrcBufOpen(target, TRUE);
+		YIrcAdd(bi, YIRC_LK_MSG, nick, text);
+		return;
+	}
+
+	if (!StrCompare(cmd, "JOIN"))
+	{
+		if (!nick)
+			return;
+		if (text)
+			target = text;	//Some servers send JOIN :#chan.
+		else
+			target = params;
+		bi = YIrcBufOpen(target, TRUE);
+		YIrcNickAdd(yirc.bufs[bi], nick);
+		if (!StrICompare(nick, yirc.nick))
+			yirc.cur = bi;	//We joined: switch to the new channel.
+		StrPrint(tmp, "%s joined %s", nick, target);
+		YIrcAdd(bi, YIRC_LK_JOIN, NULL, tmp);
+		return;
+	}
+	if (!StrCompare(cmd, "PART"))
+	{
+		if (!nick)
+			return;
+		target = params;
+		p = StrFirstOcc(target, " ");
+		if (p)
+			*p = 0;
+		bi = YIrcBufFind(target);
+		if (bi < 0)
+			return;
+		YIrcNickDel(yirc.bufs[bi], nick);
+		StrPrint(tmp, "%s left %s", nick, target);
+		YIrcAdd(bi, YIRC_LK_PART, NULL, tmp);
+		return;
+	}
+	if (!StrCompare(cmd, "KICK"))
+	{//params = "#chan victim".
+		target = params;
+		p = StrFirstOcc(target, " ");
+		if (!p)
+			return;
+		*p = 0;
+		bi = YIrcBufFind(target);
+		if (bi < 0)
+			return;
+		YIrcNickDel(yirc.bufs[bi], p + 1);
+		if (text)
+			ms = MStrPrint("%s kicked %s (%s)", nick, p + 1, text);
+		else
+			ms = MStrPrint("%s kicked %s", nick, p + 1);
+		YIrcAdd(bi, YIRC_LK_PART, NULL, ms);
+		Free(ms);
+		return;
+	}
+	if (!StrCompare(cmd, "QUIT"))
+	{//Announce in every buffer that knew the nick.
+		if (!nick)
+			return;
+		if (text)
+			ms = MStrPrint("%s quit: %s", nick, text);
+		else
+			ms = MStrPrint("%s quit", nick);
+		for (i = 0; i < yirc.num_bufs; i++)
+		{
+			buf = yirc.bufs[i];
+			if (YIrcNickFind(buf, nick) >= 0 ||
+				(!buf->is_chan && !StrICompare(buf->name, nick)))
+			{
+				YIrcNickDel(buf, nick);
+				YIrcAdd(i, YIRC_LK_PART, NULL, ms);
+			}
+		}
+		Free(ms);
+		return;
+	}
+	if (!StrCompare(cmd, "NICK"))
+	{
+		if (!nick)
+			return;
+		if (text)
+			target = text;
+		else
+			target = params;
+		if (!StrICompare(nick, yirc.nick))
+			StrCopy(yirc.nick, target);
+		StrPrint(tmp, "%s is now %s", nick, target);
+		for (i = 0; i < yirc.num_bufs; i++)
+		{
+			buf = yirc.bufs[i];
+			if (YIrcNickFind(buf, nick) >= 0)
+			{
+				YIrcNickDel(buf, nick);
+				YIrcNickAdd(buf, target);
+				YIrcAdd(i, YIRC_LK_STATUS, NULL, tmp);
+			}
+			else if (!buf->is_chan && !StrICompare(buf->name, nick))
+			{//Query buffer follows the rename.
+				StrCopy(buf->name, target);
+				YIrcAdd(i, YIRC_LK_STATUS, NULL, tmp);
+			}
+		}
+		return;
+	}
+	if (!StrCompare(cmd, "TOPIC"))
+	{
+		target = params;
+		p = StrFirstOcc(target, " ");
+		if (p)
+			*p = 0;
+		bi = YIrcBufFind(target);
+		if (bi < 0)
+			bi = 0;
+		if (text)
+		{
+			YIrcClean(yirc.bufs[bi]->topic, text, 200);
+			ms = MStrPrint("%s set topic: %s", nick, text);
+		}
+		else
+			ms = MStrPrint("%s cleared the topic", nick);
+		YIrcAdd(bi, YIRC_LK_TOPIC, NULL, ms);
+		Free(ms);
+		return;
+	}
+	if (!StrCompare(cmd, "MODE"))
+	{
+		p = StrFirstOcc(params, " ");
+		if (p)
+			*p = 0;	//First param is the mode target.
+		bi = YIrcBufFind(params);
+		if (bi < 0)
+			bi = 0;
+		if (p)
+			*p = ' ';
+		if (text)
+			ms = MStrPrint("mode %s %s", params, text);
+		else
+			ms = MStrPrint("mode %s", params);
+		YIrcAdd(bi, YIRC_LK_STATUS, NULL, ms);
+		Free(ms);
+		return;
+	}
+
+	//Anything unhandled: show raw in status so nothing is silently lost.
+	if (text)
+		ms = MStrPrint("%s %s %s", cmd, params, text);
+	else
+		ms = MStrPrint("%s %s", cmd, params);
+	YIrcStatus(ms);
+	Free(ms);
+}
+
+/***** user input *****/
+
+U0 YIrcSay(I64 bi, U8 *msg)
+{
+	YIrcSendF("PRIVMSG %s :%s", yirc.bufs[bi]->name, msg);
+	YIrcAdd(bi, YIRC_LK_SELF, yirc.nick, msg);
+}
+
+U0 YIrcInputLine(U8 *msg)
+{
+	U8	*arg, *sp;
+	U8	 buf[YIRC_LINE_MAX];
+	I64	 bi;
+	CYIrcBuf *cb = yirc.bufs[yirc.cur];
+
+	if (msg[0] != '/')
+	{//Plain text to the current buffer's target.
+		if (!yirc.cur)
+		{
+			YIrcHere("This is the server buffer. /join a channel first.");
+			return;
+		}
+		YIrcSay(yirc.cur, msg);
+		return;
+	}
+
+	StrCopy(buf, msg + 1);
+	arg = StrFirstOcc(buf, " ");
+	if (arg)
+	{
+		*arg = 0;
+		arg++;
+		while (*arg == ' ')
+			arg++;
+	}
+	else
+		arg = "";
+
+	if (!StrICompare(buf, "join") && *arg)
+		YIrcSendF("JOIN %s", arg);
+	else if (!StrICompare(buf, "part"))
+	{
+		if (*arg)
+			YIrcSendF("PART %s", arg);
+		else if (cb->is_chan)
+			YIrcSendF("PART %s", cb->name);
+	}
+	else if (!StrICompare(buf, "close"))
+	{
+		if (cb->is_chan)
+			YIrcSendF("PART %s", cb->name);
+		YIrcBufClose(yirc.cur);
+	}
+	else if (!StrICompare(buf, "msg") && *arg)
+	{
+		sp = StrFirstOcc(arg, " ");
+		if (sp)
+		{
+			*sp = 0;
+			bi = YIrcBufOpen(arg, arg[0] == '#');
+			YIrcSay(bi, sp + 1);
+		}
+	}
+	else if (!StrICompare(buf, "query") && *arg)
+	{
+		sp = StrFirstOcc(arg, " ");
+		if (sp)
+			*sp = 0;
+		yirc.cur = YIrcBufOpen(arg, FALSE);
+		yirc.bufs[yirc.cur]->unread = 0;
+		yirc.scroll = 0;
+	}
+	else if (!StrICompare(buf, "me") && *arg && yirc.cur)
+	{
+		YIrcSendF("PRIVMSG %s :\x01""ACTION %s\x01", cb->name, arg);
+		YIrcAdd(yirc.cur, YIRC_LK_ACTION, yirc.nick, arg);
+	}
+	else if (!StrICompare(buf, "nick") && *arg)
+		YIrcSendF("NICK %s", arg);
+	else if (!StrICompare(buf, "topic"))
+	{
+		if (!cb->is_chan)
+			YIrcHere("Not a channel.");
+		else if (*arg)
+			YIrcSendF("TOPIC %s :%s", cb->name, arg);
+		else
+			YIrcSendF("TOPIC %s", cb->name);
+	}
+	else if (!StrICompare(buf, "names") && cb->is_chan)
+		YIrcSendF("NAMES %s", cb->name);
+	else if (!StrICompare(buf, "raw") && *arg)
+		YIrcSendF("%s", arg);
+	else if (!StrICompare(buf, "quit"))
+	{
+		if (*arg)
+			YIrcSendF("QUIT :%s", arg);
+		else
+			YIrcSendF("QUIT :yIRC on YDE");
+		yirc.quit = TRUE;
+	}
+	else
+	{
+		YIrcHere("Commands: /join /part /close /msg /query /me /nick");
+		YIrcHere("          /topic /names /raw /quit    TAB switches tabs");
+	}
+}
+
+U0 YIrcSubmit()
+{
+	U8 *slot;
+
+	if (!yirc.input_len)
+		return;
+	//Push into history (ring by shifting; small and rare).
+	if (yirc.hist_count == YIRC_HIST_MAX)
+	{
+		MemCopy(yirc.hist, yirc.hist + YIRC_IN_MAX,
+				(YIRC_HIST_MAX - 1) * YIRC_IN_MAX);
+		yirc.hist_count--;
+	}
+	slot = yirc.hist + yirc.hist_count * YIRC_IN_MAX;
+	MemCopy(slot, yirc.input, yirc.input_len + 1);
+	yirc.hist_count++;
+	yirc.hist_pos = yirc.hist_count;
+
+	YIrcInputLine(yirc.input);
+	yirc.input_len = 0;
+	yirc.input[0] = 0;
+	yirc.scroll = 0;
+}
+
+U0 YIrcHistNav(I64 dir)
+{
+	U8 *slot;
+
+	yirc.hist_pos = ClampI64(yirc.hist_pos + dir, 0, yirc.hist_count);
+	if (yirc.hist_pos == yirc.hist_count)
+	{
+		yirc.input_len = 0;
+		yirc.input[0] = 0;
+	}
+	else
+	{
+		slot = yirc.hist + yirc.hist_pos * YIRC_IN_MAX;
+		StrCopy(yirc.input, slot);
+		yirc.input_len = StrLen(yirc.input);
+	}
+}
+
+/***** drawing *****/
+
+U0 YIrcLineHead(CYIrcLine *ln, U8 *head, CColorROPU32 *head_pen,
+				CColorROPU32 *body_pen)
+{//Prefix text + pens for one log line.
+	U8 ts[8];
+
+	StrPrint(ts, "%02d:%02d", ln->hh, ln->mm);
+	switch (ln->kind)
+	{
+		case YIRC_LK_MSG:
+			StrPrint(head, "%s <%s> ", ts, ln->nick);
+			*head_pen = YIrcNickPen(ln->nick);
+			*body_pen = de_theme.text;
+			break;
+		case YIRC_LK_SELF:
+			StrPrint(head, "%s <%s> ", ts, ln->nick);
+			*head_pen = de_theme.accent;
+			*body_pen = de_theme.text;
+			break;
+		case YIRC_LK_ACTION:
+			StrPrint(head, "%s * %s ", ts, ln->nick);
+			*head_pen = yirc.c_green;
+			*body_pen = yirc.c_green;
+			break;
+		case YIRC_LK_NOTICE:
+			StrPrint(head, "%s -%s- ", ts, ln->nick);
+			*head_pen = yirc.c_yellow;
+			*body_pen = yirc.c_yellow;
+			break;
+		case YIRC_LK_JOIN:
+			StrPrint(head, "%s --> ", ts);
+			*head_pen = yirc.c_green;
+			*body_pen = de_theme.text_dim;
+			break;
+		case YIRC_LK_PART:
+			StrPrint(head, "%s <-- ", ts);
+			*head_pen = yirc.c_red;
+			*body_pen = de_theme.text_dim;
+			break;
+		case YIRC_LK_ERROR:
+			StrPrint(head, "%s !! ", ts);
+			*head_pen = yirc.c_red;
+			*body_pen = yirc.c_red;
+			break;
+		case YIRC_LK_TOPIC:
+			StrPrint(head, "%s ** ", ts);
+			*head_pen = de_theme.accent_dim;
+			*body_pen = de_theme.text_dim;
+			break;
+		default:	//YIRC_LK_STATUS
+			StrPrint(head, "%s -- ", ts);
+			*head_pen = de_theme.accent_dim;
+			*body_pen = de_theme.text_dim;
+	}
+}
+
+U0 YIrcDrawEdge(CDC *dc, I64 x, I64 y, I64 w, I64 h)
+{
+	dc->color = de_theme.panel_edge;
+	GrRect(dc, x, y, w, 1);
+	GrRect(dc, x, y + h - 1, w, 1);
+	GrRect(dc, x, y, 1, h);
+	GrRect(dc, x + w - 1, y, 1, h);
+}
+
+U0 YIrcDrawForm(CTask *task, CDC *dc)
+{
+	I64	 fx = (task->pix_width - 360) / 2, fy = (task->pix_height - 220) / 2;
+	I64	 i, y;
+	U8	*labels[4], *vals[4];
+	U8	 buf[96];
+
+	labels[0] = "Server";	vals[0] = yirc.f_server;
+	labels[1] = "Port";		vals[1] = yirc.f_port;
+	labels[2] = "Nick";		vals[2] = yirc.f_nick;
+	labels[3] = "Channel";	vals[3] = yirc.f_chan;
+
+	dc->color = de_theme.panel;
+	GrRect(dc, fx, fy, 360, 220);
+	YIrcDrawEdge(dc, fx, fy, 360, 220);
+	dc->color = de_theme.accent;
+	GrPrint(dc, fx + (360 - 14 * FONT_WIDTH) / 2, fy + 12, "yIRC - Connect");
+
+	for (i = 0; i < 4; i++)
+	{
+		y = fy + 40 + i * 32;
+		dc->color = de_theme.text_dim;
+		GrPrint(dc, fx + 16, y + 5, "%s", labels[i]);
+		dc->color = de_theme.win_bg;
+		GrRect(dc, fx + 88, y, 256, 20);
+		if (yirc.f_focus == i)
+			dc->color = de_theme.accent;
+		else
+			dc->color = de_theme.bttn;
+		GrRect(dc, fx + 88, y, 256, 1);
+		GrRect(dc, fx + 88, y + 19, 256, 1);
+		GrRect(dc, fx + 88, y, 1, 20);
+		GrRect(dc, fx + 343, y, 1, 20);
+		dc->color = de_theme.text;
+		if (yirc.f_focus == i && Blink)
+			StrPrint(buf, "%s_", vals[i]);
+		else
+			StrPrint(buf, "%s", vals[i]);
+		GrPrint(dc, fx + 94, y + 6, "%s", buf);
+	}
+
+	//Connect / quit buttons; hit-tested against these same coords in poll.
+	y = fy + 172;
+	if (yirc.f_focus == 4)
+		dc->color = de_theme.bttn_focus;
+	else
+		dc->color = de_theme.bttn_hot;
+	GrRect(dc, fx + 88, y, 120, 24);
+	YIrcDrawEdge(dc, fx + 88, y, 120, 24);
+	dc->color = de_theme.text;
+	GrPrint(dc, fx + 88 + (120 - 7 * FONT_WIDTH) / 2, y + 8, "Connect");
+	dc->color = de_theme.bttn;
+	GrRect(dc, fx + 224, y, 120, 24);
+	YIrcDrawEdge(dc, fx + 224, y, 120, 24);
+	dc->color = de_theme.text_dim;
+	GrPrint(dc, fx + 224 + (120 - 4 * FONT_WIDTH) / 2, y + 8, "Quit");
+
+	if (yirc.f_status[0])
+	{
+		dc->color = yirc.c_red;
+		GrPrint(dc, fx + 16, fy + 226, "%s", yirc.f_status);
+	}
+}
+
+U0 YIrcDrawChat(CTask *task, CDC *dc)
+{
+	CYIrcBuf	*cb = yirc.bufs[yirc.cur], *buf;
+	CYIrcLine	*ln;
+	CColorROPU32 head_pen, body_pen;
+	I64	 i, x, y, w, r, rows, avail, blen, hlen, first, seg;
+	I64	 tab_y = 4, tab_h = 20;
+	I64	 top_y = tab_h + 10;				//Topic line.
+	I64	 in_h = 22;
+	I64	 in_y = task->pix_height - in_h - 4;
+	I64	 log_x = 8, log_y = top_y + 16;
+	I64	 log_w = task->pix_width - 16;
+	I64	 log_h = in_y - 6 - log_y;
+	I64	 cpl, skip;
+	U8	 head[64], seg_buf[200], buf2[240];
+	Bool nick_panel = cb->is_chan && task->pix_width > 400;
+
+	if (nick_panel)
+		log_w -= YIRC_NICK_PANEL_W + 6;
+	cpl = log_w / FONT_WIDTH;
+
+	//Tab bar.
+	x = 8;
+	for (i = 0; i < yirc.num_bufs; i++)
+	{
+		buf = yirc.bufs[i];
+		w = StrLen(buf->name) * FONT_WIDTH + 16;
+		buf->tab_x = x;
+		if (x + w > task->pix_width - 8)
+			buf->tab_w = 0;	//Off-screen: skip draw + hit test.
+		else
+		{
+			buf->tab_w = w;
+			if (i == yirc.cur)
+				dc->color = de_theme.accent_dim;
+			else if (buf->unread)
+			{//Query pings get their own hue so they stand out from channels.
+				if (buf->is_chan)
+					dc->color = de_theme.chip_hot;
+				else
+					dc->color = yirc.c_query;
+			}
+			else
+				dc->color = de_theme.bttn;
+			GrRect(dc, x, tab_y, w, tab_h);
+			YIrcDrawEdge(dc, x, tab_y, w, tab_h);
+			if (i == yirc.cur)
+				dc->color = de_theme.text;
+			else if (buf->unread)
+				dc->color = de_theme.win_bg;
+			else
+				dc->color = de_theme.text_dim;
+			GrPrint(dc, x + 8, tab_y + (tab_h - FONT_HEIGHT) / 2, "%s", buf->name);
+			x += w + 4;
+		}
+	}
+
+	//Topic / status line.
+	dc->color = de_theme.text_dim;
+	if (cb->topic[0])
+	{
+		StrCopy(buf2, cb->topic);
+		if (StrLen(buf2) > cpl)
+			buf2[cpl] = 0;
+		GrPrint(dc, log_x, top_y + 2, "%s", buf2);
+	}
+	else if (!yirc.connected)
+		GrPrint(dc, log_x, top_y + 2, "(connecting...)");
+
+	//Chat log, drawn bottom-up so the newest line hugs the input bar.
+	skip = yirc.scroll;
+	y = log_y + log_h - YIRC_ROW_H;
+	first = MaxI64(0, cb->count - YIRC_MAX_LINES);
+	i = cb->count - 1;
+	while (i >= first && y + FONT_HEIGHT > log_y)
+	{
+		ln = &cb->lines[i % YIRC_MAX_LINES];
+		YIrcLineHead(ln, head, &head_pen, &body_pen);
+		hlen = StrLen(head);
+		avail = MaxI64(8, cpl - hlen);
+		blen = StrLen(ln->text);
+		rows = MaxI64(1, (blen + avail - 1) / avail);
+		for (r = rows - 1; r >= 0 && y + FONT_HEIGHT > log_y; r--)
+		{
+			if (skip)
+				skip--;	//Scrolled past: consume this wrapped row, draw nothing.
+			else
+			{
+				seg = MinI64(avail, blen - r * avail);
+				if (seg < 0)
+					seg = 0;
+				MemCopy(seg_buf, &ln->text[r * avail], seg);
+				seg_buf[seg] = 0;
+				if (r == 0)
+				{
+					dc->color = head_pen;
+					GrPrint(dc, log_x, y, "%s", head);
+					dc->color = body_pen;
+					GrPrint(dc, log_x + hlen * FONT_WIDTH, y, "%s", seg_buf);
+				}
+				else
+				{
+					dc->color = body_pen;
+					GrPrint(dc, log_x + hlen * FONT_WIDTH, y, "%s", seg_buf);
+				}
+				y -= YIRC_ROW_H;
+			}
+		}
+		i--;
+	}
+	if (yirc.scroll)
+	{
+		dc->color = de_theme.chip_hot;
+		GrPrint(dc, log_x + log_w - 10 * FONT_WIDTH, log_y, "(scrolled)");
+	}
+
+	//Nick panel.
+	if (nick_panel)
+	{
+		x = task->pix_width - 8 - YIRC_NICK_PANEL_W;
+		dc->color = de_theme.panel;
+		GrRect(dc, x, log_y - 2, YIRC_NICK_PANEL_W, log_h + 2);
+		YIrcDrawEdge(dc, x, log_y - 2, YIRC_NICK_PANEL_W, log_h + 2);
+		dc->color = de_theme.accent_dim;
+		GrPrint(dc, x + 6, log_y + 4, "users: %d", cb->nick_count);
+		for (i = 0; i < cb->nick_count; i++)
+		{
+			y = log_y + 18 + i * YIRC_ROW_H;
+			if (y + FONT_HEIGHT > log_y + log_h)
+				break;
+			dc->color = YIrcNickPen(YIrcNickAt(cb, i));
+			StrCopy(buf2, YIrcNickAt(cb, i));
+			if (StrLen(buf2) > 13)
+				buf2[13] = 0;
+			GrPrint(dc, x + 6, y, "%s", buf2);
+		}
+	}
+
+	//Input bar.
+	dc->color = de_theme.panel;
+	GrRect(dc, 4, in_y, task->pix_width - 8, in_h);
+	YIrcDrawEdge(dc, 4, in_y, task->pix_width - 8, in_h);
+	StrPrint(buf2, "[%s] ", cb->name);
+	dc->color = de_theme.accent;
+	GrPrint(dc, 10, in_y + (in_h - FONT_HEIGHT) / 2, "%s", buf2);
+	x = 10 + StrLen(buf2) * FONT_WIDTH;
+	w = (task->pix_width - 14 - x) / FONT_WIDTH - 1;	//Chars that fit.
+	i = 0;
+	if (yirc.input_len > w)
+		i = yirc.input_len - w;	//Show the tail while typing long lines.
+	if (Blink)
+		StrPrint(buf2, "%s_", &yirc.input[i]);
+	else
+		StrPrint(buf2, "%s", &yirc.input[i]);
+	dc->color = de_theme.text;
+	GrPrint(dc, x, in_y + (in_h - FONT_HEIGHT) / 2, "%s", buf2);
+}
+
+U0 YIrcDrawIt(CTask *task, CDC *dc)
+{//Runs in the WinMgr each frame, window-relative coords.
+	dc->color = de_theme.win_bg;
+	GrRect(dc, 0, 0, task->pix_width, task->pix_height);
+	if (yirc.state == YIRC_ST_FORM)
+		YIrcDrawForm(task, dc);
+	else
+		YIrcDrawChat(task, dc);
+}
+
+/***** connect *****/
+
+U0 YIrcConnect()
+{
+	I64			 port = Str2I64(yirc.f_port);
+	CTCPSocket	*tcp;
+
+	if (!yirc.f_server[0])
+	{
+		StrCopy(yirc.f_status, "Server required.");
+		return;
+	}
+	if (port <= 0 || port > 0xFFFF)
+		port = YIRC_PORT;
+	if (yirc.f_nick[0])
+		StrCopy(yirc.nick, yirc.f_nick);
+	else
+		StrPrint(yirc.nick, "zealot%03d", counts.jiffies % 1000);
+	StrCopy(yirc.autojoin, yirc.f_chan);
+
+	StrCopy(yirc.f_status, "Connecting...");
+	yirc.sock = TCPConnectionCreate(yirc.f_server, port);
+	if (yirc.sock <= 0)
+	{
+		yirc.sock = 0;
+		StrCopy(yirc.f_status, "Connection failed.");
+		return;
+	}
+
+	YIrcSendF("NICK %s", yirc.nick);
+	YIrcSendF("USER %s 0 * :yIRC on YDE", yirc.nick);
+
+	YIrcBufOpen(yirc.f_server, FALSE);	//Buffer 0 = server/status.
+	yirc.cur = 0;
+	yirc.state = YIRC_ST_CHAT;
+	StrPrint(Fs->task_title, "yIRC - %s", yirc.f_server);
+	YIrcStatus("Connected. Registering...");
+
+	tcp = yirc.sock;
+	tcp->timeout = 0;	//Poll mode for the pump loop.
+}
+
+/***** input pump *****/
+
+U0 YIrcFormKey(I64 ch, I64 sc)
+{
+	U8	*vals[4];
+	I64	 max[4], len;
+	U8	*f;
+
+	vals[0] = yirc.f_server;	max[0] = 78;
+	vals[1] = yirc.f_port;		max[1] = 6;
+	vals[2] = yirc.f_nick;		max[2] = 38;
+	vals[3] = yirc.f_chan;		max[3] = 78;
+
+	if (ch == '\t')
+		yirc.f_focus = (yirc.f_focus + 1) % 5;
+	else if (ch == '\n')
+	{
+		if (yirc.f_focus < 4)
+			yirc.f_focus++;		//Enter walks the fields...
+		if (yirc.f_focus >= 4)
+			YIrcConnect;		//...and fires on the button row.
+	}
+	else if (ch == CH_ESC || ch == CH_SHIFT_ESC)
+		yirc.quit = TRUE;
+	else if (ch == CH_BACKSPACE && yirc.f_focus < 4)
+	{
+		f = vals[yirc.f_focus];
+		len = StrLen(f);
+		if (len)
+			f[len - 1] = 0;
+	}
+	else if (' ' <= ch < 0x7F && yirc.f_focus < 4)
+	{
+		f = vals[yirc.f_focus];
+		len = StrLen(f);
+		if (len < max[yirc.f_focus])
+		{
+			f[len] = ch;
+			f[len + 1] = 0;
+		}
+	}
+	else if (!ch)
+	{
+		if (sc == SC_CURSOR_DOWN)
+			yirc.f_focus = (yirc.f_focus + 1) % 5;
+		else if (sc == SC_CURSOR_UP)
+			yirc.f_focus = (yirc.f_focus + 4) % 5;
+	}
+}
+
+U0 YIrcFormClick(I64 mx, I64 my)
+{
+	I64 fx = (Fs->pix_width - 360) / 2, fy = (Fs->pix_height - 220) / 2;
+	I64 i, y;
+
+	for (i = 0; i < 4; i++)
+	{
+		y = fy + 40 + i * 32;
+		if (fx + 88 <= mx < fx + 344 && y <= my < y + 20)
+		{
+			yirc.f_focus = i;
+			return;
+		}
+	}
+	y = fy + 172;
+	if (fx + 88 <= mx < fx + 208 && y <= my < y + 24)
+		YIrcConnect;
+	else if (fx + 224 <= mx < fx + 344 && y <= my < y + 24)
+		yirc.quit = TRUE;
+}
+
+U0 YIrcChatKey(I64 ch, I64 sc)
+{
+	if (ch == CH_ESC || ch == CH_SHIFT_ESC)
+	{
+		YIrcSendF("QUIT :yIRC on YDE");
+		yirc.quit = TRUE;
+	}
+	else if (ch == '\n')
+		YIrcSubmit;
+	else if (ch == '\t')
+	{//Cycle buffers; clear the unread badge on arrival.
+		yirc.cur = (yirc.cur + 1) % yirc.num_bufs;
+		yirc.bufs[yirc.cur]->unread = 0;
+		yirc.scroll = 0;
+	}
+	else if (ch == CH_BACKSPACE)
+	{
+		if (yirc.input_len)
+			yirc.input[--yirc.input_len] = 0;
+	}
+	else if (' ' <= ch < 0x7F)
+	{
+		if (yirc.input_len < YIRC_IN_MAX - 2)
+		{
+			yirc.input[yirc.input_len++] = ch;
+			yirc.input[yirc.input_len] = 0;
+		}
+	}
+	else if (!ch)
+	{
+		switch (sc)
+		{
+			case SC_CURSOR_UP:
+				YIrcHistNav(-1);
+				break;
+			case SC_CURSOR_DOWN:
+				YIrcHistNav(1);
+				break;
+			case SC_PAGE_UP:
+				yirc.scroll += 10;
+				break;
+			case SC_PAGE_DOWN:
+				yirc.scroll = MaxI64(0, yirc.scroll - 10);
+				break;
+			case SC_END:
+				yirc.scroll = 0;
+				break;
+		}
+	}
+	yirc.scroll = ClampI64(yirc.scroll, 0, YIRC_MAX_LINES * 4);
+}
+
+U0 YIrcChatClick(I64 mx, I64 my)
+{
+	CYIrcBuf	*cb = yirc.bufs[yirc.cur];
+	I64			 i, x, y;
+
+	//Tab bar.
+	if (4 <= my < 24)
+	{
+		for (i = 0; i < yirc.num_bufs; i++)
+		{
+			if (yirc.bufs[i]->tab_w &&
+				yirc.bufs[i]->tab_x <= mx < yirc.bufs[i]->tab_x + yirc.bufs[i]->tab_w)
+			{
+				yirc.cur = i;
+				yirc.bufs[i]->unread = 0;
+				yirc.scroll = 0;
+				return;
+			}
+		}
+		return;
+	}
+	//Nick panel: click a nick to open a query buffer.
+	if (cb->is_chan && Fs->pix_width > 400 &&
+		mx >= Fs->pix_width - 8 - YIRC_NICK_PANEL_W)
+	{
+		x = 30 + 16;	//log_y = tab_h + 10 + 16.
+		for (i = 0; i < cb->nick_count; i++)
+		{
+			y = x + 18 + i * YIRC_ROW_H;
+			if (y <= my < y + YIRC_ROW_H)
+			{
+				yirc.cur = YIrcBufOpen(YIrcNickStrip(YIrcNickAt(cb, i)), FALSE);
+				yirc.bufs[yirc.cur]->unread = 0;
+				yirc.scroll = 0;
+				return;
+			}
+		}
+	}
+}
+
+U0 YIrcPoll()
+{//Pump the task message queue; non-blocking so the socket pump keeps running.
+	I64 m, a1, a2, dz;
+
+	while (m = MessageScan(&a1, &a2))
+	{
+		switch (m)
+		{
+			case MESSAGE_KEY_DOWN:
+				if (yirc.state == YIRC_ST_FORM)
+					YIrcFormKey(a1, a2.u8[0]);
+				else
+					YIrcChatKey(a1, a2.u8[0]);
+				break;
+			case MESSAGE_MS_L_DOWN:
+				if (yirc.state == YIRC_ST_FORM)
+					YIrcFormClick(a1, a2);
+				else
+					YIrcChatClick(a1, a2);
+				break;
+		}
+	}
+
+	//Mouse wheel: no queued message for it, watch pos.z directly.
+	dz = mouse.pos.z - yirc.last_z;
+	yirc.last_z = mouse.pos.z;
+	if (dz && yirc.state == YIRC_ST_CHAT && Fs == sys_focus_task)
+		yirc.scroll = ClampI64(yirc.scroll - dz * 3, 0, YIRC_MAX_LINES * 4);
+}
+
+/***** main *****/
+
+U0 YIrcSockPump()
+{
+	U8	buf[YIRC_RECV_BUF];
+	I64	received, i;
+
+	if (!yirc.sock)
+		return;
+	received = TCPSocketReceive(yirc.sock, buf, YIRC_RECV_BUF);
+	if (received == 0)
+	{
+		YIrcStatus("Server closed the connection.");
+		YIrcHere("Disconnected. <ESC> to exit.");
+		TCPSocketClose(yirc.sock);
+		yirc.sock = 0;
+		yirc.connected = FALSE;
+		return;
+	}
+	if (received < 0)
+		return;	//Nothing pending (poll mode).
+	for (i = 0; i < received; i++)
+	{
+		if (buf[i] == '\n')
+		{
+			yirc.lbuf[yirc.lbuf_len] = 0;
+			if (yirc.lbuf_len && yirc.lbuf[yirc.lbuf_len - 1] == '\r')
+				yirc.lbuf[yirc.lbuf_len - 1] = 0;
+			YIrcHandleLine(yirc.lbuf);
+			yirc.lbuf_len = 0;
+		}
+		else if (yirc.lbuf_len < YIRC_LINE_MAX)
+			yirc.lbuf[yirc.lbuf_len++] = buf[i];
+	}
+}
+
+public U0 YIRC(U8 *host=NULL, I64 port=YIRC_PORT, U8 *nick=NULL, U8 *autojoin=NULL)
+{
+	I64			 i, old_inhibit;
+	CTCPSocket	*tcp;
+
+	MemSet(&yirc, 0, sizeof(CYIrcGlobals));	//Globals are NOT zeroed on load.
+	yirc.last_z = mouse.pos.z;
+
+	//Extra pens; the rest of the palette rides de_theme live.
+	yirc.c_green  = ColorRGB(0x5E, 0xC8, 0x7A);
+	yirc.c_red	  = ColorRGB(0xD8, 0x6A, 0x6A);
+	yirc.c_yellow = ColorRGB(0xD4, 0xB8, 0x62);
+	yirc.c_query  = ColorRGB(0xC8, 0x86, 0xD8);
+	for (i = 0; i < 8; i++)
+		yirc.c_nick[i] = DEHue2RGB(i * 45, 160, 235);
+
+	StrCopy(yirc.f_server, "irc.libera.chat");
+	StrCopy(yirc.f_port, "6667");
+	StrPrint(yirc.f_nick, "zealot%03d", counts.jiffies % 1000);
+	StrCopy(yirc.f_chan, "#zealos");
+	if (host)
+		StrCopy(yirc.f_server, host);
+	if (port != YIRC_PORT)
+		StrPrint(yirc.f_port, "%d", port);
+	if (nick)
+		StrCopy(yirc.f_nick, nick);
+	if (autojoin)
+		StrCopy(yirc.f_chan, autojoin);
+
+	//Take over this task's window, DEWinInit-style (but fully custom draw).
+	SettingsPush;
+	old_inhibit = Fs->win_inhibit;
+	StrCopy(Fs->task_title, "yIRC");
+	WinHorz(MaxI64(1, (TEXT_COLS - 110) / 2), MaxI64(1, (TEXT_COLS - 110) / 2) + 109);
+	WinVert(MaxI64(2, (TEXT_ROWS - 54) / 2), MaxI64(2, (TEXT_ROWS - 54) / 2) + 53);
+	//L_DOWN must deliver instantly (skip the double-click timeout).
+	Fs->win_inhibit = old_inhibit | WIF_FOCUS_TASK_MS_L_D;
+	WinFocus;
+	DocCursor(OFF);
+	DocClear;
+	Fs->draw_it = &YIrcDrawIt;
+
+	while (!yirc.quit)
+	{
+		YIrcPoll;
+		if (yirc.state == YIRC_ST_CHAT)
+			YIrcSockPump;
+		Sleep(30);
+	}
+
+	if (yirc.sock)
+	{
+		Sleep(100);	//Let the QUIT flush.
+		tcp = yirc.sock;
+		tcp->timeout = TCP_TIMEOUT;
+		TCPSocketClose(yirc.sock);
+		yirc.sock = 0;
+	}
+
+	Fs->draw_it = NULL;
+	Fs->win_inhibit = old_inhibit;
+	for (i = 0; i < yirc.num_bufs; i++)
+	{
+		Free(yirc.bufs[i]->lines);
+		Free(yirc.bufs[i]->nicks);
+		Free(yirc.bufs[i]);
+	}
+	DocCursor(ON);
+	DocClear;
+	SettingsPop;
+}
+
+YIRC;
