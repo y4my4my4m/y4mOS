@@ -242,6 +242,7 @@ U0 DEMenuTask()
 			"Web Browser\0"
 			"IRC Chat\0"
 			"Email (ZMail)\0"
+			"Telnet / BBS\0"
 			"ZealAmp\0"
 			"YTracker\0"
 			"Calculator\0"
@@ -286,36 +287,44 @@ U0 DEMenuTask()
 			User("ExeFile(\"::/DE/ZMail\");\n");
 			break;
 		case 4:
-			User("Cd(\"::/Apps/ZealAmp\");;ExeFile(\"Run\");\n");
+			if (!de.net_up)
+			{//Telnet needs the same system-wide net stack.
+				Sys("ExeFile(\"::/DE/BrowserBoot\");");
+				de.net_up = TRUE;
+			}
+			User("ExeFile(\"::/Home/Net/Programs/Telnet/Telnet\");\n");
 			break;
 		case 5:
-			User("Cd(\"::/Apps/Tracker\");;ExeFile(\"Run\");\n");
+			User("Cd(\"::/Apps/ZealAmp\");;ExeFile(\"Run\");\n");
 			break;
 		case 6:
-			User("DECalc;\n");
+			User("Cd(\"::/Apps/Tracker\");;ExeFile(\"Run\");\n");
 			break;
 		case 7:
-			User("DECalendar;\n");
+			User("DECalc;\n");
 			break;
 		case 8:
-			User("DEViewImage;\n");
+			User("DECalendar;\n");
 			break;
 		case 9:
-			User("DESettings;\n");
+			User("DEViewImage;\n");
 			break;
 		case 10:
-			User("FileMgr;\n");
+			User("DESettings;\n");
 			break;
 		case 11:
-			User("TaskRep;\n");
+			User("FileMgr;\n");
 			break;
 		case 12:
-			User("PNGDemo;\n");
+			User("TaskRep;\n");
 			break;
 		case 13:
-			User("ExeFile(\"::/Demo/Graphics/TrueColor/TrueColor\");\n");
+			User("PNGDemo;\n");
 			break;
 		case 14:
+			User("ExeFile(\"::/Demo/Graphics/TrueColor/TrueColor\");\n");
+			break;
+		case 15:
 			PopUpOk("\n     YDE\n\n"
 					"The Y Desktop Environment,\n"
 					"on a heavily modified ZealOS:\n"
@@ -324,11 +333,11 @@ U0 DEMenuTask()
 					"TLS 1.3 web browser.\n"
 					"No ELFs were harmed.\n\n");
 			break;
-		case 15:
+		case 16:
 			if (PopUpNoYes("Reboot?"))
 				Reboot;
 			break;
-		case 16:
+		case 17:
 			DEStop;
 			break;
 	}
