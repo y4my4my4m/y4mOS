@@ -29,7 +29,7 @@
 #define YH_LK_IMG		6	//Inline image block; text = URL, img = cache idx.
 
 //Async image cache (avatars / server icons / embeds).
-#define YH_IMG_MAX		128
+#define YH_IMG_MAX		256
 #define YH_IMG_URL_LEN	240
 #define YH_EMBED_W		260
 #define YH_EMBED_H		170
@@ -60,6 +60,7 @@ class CYhLine
 	U8	react[YH_REACT_LEN];	//Reaction pills, '|'-sep "name xN" tokens.
 	I16	av;					//Avatar image cache idx, -1 none.
 	I16	img;				//YH_LK_IMG: embed cache idx, -1 none.
+	I16	rc, bc, fc;			//Fediverse post reply/boost/fav counts.
 };
 
 class CYhImg
@@ -93,6 +94,7 @@ class CYhServer
 	Bool chans_loaded;
 	I64	 tab_x, tab_w;			//Draw pass fills for hit tests.
 	I16	 icon;					//Image cache idx, -1 none.
+	Bool em_loaded;				//Server emojis already merged into the cache.
 };
 
 class CYhProfile
@@ -108,6 +110,7 @@ class CYhHit
 	I64	y0, y1;					//Row extent.
 	I64	nx0, nx1;				//Nick/avatar x range (click -> mention).
 	I64	ci, ring;				//Channel + absolute ring index.
+	I64	act;					//0 normal, 5 image, 1..4 feed footer buttons.
 };
 
 #define YH_HIT_MAX	96
@@ -148,12 +151,15 @@ class CYhGlobals
 	U8			 menu_items[14][36];
 	I64			 menu_ci, menu_ring;				//Target message.
 	//Custom-emoji cache for the current server (react menu + autocomplete).
-	I64			 em_srv;							//Server idx cached, -1 none.
+	//Global ACCUMULATING emoji cache (dedup by name): renders + react picker +
+	//autocomplete. Never reset - so an emoji stays renderable once seen on any
+	//server (fixes "emojis appear only sometimes after switching").
 	I64			 em_n;
-	U8			 em_ids[24][YH_UUID_LEN];
-	U8			 em_names[24][32];
-	U8			 em_url[24][160];	//For building proper emoji message parts.
-	I16			 em_img[24];
+	U8			 em_ids[64][YH_UUID_LEN];
+	U8			 em_names[64][32];
+	U8			 em_url[64][160];
+	I16			 em_img[64];
+	Bool		 em_feed_loaded;
 	//Hover tooltip (pill names), set by the draw pass each frame.
 	U8			 tip[48];
 	I64			 tip_x, tip_y;

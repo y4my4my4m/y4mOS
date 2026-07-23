@@ -95,9 +95,6 @@ U0 YhPostRowAdd(I64 ci, CYhJson *row, U8 *missing, I64 missing_max)
 		boosts = ToI64(YhjGet(row, "reblogs_count")->num);
 	if (YhjGet(row, "replies_count"))
 		replies = ToI64(YhjGet(row, "replies_count")->num);
-	//Mastodon-style footer counts: replies / boosts / favorites.
-	if ((favs || boosts || replies) && StrLen(text) < YH_TEXT_LEN - 30)
-		CatPrint(text, "   reply %d  boost %d  fav %d", replies, boosts, favs);
 
 	if (!StrCompare(aid, yh.prof_id))
 		YhAdd(ci, YH_LK_SELF, name, text, hh, mm);
@@ -110,6 +107,9 @@ U0 YhPostRowAdd(I64 ci, CYhJson *row, U8 *missing, I64 missing_max)
 		ln->id[MinI64(StrLen(pid), YH_UUID_LEN - 1)] = 0;
 		MemCopy(ln->auid, aid, MinI64(StrLen(aid), YH_UUID_LEN - 1));
 		ln->auid[MinI64(StrLen(aid), YH_UUID_LEN - 1)] = 0;
+		ln->rc = replies;	//Counts drive the card's action footer.
+		ln->bc = boosts;
+		ln->fc = favs;
 		pidx = YhProfileFind(aid);
 		if (pidx >= 0)
 			ln->av = yh.profiles[pidx].av;
@@ -209,12 +209,12 @@ U0 YhFetchFeed(Bool initial)
 		{
 			case 0:	//Home: follows-driven server RPC (auth context).
 				json = YhRest("POST", "/rest/v1/rpc/get_home_timeline_page",
-							  "{\"p_limit\":25,\"p_before\":null}");
+							  "{\"p_limit\":40,\"p_before\":null}");
 				break;
 			case 1:	//Local instance only.
 				json = YhRest("GET",
 					"/rest/v1/posts?is_deleted=eq.false&visibility=eq.public"
-					"&is_local=eq.true&order=created_at.desc&limit=25&" YH_POST_SELECT,
+					"&is_local=eq.true&order=created_at.desc&limit=40&" YH_POST_SELECT,
 					NULL);
 				break;
 			case 3:	//Bookmarks: interaction rows -> posts.
@@ -254,7 +254,7 @@ U0 YhFetchFeed(Bool initial)
 			default://All / federated.
 				json = YhRest("GET",
 					"/rest/v1/posts?is_deleted=eq.false&visibility=eq.public"
-					"&order=created_at.desc&limit=25&" YH_POST_SELECT,
+					"&order=created_at.desc&limit=40&" YH_POST_SELECT,
 					NULL);
 		}
 		if (!json)
@@ -270,12 +270,12 @@ U0 YhFetchFeed(Bool initial)
 		if (yh.feed_mode == 1)
 			json = YhRest("GET",
 				"/rest/v1/posts?is_deleted=eq.false&visibility=eq.public"
-				"&is_local=eq.true&created_at=gt.%s&order=created_at.asc&limit=25&"
+				"&is_local=eq.true&created_at=gt.%s&order=created_at.asc&limit=40&"
 				YH_POST_SELECT, NULL, enc_ts);
 		else
 			json = YhRest("GET",
 				"/rest/v1/posts?is_deleted=eq.false&visibility=eq.public"
-				"&created_at=gt.%s&order=created_at.asc&limit=25&"
+				"&created_at=gt.%s&order=created_at.asc&limit=40&"
 				YH_POST_SELECT, NULL, enc_ts);
 		if (!json)
 			return;
@@ -308,6 +308,7 @@ U0 YhSendPost(U8 *text)
 //in the text sets the content warning inline.
 	U8		 esc[YH_TEXT_LEN * 2], cwesc[240], cwbuf[120], ftype[12];
 	U8		 media[400], content[YH_TEXT_LEN * 4];
+	U8		 reply[80];
 	U8		*body, *vis, *msg = text, *bar, *att_url;
 	CYhJson	*json;
 	I64		 ci = YhFeedChan;
@@ -352,28 +353,34 @@ U0 YhSendPost(U8 *text)
 				 att_url, ftype);
 		Free(att_url);
 	}
+	//Replying to a post (feed reply button set yh.reply_to)? Thread it.
+	reply[0] = 0;
+	if (yh.reply_to[0])
+		StrPrint(reply, "\"in_reply_to\":\"%s\",", yh.reply_to);
 	YhBuildContent(msg, content, sizeof(content));	//:emoji: -> emoji parts.
 	if (cwbuf[0])
 	{
 		YhJsonEsc(cwesc, cwbuf, sizeof(cwesc));
 		body = MStrPrint(
 			"{\"author_id\":\"%s\",\"visibility\":\"%s\",\"content_warning\":\"%s\","
-			"\"is_sensitive\":true,\"content\":%s,"
+			"\"is_sensitive\":true,%s\"content\":%s,"
 			"\"is_local\":true,\"is_federated\":true,"
 			"\"metadata\":{\"created_via\":\"yharmony_zealos\","
 			"\"content_format\":\"message_parts_v1\"}%s}",
-			yh.prof_id, vis, cwesc, content, media);
+			yh.prof_id, vis, cwesc, reply, content, media);
 	}
 	else
 		body = MStrPrint(
-			"{\"author_id\":\"%s\",\"visibility\":\"%s\",\"content\":%s,"
+			"{\"author_id\":\"%s\",\"visibility\":\"%s\",%s\"content\":%s,"
 			"\"is_local\":true,\"is_federated\":true,"
 			"\"metadata\":{\"created_via\":\"yharmony_zealos\","
 			"\"content_format\":\"message_parts_v1\"}%s}",
-			yh.prof_id, vis, content, media);
+			yh.prof_id, vis, reply, content, media);
 	json = YhRest("POST", "/rest/v1/posts", body);
 	Free(body);
 	yh.post_cw[0] = 0;	//One-shot.
+	yh.reply_to[0] = 0;
+	yh.reply_nick[0] = 0;
 	if (json)
 	{
 		if (json->child)

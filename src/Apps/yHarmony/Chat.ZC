@@ -40,6 +40,9 @@ U0 YhAdd(I64 ci, I64 kind, U8 *nick, U8 *text, U8 hh=255, U8 mm=0)
 	ln->react[0] = 0;
 	ln->av = -1;
 	ln->img = -1;
+	ln->rc = 0;
+	ln->bc = 0;
+	ln->fc = 0;
 	if (nick)
 	{
 		n = MinI64(StrLen(nick), YH_NAME_LEN - 1);
@@ -638,7 +641,7 @@ U0 YhFetchMessages(I64 ci, Bool initial)
 	if (initial)
 		json = YhRest("GET",
 			"/rest/v1/messages?%s=eq.%s&thread_id=is.null"
-			"&is_deleted=not.is.true&order=created_at.desc&limit=40"
+			"&is_deleted=not.is.true&order=created_at.desc&limit=60"
 			"&select=id,created_at,user_id,content,is_system,reply_to",
 			NULL, col, ch->id);
 	else
@@ -646,7 +649,7 @@ U0 YhFetchMessages(I64 ci, Bool initial)
 		YhTsEnc(enc_ts, ch->last_ts);
 		json = YhRest("GET",
 			"/rest/v1/messages?%s=eq.%s&thread_id=is.null"
-			"&is_deleted=not.is.true&created_at=gt.%s&order=created_at.asc&limit=40"
+			"&is_deleted=not.is.true&created_at=gt.%s&order=created_at.asc&limit=60"
 			"&select=id,created_at,user_id,content,is_system,reply_to",
 			NULL, col, ch->id, enc_ts);
 	}
@@ -775,46 +778,63 @@ U8 *YhAttachUpload(U8 *ftype_out)
 }
 
 U0 YhEmojiLoad()
-{//Cache the current server's custom emojis (+ instance-scope ones): react
-//menu + :name: autocomplete + pill images all use this.
+{//MERGE the current context's custom emojis into the global cache (dedup by
+//name). Loaded once per server (+ once for feed/DM), so an emoji stays
+//renderable after you leave its server. React picker + autocomplete + inline
+//render + pills all read this shared cache.
 	CYhJson	*json, *row;
-	U8		*nm;
+	U8		*nm, *id, *url;
 	U8		 abs[YH_IMG_URL_LEN];
+	I64		 j, k;
 
-	if (yh.em_srv == yh.cur_srv && yh.em_n)
-		return;
-	yh.em_n = 0;
-	yh.em_srv = yh.cur_srv;
 	if (yh.cur_srv >= 0)
+	{
+		if (yh.servers[yh.cur_srv].em_loaded)
+			return;
+		yh.servers[yh.cur_srv].em_loaded = TRUE;
 		json = YhRest("GET",
 			"/rest/v1/emojis?or=(server_id.eq.%s,scope.eq.instance)"
-			"&order=usage_count.desc&limit=24&select=id,name,url",
+			"&order=usage_count.desc&limit=40&select=id,name,url",
 			NULL, yh.servers[yh.cur_srv].id);
+	}
 	else
+	{
+		if (yh.em_feed_loaded)
+			return;
+		yh.em_feed_loaded = TRUE;
 		json = YhRest("GET",
-			"/rest/v1/emojis?order=usage_count.desc&limit=24&select=id,name,url",
+			"/rest/v1/emojis?order=usage_count.desc&limit=40&select=id,name,url",
 			NULL);
+	}
 	if (!json)
 		return;
 	row = json->child;
-	while (row && yh.em_n < 24)
+	while (row && yh.em_n < 64)
 	{
 		nm = YhjStr(YhjGet(row, "name"), "?");
-		if (*YhjStr(YhjGet(row, "id")))
+		id = YhjStr(YhjGet(row, "id"));
+		if (*id)
 		{
-			StrCopy(yh.em_ids[yh.em_n], YhjStr(YhjGet(row, "id")));
-			MemCopy(yh.em_names[yh.em_n], nm, MinI64(StrLen(nm), 31));
-			yh.em_names[yh.em_n][MinI64(StrLen(nm), 31)] = 0;
-			nm = YhjStr(YhjGet(row, "url"));
-			MemCopy(yh.em_url[yh.em_n], nm, MinI64(StrLen(nm), 159));
-			yh.em_url[yh.em_n][MinI64(StrLen(nm), 159)] = 0;
-			yh.em_img[yh.em_n] = -1;
-			if (*yh.em_url[yh.em_n])
+			k = -1;	//Dedup by name.
+			for (j = 0; j < yh.em_n; j++)
+				if (!StrCompare(yh.em_names[j], nm))
+					k = j;
+			if (k < 0)
 			{
-				YhImgAbs(yh.em_url[yh.em_n], abs, sizeof(abs), "emojis");
-				yh.em_img[yh.em_n] = YhImgGet(abs, 12, 12);
+				StrCopy(yh.em_ids[yh.em_n], id);
+				MemCopy(yh.em_names[yh.em_n], nm, MinI64(StrLen(nm), 31));
+				yh.em_names[yh.em_n][MinI64(StrLen(nm), 31)] = 0;
+				url = YhjStr(YhjGet(row, "url"));
+				MemCopy(yh.em_url[yh.em_n], url, MinI64(StrLen(url), 159));
+				yh.em_url[yh.em_n][MinI64(StrLen(url), 159)] = 0;
+				yh.em_img[yh.em_n] = -1;
+				if (*yh.em_url[yh.em_n])
+				{
+					YhImgAbs(yh.em_url[yh.em_n], abs, sizeof(abs), "emojis");
+					yh.em_img[yh.em_n] = YhImgGet(abs, 12, 12);
+				}
+				yh.em_n++;
 			}
-			yh.em_n++;
 		}
 		row = row->next;
 	}
@@ -1225,6 +1245,7 @@ U0 YhSwitchServer(I64 si)
 	if (si < 0 || si >= yh.num_servers)
 		return;
 	yh.cur_srv = si;
+	YhEmojiLoad;	//So :name: shortcodes render as images while just viewing.
 	if (!yh.servers[si].chans_loaded)
 		YhFetchChannels(si);
 	ci = YhFirstChan(si);

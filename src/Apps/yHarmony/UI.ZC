@@ -154,8 +154,9 @@ U0 YhLineHead(CYhLine *ln, U8 *head, CColorROPU32 *head_pen, CColorROPU32 *body_
 	}
 }
 
-U0 YhHitPush(I64 y0, I64 y1, I64 nx0, I64 nx1, I64 ci, I64 ring)
-{//Record a clickable message row for this frame (read by click handlers).
+U0 YhHitPush(I64 y0, I64 y1, I64 nx0, I64 nx1, I64 ci, I64 ring, I64 act=0)
+{//Record a clickable row for this frame (read by click handlers). act: 0
+//normal (name/avatar x range), 5 inline image, 1..4 feed footer buttons.
 	CYhHit *h;
 
 	if (yh.hit_count >= YH_HIT_MAX)
@@ -167,6 +168,7 @@ U0 YhHitPush(I64 y0, I64 y1, I64 nx0, I64 nx1, I64 ci, I64 ring)
 	h->nx1 = nx1;
 	h->ci = ci;
 	h->ring = ring;
+	h->act = act;
 	yh.hit_count++;
 }
 
@@ -195,6 +197,73 @@ Bool YhIsGroupHead(CYhChan *cb, I64 i, I64 first)
 	if (ln->mm < pl->mm || ln->mm - pl->mm > 5)
 		return TRUE;
 	return FALSE;
+}
+
+I64 YhNDig(I64 v)
+{//Printed width of a non-negative count (for laying out footer buttons).
+	I64 d = 1;
+
+	while (v >= 10)
+	{
+		v /= 10;
+		d++;
+	}
+	return d;
+}
+
+U0 YhDrawTextRun(CDC *dc, I64 x, I64 y, U8 *seg, CColorROPU32 pen)
+{//Draw a text segment, substituting cached custom-emoji IMAGES for :name:
+//shortcodes (falls back to the literal :name: when the emoji isn't cached
+//or its image hasn't decoded yet). The emoji cache is the current server's.
+	U8	*p = seg, *colon;
+	U8	 name[40];
+	I64	 i, k, len, e;
+	Bool matched;
+
+	while (*p)
+	{
+		matched = FALSE;
+		if (*p == ':')
+		{
+			colon = StrFirstOcc(p + 1, ":");
+			len = 0;
+			if (colon)
+				len = colon - (p + 1);
+			k = -1;
+			if (colon && len >= 1 && len <= 31)
+			{
+				MemCopy(name, p + 1, len);
+				name[len] = 0;
+				for (i = 0; i < yh.em_n; i++)
+					if (!StrCompare(yh.em_names[i], name))
+						k = i;
+			}
+			if (k >= 0 && yh.em_img[k] >= 0)
+			{
+				e = yh.em_img[k];
+				if (yh.imgs[e].state == 2 && yh.imgs[e].dc)
+				{
+					GrBlot(dc, x, y - 1, yh.imgs[e].dc);
+					x += yh.imgs[e].dc->width + 1;
+				}
+				else
+				{//Not decoded yet: keep the shortcode text.
+					dc->color = pen;
+					GrPrint(dc, x, y, ":%s:", name);
+					x += (len + 2) * FONT_WIDTH;
+				}
+				p = colon + 1;
+				matched = TRUE;
+			}
+		}
+		if (!matched)
+		{
+			dc->color = pen;
+			GrPrint(dc, x, y, "%c", *p);
+			x += FONT_WIDTH;
+			p++;
+		}
+	}
 }
 
 U0 YhDrawPills(CDC *dc, I64 x, I64 y, U8 *react, I64 xmax, I64 mx, I64 my)
@@ -276,7 +345,7 @@ U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
 	I64	 y = log_y + 4 - yh.scroll * YH_ROW_H;
 	I64	 first = MaxI64(0, cb->count - YH_MAX_LINES);
 	I64	 i = cb->count - 1, j, r, rows, avail, blen, seg, ytop, ih, ay, cardh;
-	I64	 imgn, imgi[4];
+	I64	 imgn, imgi[4], fbx, w;
 	I64	 y0c = log_y, y1c = log_y + log_h;
 	I64	 cw = log_w - 4, tx = log_x + 12;
 	CYhLine	*ln, *boost, *il;
@@ -314,7 +383,7 @@ U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
 				else
 					ih += YH_ROW_H;
 			}
-			cardh = 16 + YH_HDR_H + rows * YH_ROW_H + ih;
+			cardh = 16 + YH_HDR_H + rows * YH_ROW_H + ih + YH_ROW_H + 4;
 			if (boost)
 				cardh += YH_ROW_H;
 			ytop = y;
@@ -376,7 +445,7 @@ U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
 							seg = 0;
 						MemCopy(seg_buf, &ln->text[r * avail], seg);
 						seg_buf[seg] = 0;
-						GrPrint(dc, tx, ay, "%s", seg_buf);
+						YhDrawTextRun(dc, tx, ay, seg_buf, de_theme.text);
 					}
 					ay += YH_ROW_H;
 				}
@@ -391,7 +460,7 @@ U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
 							GrBlot(dc, tx, ay, yh.imgs[il->img].dc);
 							//nx0 = -1 marks an image hit (click -> lightbox).
 							YhHitPush(ay, ay + yh.imgs[il->img].dc->height,
-									  -1, -1, yh.cur_chan, imgi[j]);
+									  0, 0, yh.cur_chan, imgi[j], 5);
 						}
 						ay += yh.imgs[il->img].dc->height + 6;
 					}
@@ -403,6 +472,31 @@ U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
 							GrPrint(dc, tx, ay, "[media loading...]");
 						}
 						ay += YH_ROW_H;
+					}
+					//Action footer: reply / boost / fav / bookmark. Distinct nx0
+					//codes let the click handler tell the buttons apart.
+					ay += 2;
+					if (ay >= y0c && ay + FONT_HEIGHT <= y1c)
+					{
+						fbx = tx;
+						dc->color = de_theme.accent_dim;
+						GrPrint(dc, fbx, ay, "reply %d", ln->rc);
+						w = (7 + YhNDig(ln->rc)) * FONT_WIDTH;
+						YhHitPush(ay, ay + YH_ROW_H, fbx, fbx + w, yh.cur_chan, i, 1);
+						fbx += w;
+						dc->color = yh.c_green;
+						GrPrint(dc, fbx, ay, "boost %d", ln->bc);
+						w = (7 + YhNDig(ln->bc)) * FONT_WIDTH;
+						YhHitPush(ay, ay + YH_ROW_H, fbx, fbx + w, yh.cur_chan, i, 2);
+						fbx += w;
+						dc->color = de_theme.accent;
+						GrPrint(dc, fbx, ay, "fav %d", ln->fc);
+						w = (5 + YhNDig(ln->fc)) * FONT_WIDTH;
+						YhHitPush(ay, ay + YH_ROW_H, fbx, fbx + w, yh.cur_chan, i, 3);
+						fbx += w;
+						dc->color = de_theme.text_dim;
+						GrPrint(dc, fbx, ay, "mark");
+						YhHitPush(ay, ay + YH_ROW_H, fbx, fbx + 5 * FONT_WIDTH, yh.cur_chan, i, 4);
 					}
 				}
 			}
@@ -521,9 +615,7 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 	for (i = yh.tab_scroll; i < yh.num_servers; i++)
 	{
 		sv = &yh.servers[i];
-		w = StrLen(sv->name) * FONT_WIDTH + 16;
-		if (sv->icon >= 0)
-			w += 18;
+		w = StrLen(sv->name) * FONT_WIDTH + 16 + 18;	//Always an icon slot.
 		sv->tab_x = x;
 		if (x + w > tab_lim - 22)
 		{//Out of room: show the ">" scroll chip and stop.
@@ -543,21 +635,19 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 			dc->color = de_theme.bttn;
 		GrRect(dc, x, tab_y, w, tab_h);
 		YhDrawEdge(dc, x, tab_y, w, tab_h);
-		r = x + 8;	//Text start.
-		if (sv->icon >= 0)
+		//Icon: real 16x16 if decoded, else a colored initial chip. Every
+		//server gets one (null-icon servers used to show nothing at all).
+		if (sv->icon >= 0 && yh.imgs[sv->icon].state == 2)
+			GrBlot(dc, x + 3, tab_y + 2, yh.imgs[sv->icon].dc);
+		else
 		{
-			if (yh.imgs[sv->icon].state == 2)
-				GrBlot(dc, x + 3, tab_y + 2, yh.imgs[sv->icon].dc);
-			else
-			{//Placeholder chip while loading / after webp fail.
-				dc->color = YhNickPen(sv->name);
-				GrRect(dc, x + 3, tab_y + 2, 16, 16);
-				dc->color = de_theme.win_bg;
-				GrPrint(dc, x + 3 + (16 - FONT_WIDTH) / 2, tab_y + 2 + (16 - FONT_HEIGHT) / 2,
-						"%c", sv->name[0]);
-			}
-			r = x + 22;
+			dc->color = YhNickPen(sv->name);
+			GrRect(dc, x + 3, tab_y + 2, 16, 16);
+			dc->color = de_theme.win_bg;
+			GrPrint(dc, x + 3 + (16 - FONT_WIDTH) / 2, tab_y + 2 + (16 - FONT_HEIGHT) / 2,
+					"%c", sv->name[0]);
 		}
+		r = x + 22;	//Text start (past the icon).
 		if (i == yh.cur_srv)
 			dc->color = de_theme.text;
 		else
@@ -730,7 +820,7 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 						GrBlot(dc, log_x + YH_IND, y, yh.imgs[ln->img].dc);
 						//nx0 = -1 marks an image (click -> lightbox).
 						YhHitPush(y, y + yh.imgs[ln->img].dc->height,
-								  -1, -1, yh.cur_chan, i);
+								  0, 0, yh.cur_chan, i, 5);
 					}
 				}
 				else
@@ -778,8 +868,8 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 							seg = 0;
 						MemCopy(seg_buf, &ln->text[r * avail], seg);
 						seg_buf[seg] = 0;
-						GrPrint(dc, log_x + YH_IND, y + r * YH_ROW_H,
-								"%s", seg_buf);
+						YhDrawTextRun(dc, log_x + YH_IND, y + r * YH_ROW_H,
+									  seg_buf, de_theme.text);
 					}
 				}
 				YhHitPush(y, y + rows * YH_ROW_H, 0, 0, yh.cur_chan, i);
@@ -1687,6 +1777,11 @@ U0 YhChatKey(I64 ch, I64 sc)
 		}
 		else if (yh.input_len)
 			yh.input[--yh.input_len] = 0;
+		else if (yh.reply_to[0])
+		{//Empty input + backspace exits reply mode.
+			yh.reply_to[0] = 0;
+			yh.reply_nick[0] = 0;
+		}
 	}
 	else if (' ' <= ch < 0x7F)
 	{
@@ -1940,16 +2035,47 @@ U0 YhChatClick(I64 mx, I64 my)
 			}
 		}
 	}
-	//Click an inline image (nx0 == -1 hits): open the lightbox at full size.
+	//Feed card action footer buttons (act 1..4).
 	for (i = 0; i < yh.hit_count; i++)
-		if (yh.hits[i].nx0 == -1 && yh.hits[i].y0 <= my < yh.hits[i].y1)
+		if (1 <= yh.hits[i].act <= 4 &&
+			yh.hits[i].y0 <= my < yh.hits[i].y1 &&
+			yh.hits[i].nx0 <= mx < yh.hits[i].nx1)
 		{
 			ln = &yh.chans[yh.hits[i].ci].lines[yh.hits[i].ring % YH_MAX_LINES];
-			if (ln->kind == YH_LK_IMG && ln->text[0])
-			{//"#big" suffix = separate cache slot at window size.
+			if (!ln->id[0])
+				return;
+			if (yh.hits[i].act == 1)
+			{//Reply: compose an in_reply_to post.
+				StrCopy(yh.reply_to, ln->id);
+				StrCopy(yh.reply_nick, ln->nick);
+			}
+			else if (yh.hits[i].act == 2)
+			{
+				YhPostInteract(ln->id, "reblog");
+				ln->bc++;
+			}
+			else if (yh.hits[i].act == 3)
+			{
+				YhPostInteract(ln->id, "favorite");
+				ln->fc++;
+			}
+			else
+				YhPostInteract(ln->id, "bookmark");
+			return;
+		}
+	//Click an inline image (act 5): open the lightbox at full size.
+	for (i = 0; i < yh.hit_count; i++)
+		if (yh.hits[i].act == 5 && yh.hits[i].y0 <= my < yh.hits[i].y1)
+		{
+			ln = &yh.chans[yh.hits[i].ci].lines[yh.hits[i].ring % YH_MAX_LINES];
+			if (ln->kind == YH_LK_IMG && ln->img >= 0)
+			{//Request a bigger copy, but fall back to the already-decoded
+			 //thumbnail when the cache is full (avoids a stuck "loading").
 				StrPrint(bigurl, "%s#big", ln->text);
 				yh.light_img = YhImgGet(bigurl, Fs->pix_width - 24,
 										Fs->pix_height - 40);
+				if (yh.light_img < 0)
+					yh.light_img = ln->img;
 				yh.light_on = TRUE;
 			}
 			return;

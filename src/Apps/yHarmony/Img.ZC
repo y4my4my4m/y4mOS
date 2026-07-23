@@ -99,7 +99,7 @@ U0 YhImgAbs(U8 *src, U8 *dst, I64 max, U8 *bucket="avatars")
 U0 YhImgLoaderTask()
 {//Fetch + decode queued images, one at a time. Decoded on this task's heap,
 //then scaled into a DC on the UI task's heap (survives us).
-	I64		 i, w, h, tries;
+	I64		 i, w, h, tries, pick;
 	U8		 fetch_url[YH_IMG_URL_LEN];
 	U8		*p;
 	CYhImg	*im;
@@ -109,16 +109,28 @@ U0 YhImgLoaderTask()
 
 	while (!yh.quit)
 	{
+		//Priority: process FRESH requests (state 1) before retrying stale
+		//failures. Otherwise a backlog of DNS-flaked old images starves the
+		//avatars/emojis of the view you just switched to ("hit or miss").
+		pick = -1;
+		for (i = 0; i < yh.img_count && pick < 0; i++)
+			if (yh.imgs[i].state == 1)
+				pick = i;
+		if (pick < 0)
+		{//No fresh work: promote ONE stale failure that's aged out.
+			for (i = 0; i < yh.img_count && pick < 0; i++)
+				if (yh.imgs[i].state == 3 &&
+					counts.jiffies > yh.imgs[i].fail_t + 20 * JIFFY_FREQ)
+				{
+					yh.imgs[i].state = 1;
+					pick = i;
+				}
+		}
 		found = FALSE;
-		for (i = 0; i < yh.img_count && !found; i++)
+		if (pick >= 0)
 		{
+			i = pick;
 			im = &yh.imgs[i];
-			//Re-queue stale failures HERE (not just in YhImgGet): server
-			//icons + avatars store their cache index once and never re-call
-			//YhImgGet, so a DNS-flaked failure would otherwise be permanent.
-			if (im->state == 3 && counts.jiffies > im->fail_t + 20 * JIFFY_FREQ)
-				im->state = 1;
-			if (im->state == 1)
 			{
 				found = TRUE;
 				raw = NULL;
@@ -150,7 +162,12 @@ U0 YhImgLoaderTask()
 					else if (resp->body_length > 12 &&
 							 !MemCompare(resp->body, "RIFF", 4) &&
 							 !MemCompare(resp->body + 8, "WEBP", 4))
+					{
 						raw = WEBPReadBuf(resp->body, resp->body_length);
+						if (!raw)
+							NetLog("yHarmony img: WEBP decode FAILED (%d bytes) %s",
+								   resp->body_length, fetch_url);
+					}
 					else
 						NetLog("yHarmony img: unknown format %s", im->url);
 				}
