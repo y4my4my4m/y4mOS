@@ -711,7 +711,7 @@ U8 *YIrcListAdd(U8 *w, U8 *fmt, ...)
 U0 YIrcConfigMenu()
 {//Blocking pop-up settings menu. Loops so toggles apply without reopening.
 	I64	 sel;
-	U8	 list[256], *w, color[16];
+	U8	 list[256], *w, color[16], *onoff;
 
 	while (TRUE)
 	{
@@ -719,9 +719,12 @@ U0 YIrcConfigMenu()
 			StrCopy(color, "default");
 		else
 			StrPrint(color, "%d", yirc.my_color);
+		if (yirc.f_autoconn)
+			onoff = "ON";
+		else
+			onoff = "OFF";
 		w = list;
-		w = YIrcListAdd(w, "Auto-connect on launch: %s",
-						yirc.f_autoconn ? "ON" : "OFF");
+		w = YIrcListAdd(w, "Auto-connect on launch: %s", onoff);
 		w = YIrcListAdd(w, "Cycle nick color (now: %s)", color);
 		w = YIrcListAdd(w, "Reset nick color to default");
 		w = YIrcListAdd(w, "Save settings now");
