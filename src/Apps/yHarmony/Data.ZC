@@ -14,7 +14,7 @@
 #define YH_ROW_H		(FONT_HEIGHT + 2)
 #define YH_HDR_H		18	//Message-group header row (16px avatar + pad).
 #define YH_GAP			5	//Gap between message groups.
-#define YH_PILL_H		14	//Reaction pill row.
+#define YH_PILL_H		18	//Reaction pill row (16px pill + gap).
 #define YH_IND			22	//Text indent under the avatar column.
 #define YH_REACT_LEN	80	//Per-line reaction-pill string buffer.
 #define YH_CHAN_PANEL_W	170
@@ -56,6 +56,7 @@ class CYhLine
 	U8	nick[YH_NAME_LEN];
 	U8	text[YH_TEXT_LEN];
 	U8	id[YH_UUID_LEN];	//Message/post uuid (reactions + reply lookups).
+	U8	auid[YH_UUID_LEN];	//Author profile uuid (profile view).
 	U8	react[YH_REACT_LEN];	//Reaction pills, '|'-sep "name xN" tokens.
 	I16	av;					//Avatar image cache idx, -1 none.
 	I16	img;				//YH_LK_IMG: embed cache idx, -1 none.
@@ -140,6 +141,44 @@ class CYhGlobals
 	I64			 hit_count;
 	//Reply-in-progress (right-click menu sets; cleared after send).
 	U8			 reply_to[YH_UUID_LEN], reply_nick[YH_NAME_LEN];
+	//In-window context menu (anchored at the cursor).
+	Bool		 menu_on;
+	I64			 menu_x, menu_y, menu_n, menu_mode;	//mode 0=message, 1=react.
+	U8			 menu_items[14][36];
+	I64			 menu_ci, menu_ring;				//Target message.
+	//Custom-emoji cache for the current server (react menu + autocomplete).
+	I64			 em_srv;							//Server idx cached, -1 none.
+	I64			 em_n;
+	U8			 em_ids[24][YH_UUID_LEN];
+	U8			 em_names[24][32];
+	I16			 em_img[24];
+	//Hover tooltip (pill names), set by the draw pass each frame.
+	U8			 tip[48];
+	I64			 tip_x, tip_y;
+	//TAB-autocomplete cycling state.
+	U8			 ac_prefix[40];
+	I64			 ac_idx, ac_start;
+	//Select-all pending (Ctrl+A: next edit replaces the input).
+	Bool		 selall;
+	//Input-bar buttons.
+	I64			 emoji_btn_x, vis_btn_x, vis_btn_w;
+	I64			 post_vis;		//0 public 1 unlisted 2 followers 3 direct.
+	U8			 post_cw[120];	//Content warning for the next post.
+	//Fediverse timeline mode + sub-tab hit zones.
+	I64			 feed_mode;		//0 Home, 1 Local, 2 All, 3 Bookmarks.
+	I64			 fm_x[4], fm_w[4];
+	//Profile view (the ~profile pseudo-channel shows this author).
+	Bool		 pv_on;
+	U8			 pv_id[YH_UUID_LEN];
+	U8			 pv_name[YH_NAME_LEN], pv_domain[64], pv_bio[200];
+	I64			 pv_posts, pv_followers, pv_following;
+	Bool		 pv_isfollowing;	//We follow them.
+	I16			 pv_av;
+	I64			 pv_btn_x, pv_btn_y, pv_btn_w;		//Follow/unfollow button.
+	I64			 pv_back_x, pv_back_w;				//"< feed" chip.
+	I64			 pv_fl_y;							//Counts row (list clicks).
+	//Follow-list submenu targets (menu_mode 2).
+	U8			 fl_ids[14][YH_UUID_LEN];
 	//Realtime.
 	CWs			*ws;
 	Bool		 ws_ok;

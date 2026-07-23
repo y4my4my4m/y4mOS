@@ -1,12 +1,12 @@
 /***** fediverse feed (ActivityPub timeline) *****/
 
 I64 YhFeedChan()
-{//The feed lives in a pseudo-channel on pseudo-server YH_SRV_FEED.
+{//The timeline lives in a pseudo-channel on pseudo-server YH_SRV_FEED.
 	I64		 i;
 	CYhChan	*ch;
 
 	for (i = 0; i < yh.num_chans; i++)
-		if (yh.chans[i].server == YH_SRV_FEED)
+		if (yh.chans[i].server == YH_SRV_FEED && !StrCompare(yh.chans[i].name, "fediverse"))
 			return i;
 	if (yh.num_chans >= YH_MAX_CHANS)
 		return -1;
@@ -18,20 +18,49 @@ I64 YhFeedChan()
 	return yh.num_chans++;
 }
 
+I64 YhProfChan()
+{//Second pseudo-channel: the currently-viewed federated profile's posts.
+	I64		 i;
+	CYhChan	*ch;
+
+	for (i = 0; i < yh.num_chans; i++)
+		if (yh.chans[i].server == YH_SRV_FEED && !StrCompare(yh.chans[i].name, "~profile"))
+			return i;
+	if (yh.num_chans >= YH_MAX_CHANS)
+		return -1;
+	ch = &yh.chans[yh.num_chans];
+	MemSet(ch, 0, sizeof(CYhChan));
+	StrCopy(ch->name, "~profile");
+	ch->server = YH_SRV_FEED;
+	StrCopy(ch->last_ts, "1970-01-01T00:00:00");
+	return yh.num_chans++;
+}
+
 U0 YhPostRowAdd(I64 ci, CYhJson *row, U8 *missing, I64 missing_max)
 {//One posts row -> feed line(s): author, text, fav/boost counts, media.
+//Handles both PostgREST rows (author_id) and home-timeline RPC rows
+//(embedded author object).
 	U8		 text[YH_TEXT_LEN], hh, mm;
 	U8		*aid, *name, *created, *pid;
-	CYhJson	*media, *att;
+	CYhJson	*media, *att, *author;
 	CYhChan	*ch = &yh.chans[ci];
 	CYhLine	*ln;
-	I64		 pidx, favs = 0, boosts = 0;
+	I64		 pidx, favs = 0, boosts = 0, replies = 0;
 	U8		 abs[YH_IMG_URL_LEN];
 
 	created = YhjStr(YhjGet(row, "created_at"));
 	YhMsgTime(created, &hh, &mm);
-	aid = YhjStr(YhjGet(row, "author_id"));
 	pid = YhjStr(YhjGet(row, "id"));
+	author = YhjGet(row, "author");
+	if (author && author->type == YHJ_OBJ)
+	{//RPC row: author embedded - feed the profile cache directly.
+		aid = YhjStr(YhjGet(author, "id"));
+		if (*aid)
+			YhProfileAdd(aid, YhjStr(YhjGet(author, "username"), "user"),
+						 YhjStr(YhjGet(author, "avatar_url")));
+	}
+	else
+		aid = YhjStr(YhjGet(row, "author_id"));
 	name = NULL;
 	if (*aid)
 		name = YhProfileName(aid);
@@ -64,8 +93,11 @@ U0 YhPostRowAdd(I64 ci, CYhJson *row, U8 *missing, I64 missing_max)
 		favs = ToI64(YhjGet(row, "favorites_count")->num);
 	if (YhjGet(row, "reblogs_count"))
 		boosts = ToI64(YhjGet(row, "reblogs_count")->num);
-	if ((favs || boosts) && StrLen(text) < YH_TEXT_LEN - 24)
-		CatPrint(text, "  {*%d ^%d}", favs, boosts);
+	if (YhjGet(row, "replies_count"))
+		replies = ToI64(YhjGet(row, "replies_count")->num);
+	//Mastodon-style footer counts: replies / boosts / favorites.
+	if ((favs || boosts || replies) && StrLen(text) < YH_TEXT_LEN - 30)
+		CatPrint(text, "   reply %d  boost %d  fav %d", replies, boosts, favs);
 
 	if (!StrCompare(aid, yh.prof_id))
 		YhAdd(ci, YH_LK_SELF, name, text, hh, mm);
@@ -76,6 +108,8 @@ U0 YhPostRowAdd(I64 ci, CYhJson *row, U8 *missing, I64 missing_max)
 	{
 		MemCopy(ln->id, pid, MinI64(StrLen(pid), YH_UUID_LEN - 1));
 		ln->id[MinI64(StrLen(pid), YH_UUID_LEN - 1)] = 0;
+		MemCopy(ln->auid, aid, MinI64(StrLen(aid), YH_UUID_LEN - 1));
+		ln->auid[MinI64(StrLen(aid), YH_UUID_LEN - 1)] = 0;
 		pidx = YhProfileFind(aid);
 		if (pidx >= 0)
 			ln->av = yh.profiles[pidx].av;
@@ -107,42 +141,17 @@ U0 YhPostRowAdd(I64 ci, CYhJson *row, U8 *missing, I64 missing_max)
 	}
 }
 
-U0 YhFetchFeed(Bool initial)
-{
-	I64		 ci = YhFeedChan, n, i;
-	CYhJson	*json, *row, *rows[64];
-	CYhChan	*ch;
-	U8		 missing[1600], enc_ts[56];
+U0 YhFeedRows(I64 ci, CYhJson *json, Bool newest_first)
+{//Shared row-walker: profile batch + add in display order.
+	CYhJson	*row, *rows[64];
+	I64		 n, i;
+	U8		 missing[1600];
 
-	if (ci < 0)
-		return;
-	ch = &yh.chans[ci];
-	if (initial)
-		json = YhRest("GET",
-			"/rest/v1/posts?is_deleted=eq.false&visibility=eq.public"
-			"&order=created_at.desc&limit=25"
-			"&select=id,created_at,author_id,content,media_attachments,"
-			"reblog,reblog_author,favorites_count,reblogs_count",
-			NULL);
-	else
-	{
-		YhTsEnc(enc_ts, ch->last_ts);
-		json = YhRest("GET",
-			"/rest/v1/posts?is_deleted=eq.false&visibility=eq.public"
-			"&created_at=gt.%s&order=created_at.asc&limit=25"
-			"&select=id,created_at,author_id,content,media_attachments,"
-			"reblog,reblog_author,favorites_count,reblogs_count",
-			NULL, enc_ts);
-	}
-	if (!json)
-		return;
-
-	//Batch-resolve unknown authors first (names + avatars on first paint).
 	missing[0] = 0;
 	row = json->child;
 	while (row)
 	{
-		if (*YhjStr(YhjGet(row, "author_id")) &&
+		if (!YhjGet(row, "author") && *YhjStr(YhjGet(row, "author_id")) &&
 			!YhProfileName(YhjStr(YhjGet(row, "author_id"))))
 		{
 			if (StrLen(missing) + 40 < sizeof(missing))
@@ -157,8 +166,8 @@ U0 YhFetchFeed(Bool initial)
 	YhFetchProfiles(missing);
 	missing[0] = 0;
 
-	if (initial)
-	{
+	if (newest_first)
+	{//Reverse into oldest-first for the bottom-up log.
 		n = 0;
 		row = json->child;
 		while (row && n < 64)
@@ -168,7 +177,6 @@ U0 YhFetchFeed(Bool initial)
 		}
 		for (i = n - 1; i >= 0; i--)
 			YhPostRowAdd(ci, rows[i], missing, sizeof(missing));
-		ch->loaded = TRUE;
 	}
 	else
 	{
@@ -179,30 +187,182 @@ U0 YhFetchFeed(Bool initial)
 			row = row->next;
 		}
 	}
+}
+
+//One line on purpose: multiline #define continuation is untested in ZealC.
+#define YH_POST_SELECT "select=id,created_at,author_id,content,media_attachments,reblog,reblog_author,favorites_count,reblogs_count,replies_count"
+
+U0 YhFetchFeed(Bool initial)
+{//Timeline fetch, honoring the current sub-tab (yh.feed_mode).
+	I64		 ci = YhFeedChan;
+	CYhJson	*json = NULL, *row;
+	CYhChan	*ch;
+	U8		 enc_ts[56], ids[1700];
+	I64		 n;
+
+	if (ci < 0)
+		return;
+	ch = &yh.chans[ci];
+	if (initial)
+	{
+		switch (yh.feed_mode)
+		{
+			case 0:	//Home: follows-driven server RPC (auth context).
+				json = YhRest("POST", "/rest/v1/rpc/get_home_timeline_page",
+							  "{\"p_limit\":25,\"p_before\":null}");
+				break;
+			case 1:	//Local instance only.
+				json = YhRest("GET",
+					"/rest/v1/posts?is_deleted=eq.false&visibility=eq.public"
+					"&is_local=eq.true&order=created_at.desc&limit=25&" YH_POST_SELECT,
+					NULL);
+				break;
+			case 3:	//Bookmarks: interaction rows -> posts.
+				json = YhRest("GET",
+					"/rest/v1/post_interactions?user_id=eq.%s"
+					"&interaction_type=eq.bookmark&order=created_at.desc"
+					"&limit=20&select=post_id",
+					NULL, yh.prof_id);
+				if (!json)
+					return;
+				ids[0] = 0;
+				n = 0;
+				row = json->child;
+				while (row && n < 20)
+				{
+					if (*YhjStr(YhjGet(row, "post_id")))
+					{
+						if (*ids)
+							CatPrint(ids, ",");
+						CatPrint(ids, "%s", YhjStr(YhjGet(row, "post_id")));
+						n++;
+					}
+					row = row->next;
+				}
+				YhjFree(json);
+				json = NULL;
+				if (!*ids)
+				{
+					YhAdd(ci, YH_LK_STATUS, NULL, "No bookmarks yet.");
+					ch->loaded = TRUE;
+					return;
+				}
+				json = YhRest("GET",
+					"/rest/v1/posts?id=in.(%s)&order=created_at.desc&" YH_POST_SELECT,
+					NULL, ids);
+				break;
+			default://All / federated.
+				json = YhRest("GET",
+					"/rest/v1/posts?is_deleted=eq.false&visibility=eq.public"
+					"&order=created_at.desc&limit=25&" YH_POST_SELECT,
+					NULL);
+		}
+		if (!json)
+			return;
+		YhFeedRows(ci, json, TRUE);
+		ch->loaded = TRUE;
+	}
+	else
+	{//Watermark poll: only meaningful for the chronological modes.
+		if (yh.feed_mode != 1 && yh.feed_mode != 2)
+			return;
+		YhTsEnc(enc_ts, ch->last_ts);
+		if (yh.feed_mode == 1)
+			json = YhRest("GET",
+				"/rest/v1/posts?is_deleted=eq.false&visibility=eq.public"
+				"&is_local=eq.true&created_at=gt.%s&order=created_at.asc&limit=25&"
+				YH_POST_SELECT, NULL, enc_ts);
+		else
+			json = YhRest("GET",
+				"/rest/v1/posts?is_deleted=eq.false&visibility=eq.public"
+				"&created_at=gt.%s&order=created_at.asc&limit=25&"
+				YH_POST_SELECT, NULL, enc_ts);
+		if (!json)
+			return;
+		YhFeedRows(ci, json, FALSE);
+	}
 	YhjFree(json);
+}
+
+U0 YhFeedSetMode(I64 mode)
+{//Sub-tab switch: reset the timeline ring and refetch.
+	I64		 ci = YhFeedChan;
+	CYhChan	*ch;
+
+	if (ci < 0)
+		return;
+	yh.feed_mode = mode;
+	ch = &yh.chans[ci];
+	ch->count = 0;
+	ch->unread = 0;
+	ch->loaded = FALSE;
+	StrCopy(ch->last_ts, "1970-01-01T00:00:00");
+	yh.scroll = 0;
+	//YhNetPump re-runs the initial load.
 }
 
 U0 YhSendPost(U8 *text)
 {//Publish to the fediverse: direct posts insert; the federation backend
 //picks it up (is_federated + federation_status pending) and delivers via
-//ActivityPub.
-	U8		 esc[YH_TEXT_LEN * 2];
-	U8		*body;
+//ActivityPub. Honors yh.post_vis + yh.post_cw. A leading "cw:<warn>|<body>"
+//in the text sets the content warning inline.
+	U8		 esc[YH_TEXT_LEN * 2], cwesc[240], cwbuf[120];
+	U8		*body, *vis, *msg = text, *bar;
 	CYhJson	*json;
 	I64		 ci = YhFeedChan;
 
 	if (ci < 0)
 		return;
-	YhJsonEsc(esc, text, sizeof(esc));
-	body = MStrPrint(
-		"{\"author_id\":\"%s\",\"visibility\":\"public\","
-		"\"content\":[{\"type\":\"text\",\"text\":\"%s\"}],"
-		"\"is_local\":true,\"is_federated\":true,"
-		"\"metadata\":{\"created_via\":\"yharmony_zealos\","
-		"\"content_format\":\"message_parts_v1\"}}",
-		yh.prof_id, esc);
+	cwbuf[0] = 0;
+	if (!StrNICompare(msg, "cw:", 3))
+	{
+		bar = StrFirstOcc(msg + 3, "|");
+		if (bar)
+		{
+			*bar = 0;
+			MemCopy(cwbuf, msg + 3, MinI64(StrLen(msg + 3), 119));
+			cwbuf[MinI64(StrLen(msg + 3), 119)] = 0;
+			msg = bar + 1;
+			while (*msg == ' ')
+				msg++;
+		}
+	}
+	else if (yh.post_cw[0])
+		StrCopy(cwbuf, yh.post_cw);
+
+	if (yh.post_vis == 1)
+		vis = "unlisted";
+	else if (yh.post_vis == 2)
+		vis = "followers";
+	else if (yh.post_vis == 3)
+		vis = "direct";
+	else
+		vis = "public";
+
+	YhJsonEsc(esc, msg, sizeof(esc));
+	if (cwbuf[0])
+	{
+		YhJsonEsc(cwesc, cwbuf, sizeof(cwesc));
+		body = MStrPrint(
+			"{\"author_id\":\"%s\",\"visibility\":\"%s\",\"content_warning\":\"%s\","
+			"\"is_sensitive\":true,"
+			"\"content\":[{\"type\":\"text\",\"text\":\"%s\"}],"
+			"\"is_local\":true,\"is_federated\":true,"
+			"\"metadata\":{\"created_via\":\"yharmony_zealos\","
+			"\"content_format\":\"message_parts_v1\"}}",
+			yh.prof_id, vis, cwesc, esc);
+	}
+	else
+		body = MStrPrint(
+			"{\"author_id\":\"%s\",\"visibility\":\"%s\","
+			"\"content\":[{\"type\":\"text\",\"text\":\"%s\"}],"
+			"\"is_local\":true,\"is_federated\":true,"
+			"\"metadata\":{\"created_via\":\"yharmony_zealos\","
+			"\"content_format\":\"message_parts_v1\"}}",
+			yh.prof_id, vis, esc);
 	json = YhRest("POST", "/rest/v1/posts", body);
 	Free(body);
+	yh.post_cw[0] = 0;	//One-shot.
 	if (json)
 	{
 		if (json->child)
@@ -211,8 +371,201 @@ U0 YhSendPost(U8 *text)
 			YhPostRowAdd(ci, json->child, esc, sizeof(esc));
 		}
 		YhjFree(json);
+		YhStatus("Posted.");
 	}
 	else
 		YhStatus("Post failed.");
 }
 
+/***** federated profiles + follow graph *****/
+
+U0 YhProfileOpen(U8 *author_id)
+{//Fetch a profile + its posts into the ~profile pseudo-channel and show it.
+	CYhJson	*json;
+	I64		 ci = YhProfChan;
+	CYhChan	*ch;
+	U8		 abs[YH_IMG_URL_LEN];
+	U8		*s;
+
+	if (ci < 0 || !author_id || !*author_id)
+		return;
+	json = YhRest("GET",
+		"/rest/v1/profiles?id=eq.%s&select=id,username,display_name,avatar_url,"
+		"bio,domain,is_local,followers_count,following_count,posts_count",
+		NULL, author_id);
+	if (!json || !json->child)
+	{
+		YhjFree(json);
+		YhStatus("Profile not found.");
+		return;
+	}
+	yh.pv_on = TRUE;
+	StrCopy(yh.pv_id, author_id);
+	s = YhjStr(YhjGet(json->child, "username"), "user");
+	MemCopy(yh.pv_name, s, MinI64(StrLen(s), YH_NAME_LEN - 1));
+	yh.pv_name[MinI64(StrLen(s), YH_NAME_LEN - 1)] = 0;
+	s = YhjStr(YhjGet(json->child, "domain"), "local");
+	MemCopy(yh.pv_domain, s, MinI64(StrLen(s), 63));
+	yh.pv_domain[MinI64(StrLen(s), 63)] = 0;
+	s = YhjStr(YhjGet(json->child, "bio"));
+	MemCopy(yh.pv_bio, s, MinI64(StrLen(s), 199));
+	yh.pv_bio[MinI64(StrLen(s), 199)] = 0;
+	yh.pv_followers = 0;
+	yh.pv_following = 0;
+	yh.pv_posts = 0;
+	if (YhjGet(json->child, "followers_count"))
+		yh.pv_followers = ToI64(YhjGet(json->child, "followers_count")->num);
+	if (YhjGet(json->child, "following_count"))
+		yh.pv_following = ToI64(YhjGet(json->child, "following_count")->num);
+	if (YhjGet(json->child, "posts_count"))
+		yh.pv_posts = ToI64(YhjGet(json->child, "posts_count")->num);
+	yh.pv_av = -1;
+	if (*YhjStr(YhjGet(json->child, "avatar_url")))
+	{
+		YhImgAbs(YhjStr(YhjGet(json->child, "avatar_url")), abs, sizeof(abs));
+		yh.pv_av = YhImgGet(abs, 16, 16);
+	}
+	YhjFree(json);
+
+	//Do we already follow them?
+	yh.pv_isfollowing = FALSE;
+	json = YhRest("GET",
+		"/rest/v1/follows?follower_id=eq.%s&following_id=eq.%s&select=id",
+		NULL, yh.prof_id, author_id);
+	if (json)
+	{
+		if (json->child)
+			yh.pv_isfollowing = TRUE;
+		YhjFree(json);
+	}
+
+	//Their recent posts.
+	ch = &yh.chans[ci];
+	ch->count = 0;
+	ch->unread = 0;
+	StrCopy(ch->last_ts, "1970-01-01T00:00:00");
+	json = YhRest("GET",
+		"/rest/v1/posts?author_id=eq.%s&is_deleted=eq.false"
+		"&order=created_at.desc&limit=20&" YH_POST_SELECT,
+		NULL, author_id);
+	if (json)
+	{
+		YhFeedRows(ci, json, TRUE);
+		YhjFree(json);
+	}
+	ch->loaded = TRUE;
+	YhSwitchChan(ci);
+}
+
+U0 YhFollowToggle()
+{//Follow / unfollow the viewed profile. Remote follows federate via the
+//backend (follows row triggers ActivityPub Follow delivery).
+	CYhJson	*json;
+	U8		*body;
+
+	if (!yh.pv_on || !yh.pv_id[0])
+		return;
+	if (yh.pv_isfollowing)
+	{
+		json = YhRest("DELETE",
+			"/rest/v1/follows?follower_id=eq.%s&following_id=eq.%s",
+			NULL, yh.prof_id, yh.pv_id);
+		yh.pv_isfollowing = FALSE;
+		if (yh.pv_followers > 0)
+			yh.pv_followers--;
+		YhjFree(json);
+		YhStatus("Unfollowed.");
+	}
+	else
+	{
+		body = MStrPrint("{\"follower_id\":\"%s\",\"following_id\":\"%s\"}",
+						 yh.prof_id, yh.pv_id);
+		json = YhRest("POST", "/rest/v1/follows", body);
+		Free(body);
+		if (json)
+		{
+			yh.pv_isfollowing = TRUE;
+			yh.pv_followers++;
+			YhjFree(json);
+			YhStatus("Follow sent (remote follows may need acceptance).");
+		}
+		else
+			YhStatus("Follow failed.");
+	}
+}
+
+I64 YhFollowList(Bool followers)
+{//Fill yh.fl_ids + yh.menu_items with (up to 14) follower/following names.
+//Returns the count. Caller opens the menu (mode 2).
+	CYhJson	*json, *row;
+	U8		 ids[14 * 40 + 8];
+	U8		*col, *ocol, *uid, *nm;
+	I64		 n = 0, i;
+
+	if (followers)
+	{//People following pv: follows rows where following_id = pv.
+		col = "following_id";
+		ocol = "follower_id";
+	}
+	else
+	{
+		col = "follower_id";
+		ocol = "following_id";
+	}
+	json = YhRest("GET",
+		"/rest/v1/follows?%s=eq.%s&status=eq.accepted&limit=14&select=%s",
+		NULL, col, yh.pv_id, ocol);
+	if (!json)
+		return 0;
+	ids[0] = 0;
+	row = json->child;
+	while (row && n < 14)
+	{
+		uid = YhjStr(YhjGet(row, ocol));
+		if (*uid)
+		{
+			StrCopy(yh.fl_ids[n], uid);
+			n++;
+			if (*ids)
+				CatPrint(ids, ",");
+			CatPrint(ids, "%s", uid);
+		}
+		row = row->next;
+	}
+	YhjFree(json);
+	if (!n)
+		return 0;
+	YhFetchProfiles(ids);
+	for (i = 0; i < n; i++)
+	{
+		nm = YhProfileName(yh.fl_ids[i]);
+		if (!nm)
+			nm = "unknown";
+		MemCopy(yh.menu_items[i], nm, MinI64(StrLen(nm), 35));
+		yh.menu_items[i][MinI64(StrLen(nm), 35)] = 0;
+	}
+	return n;
+}
+
+U0 YhPostInteract(U8 *post_id, U8 *type)
+{//favorite / bookmark on a post (federates via the backend like the rest).
+	CYhJson	*json;
+	U8		*body;
+	U8		 msg[48];
+
+	if (!post_id || !*post_id)
+		return;
+	body = MStrPrint(
+		"{\"user_id\":\"%s\",\"post_id\":\"%s\",\"interaction_type\":\"%s\"}",
+		yh.prof_id, post_id, type);
+	json = YhRest("POST", "/rest/v1/post_interactions", body);
+	Free(body);
+	if (json)
+	{
+		YhjFree(json);
+		StrPrint(msg, "%sd.", type);
+		YhStatus(msg);
+	}
+	else
+		YhStatus("Interaction failed (already done?).");
+}

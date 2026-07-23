@@ -65,7 +65,8 @@ U8 *YhjString()
 			yhj_p++;
 			switch (*yhj_p)
 			{
-				case 'n':	out[n++] = '\n';	break;
+				case 'n':	out[n++] = ' ';		break;	//Newline -> space:
+						//GrPrint overdraws rows on a real newline.
 				case 't':	out[n++] = ' ';		break;
 				case 'r':	break;
 				case 'b':	break;

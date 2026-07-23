@@ -36,6 +36,7 @@ U0 YhAdd(I64 ci, I64 kind, U8 *nick, U8 *text, U8 hh=255, U8 mm=0)
 	ln->kind = kind;
 	ln->nick[0] = 0;
 	ln->id[0] = 0;
+	ln->auid[0] = 0;
 	ln->react[0] = 0;
 	ln->av = -1;
 	ln->img = -1;
@@ -472,6 +473,8 @@ U0 YhMsgRowAdd(I64 ci, CYhJson *row, U8 *missing, I64 missing_max)
 	{
 		MemCopy(ln->id, mid, MinI64(StrLen(mid), YH_UUID_LEN - 1));
 		ln->id[MinI64(StrLen(mid), YH_UUID_LEN - 1)] = 0;
+		MemCopy(ln->auid, uid, MinI64(StrLen(uid), YH_UUID_LEN - 1));
+		ln->auid[MinI64(StrLen(uid), YH_UUID_LEN - 1)] = 0;
 		pidx = YhProfileFind(uid);
 		if (pidx >= 0)
 			ln->av = yh.profiles[pidx].av;
@@ -494,10 +497,11 @@ U0 YhFetchReactions(I64 ci)
 	CYhJson	*json, *ej, *row;
 	U8		 ids[1700], eids[1300];
 	U8		 enames[32][32], eid_list[32][YH_UUID_LEN];
+	I64		 eimg[32];
 	I64		 n_emoji = 0;
 	U8		*mid, *eid, *nm;
 	I64		 i, j, k, first, cnt;
-	U8		 chip[48];
+	U8		 chip[64], abs[YH_IMG_URL_LEN];
 
 	if (!ch->lines)
 		return;
@@ -547,6 +551,7 @@ U0 YhFetchReactions(I64 ci)
 			{
 				StrCopy(eid_list[n_emoji], eid);
 				StrCopy(enames[n_emoji], "?");
+				eimg[n_emoji] = -1;
 				n_emoji++;
 				if (StrLen(eids) + 40 < sizeof(eids))
 				{
@@ -560,7 +565,7 @@ U0 YhFetchReactions(I64 ci)
 	}
 	if (*eids)
 	{
-		ej = YhRest("GET", "/rest/v1/emojis?id=in.(%s)&select=id,name",
+		ej = YhRest("GET", "/rest/v1/emojis?id=in.(%s)&select=id,name,url",
 					NULL, eids);
 		if (ej)
 		{
@@ -574,6 +579,11 @@ U0 YhFetchReactions(I64 ci)
 					{
 						MemCopy(enames[j], nm, MinI64(StrLen(nm), 31));
 						enames[j][MinI64(StrLen(nm), 31)] = 0;
+						if (*YhjStr(YhjGet(row, "url")))
+						{//The pill shows the actual emoji image (12x12).
+							YhImgAbs(YhjStr(YhjGet(row, "url")), abs, sizeof(abs));
+							eimg[j] = YhImgGet(abs, 12, 12);
+						}
 					}
 				row = row->next;
 			}
@@ -601,11 +611,8 @@ U0 YhFetchReactions(I64 ci)
 					row = row->next;
 				}
 				if (cnt)
-				{
-					if (cnt > 1)
-						StrPrint(chip, "%s x%d|", enames[j], cnt);
-					else
-						StrPrint(chip, "%s|", enames[j]);
+				{//Pill token: "imgidx~name~count|".
+					StrPrint(chip, "%d~%s~%d|", eimg[j], enames[j], cnt);
 					if (StrLen(ln->react) + StrLen(chip) < YH_REACT_LEN - 1)
 						CatPrint(ln->react, "%s", chip);
 				}
@@ -740,77 +747,168 @@ U8 *YhListAdd(U8 *w, U8 *fmt, ...)
 	return w;
 }
 
-U0 YhReactAdd(CYhLine *ln)
-{//Right-click -> React: pick a custom emoji from this server's set (plus
-//instance-scope ones) and insert a reactions row. Chip appended locally.
+U0 YhEmojiLoad()
+{//Cache the current server's custom emojis (+ instance-scope ones): react
+//menu + :name: autocomplete + pill images all use this.
 	CYhJson	*json, *row;
-	U8		 list[24 * 34 + 4], *w;
-	U8		 eids[24][YH_UUID_LEN];
-	I64		 n = 0, sel;
-	U8		*body, *nm, chip[48];
+	U8		*nm;
+	U8		 abs[YH_IMG_URL_LEN];
 
-	if (!ln || !ln->id[0])
+	if (yh.em_srv == yh.cur_srv && yh.em_n)
 		return;
+	yh.em_n = 0;
+	yh.em_srv = yh.cur_srv;
 	if (yh.cur_srv >= 0)
 		json = YhRest("GET",
 			"/rest/v1/emojis?or=(server_id.eq.%s,scope.eq.instance)"
-			"&order=usage_count.desc&limit=24&select=id,name",
+			"&order=usage_count.desc&limit=24&select=id,name,url",
 			NULL, yh.servers[yh.cur_srv].id);
 	else
 		json = YhRest("GET",
-			"/rest/v1/emojis?order=usage_count.desc&limit=24&select=id,name",
+			"/rest/v1/emojis?order=usage_count.desc&limit=24&select=id,name,url",
 			NULL);
-	if (!json || !json->child)
-	{
-		YhjFree(json);
-		YhStatus("No emojis available to react with.");
+	if (!json)
 		return;
-	}
-	w = list;
 	row = json->child;
-	while (row && n < 24)
+	while (row && yh.em_n < 24)
 	{
 		nm = YhjStr(YhjGet(row, "name"), "?");
 		if (*YhjStr(YhjGet(row, "id")))
 		{
-			StrCopy(eids[n], YhjStr(YhjGet(row, "id")));
-			w = YhListAdd(w, ":%s:", nm);
-			n++;
+			StrCopy(yh.em_ids[yh.em_n], YhjStr(YhjGet(row, "id")));
+			MemCopy(yh.em_names[yh.em_n], nm, MinI64(StrLen(nm), 31));
+			yh.em_names[yh.em_n][MinI64(StrLen(nm), 31)] = 0;
+			yh.em_img[yh.em_n] = -1;
+			if (*YhjStr(YhjGet(row, "url")))
+			{
+				YhImgAbs(YhjStr(YhjGet(row, "url")), abs, sizeof(abs));
+				yh.em_img[yh.em_n] = YhImgGet(abs, 12, 12);
+			}
+			yh.em_n++;
 		}
 		row = row->next;
 	}
-	*w = 0;
-	if (!n)
-	{
-		YhjFree(json);
-		return;
-	}
-	sel = PopUpPickList(list);
-	if (sel < 0 || sel >= n)
-	{
-		YhjFree(json);
-		return;
-	}
-
-	body = MStrPrint("{\"message_id\":\"%s\",\"emoji_id\":\"%s\",\"user_id\":\"%s\"}",
-					 ln->id, eids[sel], yh.prof_id);
-	//Reuse the parsed emoji name for the local pill before freeing.
-	row = json->child;
-	while (sel--)
-		row = row->next;
-	StrPrint(chip, "%s|", YhjStr(YhjGet(row, "name"), "?"));
 	YhjFree(json);
+}
 
+U0 YhReactPost(CYhLine *ln, I64 k)
+{//Insert a reactions row for cached emoji k; pill appended locally.
+	CYhJson	*json;
+	U8		*body, chip[64];
+
+	if (!ln || !ln->id[0] || k < 0 || k >= yh.em_n)
+		return;
+	body = MStrPrint("{\"message_id\":\"%s\",\"emoji_id\":\"%s\",\"user_id\":\"%s\"}",
+					 ln->id, yh.em_ids[k], yh.prof_id);
 	json = YhRest("POST", "/rest/v1/reactions", body);
 	Free(body);
 	if (json)
 	{
 		YhjFree(json);
+		StrPrint(chip, "%d~%s~1|", yh.em_img[k], yh.em_names[k]);
 		if (StrLen(ln->react) + StrLen(chip) < YH_REACT_LEN - 1)
 			CatPrint(ln->react, "%s", chip);
 	}
 	else
 		YhStatus("Reaction failed.");
+}
+
+U0 YhUpload()
+{//Pick a local file, upload it to the user_media bucket (path must start
+//with our profile id - storage RLS), then send it as a file-part message.
+	U8	*file, *fbuf, *body, *url, *pub, *ext, *ftype;
+	I64	 size;
+	CHttpResponse *resp;
+	U8	 name[96];
+	CYhJson	*json;
+	U8	 esc[YH_TEXT_LEN * 2];
+
+	if (yh.cur_chan < 0 || yh.chans[yh.cur_chan].server == YH_SRV_FEED)
+	{
+		YhStatus("Open a channel or DM first.");
+		return;
+	}
+	file = PopUpPickFile("::/Home");
+	if (!file)
+		return;
+	fbuf = FileRead(file, &size);
+	if (!fbuf || size < 1)
+	{
+		Free(file);
+		YhStatus("Could not read that file.");
+		return;
+	}
+	//Content sniff -> extension + mime + fileType part field.
+	ext = "bin";
+	ftype = "file";
+	if (size > 8 && !MemCompare(fbuf + 1, "PNG", 3))
+	{
+		ext = "png";
+		ftype = "image";
+	}
+	else if (size > 2 && fbuf[0] == 0xFF && fbuf[1] == 0xD8)
+	{
+		ext = "jpg";
+		ftype = "image";
+	}
+	else if (size > 4 && !MemCompare(fbuf, "GIF8", 4))
+	{
+		ext = "gif";
+		ftype = "image";
+	}
+	else if (size > 12 && !MemCompare(fbuf, "RIFF", 4) &&
+			 !MemCompare(fbuf + 8, "WEBP", 4))
+	{
+		ext = "webp";
+		ftype = "image";
+	}
+
+	StrPrint(name, "%s/zeal_%08X.%s", yh.prof_id, counts.jiffies & 0xFFFFFFFF, ext);
+	url = MStrPrint("%s/storage/v1/object/user_media/%s", yh.f_url, name);
+	YhStatus("Uploading...");
+	//Binary body: bypass HttpReq (StrLen would stop at the first NUL byte).
+	resp = HttpNav(url, "POST", "application/octet-stream", fbuf, size, yh.hdrs);
+	Free(url);
+	Free(fbuf);
+	Free(file);
+	if (!resp || resp->status < 200 || resp->status >= 300)
+	{
+		if (resp)
+			HttpResponseFree(resp);
+		YhStatus("Upload failed (check Network Log).");
+		return;
+	}
+	HttpResponseFree(resp);
+
+	pub = MStrPrint("%s/storage/v1/object/public/user_media/%s", yh.f_url, name);
+	YhJsonEsc(esc, pub, sizeof(esc));
+	if (yh.chans[yh.cur_chan].is_dm)
+		body = MStrPrint(
+			"{\"user_id\":\"%s\",\"conversation_id\":\"%s\","
+			"\"content\":[{\"type\":\"file\",\"url\":\"%s\",\"fileType\":\"%s\"}],"
+			"\"metadata\":{\"created_via\":\"yharmony_zealos\"}}",
+			yh.prof_id, yh.chans[yh.cur_chan].id, esc, ftype);
+	else
+		body = MStrPrint(
+			"{\"user_id\":\"%s\",\"channel_id\":\"%s\","
+			"\"content\":[{\"type\":\"file\",\"url\":\"%s\",\"fileType\":\"%s\"}],"
+			"\"metadata\":{\"created_via\":\"yharmony_zealos\"}}",
+			yh.prof_id, yh.chans[yh.cur_chan].id, esc, ftype);
+	json = YhRest("POST", "/rest/v1/messages", body);
+	Free(body);
+	Free(pub);
+	if (json)
+	{
+		if (json->child)
+		{
+			esc[0] = 0;
+			YhMsgRowAdd(yh.cur_chan, json->child, esc, sizeof(esc));
+		}
+		YhjFree(json);
+		YhStatus("Uploaded.");
+	}
+	else
+		YhStatus("Upload message failed.");
 }
 
 /***** servers + channels *****/

@@ -18,6 +18,8 @@ Cd(__DIR__);;
 #include "GrPNG"
 #include "GrJPG"
 #include "GrGIF"
+#include "GrWEBPTables"
+#include "GrWEBP"
 #include "GrFont"
 #include "ScreenCast"
 

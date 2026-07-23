@@ -263,6 +263,9 @@ CDC *GxImgViewDecode(U8 *buf, I64 len)
 		dc = JPGReadBuf(buf, len, sys_task);
 	else if (buf[0] == 'G' && buf[1] == 'I' && buf[2] == 'F')
 		dc = GIFReadBuf(buf, len, sys_task);
+	else if (len > 12 && !MemCompare(buf, "RIFF", 4) &&
+			 !MemCompare(buf + 8, "WEBP", 4))
+		dc = WEBPReadBuf(buf, len, sys_task);
 	else
 	{
 		while (*b0 == ' ' || *b0 == '\n' || *b0 == '\r' || *b0 == '\t')
@@ -2710,6 +2713,9 @@ U0 GxFetchTask()
 			else if (gx_fetch_body[0] == 'G' && gx_fetch_body[1] == 'I' &&
 					 gx_fetch_body[2] == 'F')
 				gx_fetch_img = TRUE;
+			else if (gx_fetch_len > 12 && !MemCompare(gx_fetch_body, "RIFF", 4) &&
+					 !MemCompare(gx_fetch_body + 8, "WEBP", 4))
+				gx_fetch_img = TRUE;
 		}
 		if (gx_fetch_img)
 			gx_fetch_html = FALSE;
@@ -2788,6 +2794,9 @@ U0 GxImgTask()
 					dc = JPGReadBuf(r->body, r->body_length, sys_task);
 				else if (r->body[0] == 'G' && r->body[1] == 'I' && r->body[2] == 'F')
 					dc = GIFReadBuf(r->body, r->body_length, sys_task);
+				else if (r->body_length > 12 && !MemCompare(r->body, "RIFF", 4) &&
+						 !MemCompare(r->body + 8, "WEBP", 4))
+					dc = WEBPReadBuf(r->body, r->body_length, sys_task);
 					else
 					{//Text beginning with '<' with an <svg root = vector image.
 						U8 *b0 = r->body;
