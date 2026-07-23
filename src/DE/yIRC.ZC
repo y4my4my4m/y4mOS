@@ -7,7 +7,11 @@
 //panel (click a nick to open a query), wheel/<PGUP>/<PGDN> scroll,
 //<UP>/<DOWN> input history, <ESC> quits.
 //
-//Commands: /join /part /close /msg /query /me /nick /topic /names /raw /quit
+//Commands: /join /part /close /msg /query /me /nick /color /topic /names /raw
+//          /config /quit
+//
+//Settings (server/nick/channel, own nick color, auto-connect) persist to
+//::/Home/YIRC.CFG. Right-click a tab for per-buffer options + settings.
 
 #define YIRC_PORT		6667
 #define YIRC_RECV_BUF	4096
@@ -20,6 +24,8 @@
 #define YIRC_MAX_NICKS	96
 #define YIRC_HIST_MAX	10
 #define YIRC_IN_MAX		440
+
+#define YIRC_CFG_PATH	"::/Home/YIRC.CFG"
 
 //Line kinds.
 #define YIRC_LK_MSG		0
@@ -81,6 +87,8 @@ class CYIrcGlobals
 	U8			 f_server[80], f_port[8], f_nick[40], f_chan[80];
 	I64			 f_focus;
 	U8			 f_status[80];
+	Bool		 f_autoconn;	//Auto-connect on next launch.
+	I64			 my_color;		//-1 = theme default; else index into c_nick[8].
 	//Pens beyond the shared theme.
 	CColorROPU32 c_green, c_red, c_yellow, c_query;
 	CColorROPU32 c_nick[8];		//Nick hash palette.
@@ -101,11 +109,20 @@ U8 *YIrcNickStrip(U8 *nick)
 	return nick;
 }
 
+CColorROPU32 YIrcSelfPen()
+{//Our own nick's pen: chosen palette color, or the theme accent by default.
+	if (yirc.my_color >= 0)
+		return yirc.c_nick[yirc.my_color & 7];
+	return de_theme.accent;
+}
+
 CColorROPU32 YIrcNickPen(U8 *nick)
 {
 	I64 h = 0;
 
 	nick = YIrcNickStrip(nick);
+	if (yirc.my_color >= 0 && !StrICompare(nick, yirc.nick))
+		return yirc.c_nick[yirc.my_color & 7];	//Our nick, user-picked hue.
 	while (*nick)
 		h = h * 31 + *nick++;
 	return yirc.c_nick[h & 7];
@@ -642,6 +659,99 @@ U0 YIrcHandleLine(U8 *line)
 	Free(ms);
 }
 
+/***** config *****/
+
+U0 YIrcConfigSave()
+{//Persist the connect form + preferences as hand-editable key=value text.
+	U8 *buf;
+
+	if (!DriveIsWritable)
+		return;
+	buf = MStrPrint(
+		"# yIRC settings - edit freely, reloaded on launch.\n"
+		"server %s\n"
+		"port %s\n"
+		"nick %s\n"
+		"channel %s\n"
+		"color %d\n"
+		"autoconnect %d\n",
+		yirc.f_server, yirc.f_port, yirc.f_nick, yirc.f_chan,
+		yirc.my_color, yirc.f_autoconn != 0);
+	FileWrite(YIRC_CFG_PATH, buf, StrLen(buf));
+	Free(buf);
+}
+
+U0 YIrcConfigLoad()
+{//Prefill the connect form from a saved config, if one exists. Reuses the
+//DE key=value parser (DE.ZC is compiled system-wide before yIRC launches).
+	I64	 size;
+	U8	*body = FileRead(YIRC_CFG_PATH, &size);
+
+	if (!body)
+		return;
+	DEConfigValStr(body, "server",  yirc.f_server, sizeof(yirc.f_server));
+	DEConfigValStr(body, "port",    yirc.f_port,   sizeof(yirc.f_port));
+	DEConfigValStr(body, "nick",    yirc.f_nick,   sizeof(yirc.f_nick));
+	DEConfigValStr(body, "channel", yirc.f_chan,   sizeof(yirc.f_chan));
+	yirc.my_color   = DEConfigValI64(body, "color", -1);
+	yirc.f_autoconn = DEConfigValI64(body, "autoconnect", 0) != 0;
+	Free(body);
+}
+
+U8 *YIrcListAdd(U8 *w, U8 *fmt, ...)
+{//Append one PopUpPickList item plus its NUL separator; returns new write ptr.
+	U8 *s = StrPrintJoin(NULL, fmt, argc, argv);
+
+	StrCopy(w, s);
+	w += StrLen(s) + 1;	//Step past the item's own NUL terminator.
+	Free(s);
+	return w;
+}
+
+U0 YIrcConfigMenu()
+{//Blocking pop-up settings menu. Loops so toggles apply without reopening.
+	I64	 sel;
+	U8	 list[256], *w, color[16];
+
+	while (TRUE)
+	{
+		if (yirc.my_color < 0)
+			StrCopy(color, "default");
+		else
+			StrPrint(color, "%d", yirc.my_color);
+		w = list;
+		w = YIrcListAdd(w, "Auto-connect on launch: %s",
+						yirc.f_autoconn ? "ON" : "OFF");
+		w = YIrcListAdd(w, "Cycle nick color (now: %s)", color);
+		w = YIrcListAdd(w, "Reset nick color to default");
+		w = YIrcListAdd(w, "Save settings now");
+		w = YIrcListAdd(w, "Close");
+		*w = 0;	//Double-NUL terminates the list.
+		sel = PopUpPickList(list);
+		switch (sel)
+		{
+			case 0:
+				yirc.f_autoconn = !yirc.f_autoconn;
+				YIrcConfigSave;
+				break;
+			case 1:
+				yirc.my_color = (yirc.my_color + 1) & 7;	//-1 -> 0 too.
+				YIrcConfigSave;
+				break;
+			case 2:
+				yirc.my_color = -1;
+				YIrcConfigSave;
+				break;
+			case 3:
+				YIrcConfigSave;
+				YIrcHere("Settings saved to " YIRC_CFG_PATH ".");
+				return;
+			default:	//Close or cancel.
+				return;
+		}
+	}
+}
+
 /***** user input *****/
 
 U0 YIrcSay(I64 bi, U8 *msg)
@@ -721,6 +831,24 @@ U0 YIrcInputLine(U8 *msg)
 	}
 	else if (!StrICompare(buf, "nick") && *arg)
 		YIrcSendF("NICK %s", arg);
+	else if (!StrICompare(buf, "color"))
+	{//"/color" or "/color -1" resets; "/color 0..7" picks a nick hue.
+		if (*arg)
+			yirc.my_color = ClampI64(Str2I64(arg), -1, 7);
+		else
+			yirc.my_color = -1;
+		if (yirc.my_color < 0)
+			YIrcHere("Nick color reset to theme default.");
+		else
+		{
+			StrPrint(buf, "Nick color set to %d (0-7, /color to reset).",
+					 yirc.my_color);
+			YIrcHere(buf);
+		}
+		YIrcConfigSave;
+	}
+	else if (!StrICompare(buf, "config"))
+		YIrcConfigMenu;
 	else if (!StrICompare(buf, "topic"))
 	{
 		if (!cb->is_chan)
@@ -744,8 +872,9 @@ U0 YIrcInputLine(U8 *msg)
 	}
 	else
 	{
-		YIrcHere("Commands: /join /part /close /msg /query /me /nick");
-		YIrcHere("          /topic /names /raw /quit    TAB switches tabs");
+		YIrcHere("Commands: /join /part /close /msg /query /me /nick /color");
+		YIrcHere("          /topic /names /raw /config /quit    TAB switches tabs");
+		YIrcHere("Right-click a tab for per-buffer options and settings.");
 	}
 }
 
@@ -808,7 +937,7 @@ U0 YIrcLineHead(CYIrcLine *ln, U8 *head, CColorROPU32 *head_pen,
 			break;
 		case YIRC_LK_SELF:
 			StrPrint(head, "%s <%s> ", ts, ln->nick);
-			*head_pen = de_theme.accent;
+			*head_pen = YIrcSelfPen;
 			*body_pen = de_theme.text;
 			break;
 		case YIRC_LK_ACTION:
@@ -857,10 +986,24 @@ U0 YIrcDrawEdge(CDC *dc, I64 x, I64 y, I64 w, I64 h)
 	GrRect(dc, x + w - 1, y, 1, h);
 }
 
+//Connect-form geometry, shared by the draw pass and the hit tests.
+#define YIRC_FORM_W		360
+#define YIRC_FORM_H		286
+#define YIRC_CB_DX		16		//Auto-connect checkbox, from fx.
+#define YIRC_CB_DY		160		//                       from fy.
+#define YIRC_CB_SZ		14
+#define YIRC_SW_DX		70		//Color swatch strip, from fx.
+#define YIRC_SW_DY		184		//                    from fy.
+#define YIRC_SW_W		18		//Per-swatch cell width.
+#define YIRC_SW_H		16
+#define YIRC_SW_N		9		//Slot 0 = default, slots 1..8 = colors 0..7.
+#define YIRC_BTN_DY		216		//Connect / quit button row, from fy.
+
 U0 YIrcDrawForm(CTask *task, CDC *dc)
 {
-	I64	 fx = (task->pix_width - 360) / 2, fy = (task->pix_height - 220) / 2;
-	I64	 i, y;
+	I64	 fx = (task->pix_width - YIRC_FORM_W) / 2;
+	I64	 fy = (task->pix_height - YIRC_FORM_H) / 2;
+	I64	 i, y, x, sel;
 	U8	*labels[4], *vals[4];
 	U8	 buf[96];
 
@@ -870,10 +1013,10 @@ U0 YIrcDrawForm(CTask *task, CDC *dc)
 	labels[3] = "Channel";	vals[3] = yirc.f_chan;
 
 	dc->color = de_theme.panel;
-	GrRect(dc, fx, fy, 360, 220);
-	YIrcDrawEdge(dc, fx, fy, 360, 220);
+	GrRect(dc, fx, fy, YIRC_FORM_W, YIRC_FORM_H);
+	YIrcDrawEdge(dc, fx, fy, YIRC_FORM_W, YIRC_FORM_H);
 	dc->color = de_theme.accent;
-	GrPrint(dc, fx + (360 - 14 * FONT_WIDTH) / 2, fy + 12, "yIRC - Connect");
+	GrPrint(dc, fx + (YIRC_FORM_W - 14 * FONT_WIDTH) / 2, fy + 12, "yIRC - Connect");
 
 	for (i = 0; i < 4; i++)
 	{
@@ -898,8 +1041,49 @@ U0 YIrcDrawForm(CTask *task, CDC *dc)
 		GrPrint(dc, fx + 94, y + 6, "%s", buf);
 	}
 
+	//Auto-connect checkbox.
+	y = fy + YIRC_CB_DY;
+	dc->color = de_theme.win_bg;
+	GrRect(dc, fx + YIRC_CB_DX, y, YIRC_CB_SZ, YIRC_CB_SZ);
+	YIrcDrawEdge(dc, fx + YIRC_CB_DX, y, YIRC_CB_SZ, YIRC_CB_SZ);
+	if (yirc.f_autoconn)
+	{
+		dc->color = de_theme.accent;
+		GrRect(dc, fx + YIRC_CB_DX + 3, y + 3, YIRC_CB_SZ - 6, YIRC_CB_SZ - 6);
+	}
+	dc->color = de_theme.text_dim;
+	GrPrint(dc, fx + YIRC_CB_DX + YIRC_CB_SZ + 8, y + 3, "Auto-connect on launch");
+
+	//Nick color swatches: slot 0 = theme default, slots 1..8 = c_nick[0..7].
+	dc->color = de_theme.text_dim;
+	GrPrint(dc, fx + 16, fy + YIRC_SW_DY + 4, "Color");
+	sel = yirc.my_color + 1;	//-1 -> slot 0.
+	for (i = 0; i < YIRC_SW_N; i++)
+	{
+		x = fx + YIRC_SW_DX + i * YIRC_SW_W;
+		y = fy + YIRC_SW_DY;
+		if (i == 0)
+			dc->color = de_theme.win_bg;
+		else
+			dc->color = yirc.c_nick[i - 1];
+		GrRect(dc, x + 1, y + 1, YIRC_SW_W - 3, YIRC_SW_H - 2);
+		if (i == 0)
+		{
+			dc->color = de_theme.text_dim;
+			GrPrint(dc, x + 4, y + 4, "D");
+		}
+		if (i == sel)
+			dc->color = de_theme.accent;
+		else
+			dc->color = de_theme.panel_edge;
+		GrRect(dc, x, y, YIRC_SW_W - 2, 1);
+		GrRect(dc, x, y + YIRC_SW_H - 1, YIRC_SW_W - 2, 1);
+		GrRect(dc, x, y, 1, YIRC_SW_H);
+		GrRect(dc, x + YIRC_SW_W - 2, y, 1, YIRC_SW_H);
+	}
+
 	//Connect / quit buttons; hit-tested against these same coords in poll.
-	y = fy + 172;
+	y = fy + YIRC_BTN_DY;
 	if (yirc.f_focus == 4)
 		dc->color = de_theme.bttn_focus;
 	else
@@ -914,10 +1098,13 @@ U0 YIrcDrawForm(CTask *task, CDC *dc)
 	dc->color = de_theme.text_dim;
 	GrPrint(dc, fx + 224 + (120 - 4 * FONT_WIDTH) / 2, y + 8, "Quit");
 
+	dc->color = de_theme.text_dim;
+	GrPrint(dc, fx + 16, fy + YIRC_BTN_DY + 34,
+			"Tip: right-click a tab in chat for options.");
 	if (yirc.f_status[0])
 	{
 		dc->color = yirc.c_red;
-		GrPrint(dc, fx + 16, fy + 226, "%s", yirc.f_status);
+		GrPrint(dc, fx + 16, fy + YIRC_BTN_DY + 48, "%s", yirc.f_status);
 	}
 }
 
@@ -1129,6 +1316,8 @@ U0 YIrcConnect()
 
 	tcp = yirc.sock;
 	tcp->timeout = 0;	//Poll mode for the pump loop.
+
+	YIrcConfigSave;	//Remember these connect details for next launch.
 }
 
 /***** input pump *****/
@@ -1183,8 +1372,9 @@ U0 YIrcFormKey(I64 ch, I64 sc)
 
 U0 YIrcFormClick(I64 mx, I64 my)
 {
-	I64 fx = (Fs->pix_width - 360) / 2, fy = (Fs->pix_height - 220) / 2;
-	I64 i, y;
+	I64 fx = (Fs->pix_width - YIRC_FORM_W) / 2;
+	I64 fy = (Fs->pix_height - YIRC_FORM_H) / 2;
+	I64 i, y, x;
 
 	for (i = 0; i < 4; i++)
 	{
@@ -1195,7 +1385,30 @@ U0 YIrcFormClick(I64 mx, I64 my)
 			return;
 		}
 	}
-	y = fy + 172;
+	//Auto-connect checkbox (generous hit box over box + label).
+	y = fy + YIRC_CB_DY;
+	if (fx + YIRC_CB_DX <= mx < fx + 300 && y - 2 <= my < y + YIRC_CB_SZ + 2)
+	{
+		yirc.f_autoconn = !yirc.f_autoconn;
+		YIrcConfigSave;
+		return;
+	}
+	//Nick color swatches.
+	y = fy + YIRC_SW_DY;
+	if (y <= my < y + YIRC_SW_H)
+	{
+		for (i = 0; i < YIRC_SW_N; i++)
+		{
+			x = fx + YIRC_SW_DX + i * YIRC_SW_W;
+			if (x <= mx < x + YIRC_SW_W)
+			{
+				yirc.my_color = i - 1;	//Slot 0 -> -1 (default).
+				YIrcConfigSave;
+				return;
+			}
+		}
+	}
+	y = fy + YIRC_BTN_DY;
 	if (fx + 88 <= mx < fx + 208 && y <= my < y + 24)
 		YIrcConnect;
 	else if (fx + 224 <= mx < fx + 344 && y <= my < y + 24)
@@ -1294,6 +1507,68 @@ U0 YIrcChatClick(I64 mx, I64 my)
 	}
 }
 
+U0 YIrcTabRClick(I64 mx, I64 my)
+{//Right-click a tab: per-buffer context menu. Empty tab-bar area: settings.
+	I64			 i, bi = -1, sel, n = 0, acts[4];
+	U8			 list[256], *w;
+	CYIrcBuf	*buf;
+
+	if (!(4 <= my < 24))
+		return;
+	for (i = 0; i < yirc.num_bufs; i++)
+		if (yirc.bufs[i]->tab_w &&
+			yirc.bufs[i]->tab_x <= mx < yirc.bufs[i]->tab_x + yirc.bufs[i]->tab_w)
+		{
+			bi = i;
+			break;
+		}
+	if (bi < 0)
+	{//No tab under the cursor: open general settings.
+		YIrcConfigMenu;
+		return;
+	}
+	buf = yirc.bufs[bi];
+
+	w = list;
+	w = YIrcListAdd(w, "Clear log");					acts[n++] = 0;
+	w = YIrcListAdd(w, "Mark read");					acts[n++] = 1;
+	if (bi != 0)
+	{//Buffer 0 is the server/status log and can't be closed.
+		if (buf->is_chan)
+			w = YIrcListAdd(w, "Part & close");
+		else
+			w = YIrcListAdd(w, "Close query");
+		acts[n++] = 2;
+	}
+	w = YIrcListAdd(w, "Settings...");					acts[n++] = 3;
+	*w = 0;
+
+	sel = PopUpPickList(list);
+	if (sel < 0 || sel >= n)
+		return;
+	switch (acts[sel])
+	{
+		case 0:	//Clear log: reset the ring by zeroing the line count.
+			buf->count = 0;
+			buf->unread = 0;
+			if (bi == yirc.cur)
+				yirc.scroll = 0;
+			break;
+		case 1:
+			buf->unread = 0;
+			break;
+		case 2:
+			if (buf->is_chan && yirc.sock)
+				YIrcSendF("PART %s", buf->name);
+			YIrcBufClose(bi);
+			yirc.scroll = 0;
+			break;
+		case 3:
+			YIrcConfigMenu;
+			break;
+	}
+}
+
 U0 YIrcPoll()
 {//Pump the task message queue; non-blocking so the socket pump keeps running.
 	I64 m, a1, a2, dz;
@@ -1313,6 +1588,10 @@ U0 YIrcPoll()
 					YIrcFormClick(a1, a2);
 				else
 					YIrcChatClick(a1, a2);
+				break;
+			case MESSAGE_MS_R_DOWN:
+				if (yirc.state == YIRC_ST_CHAT)
+					YIrcTabRClick(a1, a2);
 				break;
 		}
 	}
@@ -1367,6 +1646,7 @@ public U0 YIRC(U8 *host=NULL, I64 port=YIRC_PORT, U8 *nick=NULL, U8 *autojoin=NU
 
 	MemSet(&yirc, 0, sizeof(CYIrcGlobals));	//Globals are NOT zeroed on load.
 	yirc.last_z = mouse.pos.z;
+	yirc.my_color = -1;	//Default: theme accent for self, hash for others.
 
 	//Extra pens; the rest of the palette rides de_theme live.
 	yirc.c_green  = ColorRGB(0x5E, 0xC8, 0x7A);
@@ -1380,7 +1660,8 @@ public U0 YIRC(U8 *host=NULL, I64 port=YIRC_PORT, U8 *nick=NULL, U8 *autojoin=NU
 	StrCopy(yirc.f_port, "6667");
 	StrPrint(yirc.f_nick, "zealot%03d", counts.jiffies % 1000);
 	StrCopy(yirc.f_chan, "#zealos");
-	if (host)
+	YIrcConfigLoad;	//Saved settings override the built-in defaults...
+	if (host)		//...but explicit launch args still win over the config.
 		StrCopy(yirc.f_server, host);
 	if (port != YIRC_PORT)
 		StrPrint(yirc.f_port, "%d", port);
@@ -1395,12 +1676,15 @@ public U0 YIRC(U8 *host=NULL, I64 port=YIRC_PORT, U8 *nick=NULL, U8 *autojoin=NU
 	StrCopy(Fs->task_title, "yIRC");
 	WinHorz(MaxI64(1, (TEXT_COLS - 110) / 2), MaxI64(1, (TEXT_COLS - 110) / 2) + 109);
 	WinVert(MaxI64(2, (TEXT_ROWS - 54) / 2), MaxI64(2, (TEXT_ROWS - 54) / 2) + 53);
-	//L_DOWN must deliver instantly (skip the double-click timeout).
-	Fs->win_inhibit = old_inhibit | WIF_FOCUS_TASK_MS_L_D;
+	//L/R-DOWN must deliver instantly (skip the double-click timeout).
+	Fs->win_inhibit = old_inhibit | WIF_FOCUS_TASK_MS_L_D | WIF_FOCUS_TASK_MS_R_D;
 	WinFocus;
 	DocCursor(OFF);
 	DocClear;
 	Fs->draw_it = &YIrcDrawIt;
+
+	if (yirc.f_autoconn)
+		YIrcConnect;	//Straight into chat; on failure the form still shows.
 
 	while (!yirc.quit)
 	{
