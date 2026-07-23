@@ -136,9 +136,9 @@ U0 YhLineHead(CYhLine *ln, U8 *head, CColorROPU32 *head_pen, CColorROPU32 *body_
 			break;
 		case YH_LK_REPLY:
 			if (ln->nick[0])
-				StrPrint(head, "      | re %s: ", ln->nick);
+				StrPrint(head, "re %s: ", ln->nick);
 			else
-				StrPrint(head, "      | re: ");
+				StrPrint(head, "re: ");
 			*head_pen = de_theme.accent_dim;
 			*body_pen = de_theme.text_dim;
 			break;
@@ -176,6 +176,58 @@ U0 YhCRect(CDC *dc, I64 x, I64 y, I64 w, I64 h, I64 y0, I64 y1)
 
 	if (b > a)
 		GrRect(dc, x, a, w, b - a);
+}
+
+Bool YhIsGroupHead(CYhChan *cb, I64 i, I64 first)
+{//Discord-style grouping: consecutive lines from the same author within a
+//few minutes share one avatar/name header.
+	CYhLine	*ln = &cb->lines[i % YH_MAX_LINES], *pl;
+
+	if (i - 1 < first)
+		return TRUE;
+	pl = &cb->lines[(i - 1) % YH_MAX_LINES];
+	if (pl->kind != YH_LK_MSG && pl->kind != YH_LK_SELF)
+		return TRUE;	//Reply banner / status / image above breaks the group.
+	if (StrCompare(pl->nick, ln->nick))
+		return TRUE;
+	if (pl->hh != ln->hh)
+		return TRUE;
+	if (ln->mm < pl->mm || ln->mm - pl->mm > 5)
+		return TRUE;
+	return FALSE;
+}
+
+U0 YhDrawPills(CDC *dc, I64 x, I64 y, U8 *react, I64 xmax)
+{//Reaction pills: '|'-separated "name xN" tokens as bordered chips.
+	U8	 tok[40];
+	I64	 n, w;
+	U8	*p = react;
+
+	while (*p)
+	{
+		n = 0;
+		while (*p && *p != '|' && n < 39)
+			tok[n++] = *p++;
+		tok[n] = 0;
+		if (*p == '|')
+			p++;
+		if (n)
+		{
+			w = n * FONT_WIDTH + 10;
+			if (x + w > xmax)
+				return;
+			dc->color = de_theme.bttn;
+			GrRect(dc, x, y, w, 12);
+			dc->color = de_theme.accent_dim;
+			GrRect(dc, x, y, w, 1);
+			GrRect(dc, x, y + 11, w, 1);
+			GrRect(dc, x, y, 1, 12);
+			GrRect(dc, x + w - 1, y, 1, 12);
+			dc->color = de_theme.text;
+			GrPrint(dc, x + 5, y + 2, "%s", tok);
+			x += w + 4;
+		}
+	}
 }
 
 U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
@@ -222,7 +274,7 @@ U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
 				else
 					ih += YH_ROW_H;
 			}
-			cardh = 10 + YH_ROW_H + rows * YH_ROW_H + ih;
+			cardh = 10 + YH_HDR_H + rows * YH_ROW_H + ih;
 			if (boost)
 				cardh += YH_ROW_H;
 			ytop = y - cardh;
@@ -251,26 +303,28 @@ U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
 					}
 					ay += YH_ROW_H;
 				}
-				//Header: avatar chip + author + time.
-				if (ay >= y0c && ay + FONT_HEIGHT <= y1c)
+				//Header: 16x16 avatar + author + time.
+				if (ay >= y0c && ay + 16 <= y1c)
 				{
 					if (ln->av >= 0 && yh.imgs[ln->av].state == 2)
-						GrBlot(dc, tx, ay - 1, yh.imgs[ln->av].dc);
+						GrBlot(dc, tx, ay, yh.imgs[ln->av].dc);
 					else
 					{
 						dc->color = YhNickPen(ln->nick);
-						GrRect(dc, tx, ay - 1, 10, 10);
+						GrRect(dc, tx, ay, 16, 16);
+						dc->color = de_theme.win_bg;
+						GrPrint(dc, tx + 4, ay + 4, "%c", ln->nick[0]);
 					}
 					dc->color = YhNickPen(ln->nick);
-					GrPrint(dc, tx + 14, ay, "%s", ln->nick);
+					GrPrint(dc, tx + YH_IND, ay + 4, "%s", ln->nick);
 					StrPrint(ts, "%02d:%02d", ln->hh, ln->mm);
 					dc->color = de_theme.text_dim;
-					GrPrint(dc, log_x + cw - 6 * FONT_WIDTH, ay, "%s", ts);
-					YhHitPush(ay, ay + YH_ROW_H, tx,
-							  tx + 14 + StrLen(ln->nick) * FONT_WIDTH,
+					GrPrint(dc, log_x + cw - 6 * FONT_WIDTH, ay + 4, "%s", ts);
+					YhHitPush(ay, ay + YH_HDR_H, tx,
+							  tx + YH_IND + StrLen(ln->nick) * FONT_WIDTH,
 							  yh.cur_chan, i);
 				}
-				ay += YH_ROW_H;
+				ay += YH_HDR_H;
 				//Body text.
 				dc->color = de_theme.text;
 				for (r = 0; r < rows; r++)
@@ -337,7 +391,7 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 	CYhServer	*sv;
 	CYhLine		*ln;
 	CColorROPU32 head_pen, body_pen;
-	I64	 i, x, y, w, r, rows, avail, blen, hlen, first, seg, skip, cpl, ax;
+	I64	 i, x, y, w, r, rows, avail, blen, hlen, first, seg, cpl, y1c;
 	I64	 tab_y = 4, tab_h = 20, tab_lim;
 	I64	 in_h = 22;
 	I64	 in_y = task->pix_height - in_h - 4;
@@ -471,14 +525,14 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 	GrRect(dc, 8, log_y - 2, YH_CHAN_PANEL_W, log_h + 2);
 	YhDrawEdge(dc, 8, log_y - 2, YH_CHAN_PANEL_W, log_h + 2);
 	dc->color = de_theme.accent_dim;
-	GrPrint(dc, 14, log_y + 4, "channels");
+	GrPrint(dc, 14, log_y + 6, "channels");
 	r = 0;
 	for (i = 0; i < yh.num_chans; i++)
 	{//No `continue` in ZealC: filter with a plain if instead.
 		ch = &yh.chans[i];
 		if (ch->server == yh.cur_srv)
 		{
-			y = log_y + 18 + r * YH_ROW_H;
+			y = log_y + 22 + r * (YH_ROW_H + 4);
 			if (y + FONT_HEIGHT > log_y + log_h)
 				break;
 			if (i == yh.cur_chan)
@@ -498,100 +552,143 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 		}
 	}
 
-	//Chat log, bottom-up. The Fediverse feed gets card rendering instead.
+	//Chat log, bottom-up, Discord-style grouping. The Fediverse feed gets
+	//card rendering instead. Everything pixel-clipped to the log band.
 	if (cb && cb->lines && cb->server == YH_SRV_FEED)
 		YhDrawFeed(task, dc, cb, log_x, log_y, log_w, log_h, mx, my);
 	else if (cb && cb->lines)
 	{
-		skip = yh.scroll;
-		y = log_y + log_h - YH_ROW_H;
+		y1c = log_y + log_h;
+		y = y1c - 4 + yh.scroll * YH_ROW_H;	//Scroll pushes content down.
 		first = MaxI64(0, cb->count - YH_MAX_LINES);
 		i = cb->count - 1;
-		while (i >= first && y + FONT_HEIGHT > log_y)
+		while (i >= first && y > log_y)
 		{
 			ln = &cb->lines[i % YH_MAX_LINES];
 			if (ln->kind == YH_LK_IMG)
-			{//Inline image block: occupies ceil(h/ROW_H) rows.
+			{//Inline image block.
 				if (ln->img >= 0 && yh.imgs[ln->img].state == 2)
-					rows = (yh.imgs[ln->img].dc->height + YH_ROW_H - 1) / YH_ROW_H;
-				else
-					rows = 1;
-				if (skip >= rows)
-					skip -= rows;
+				{
+					y -= yh.imgs[ln->img].dc->height + 4;
+					if (y >= log_y &&
+						y + yh.imgs[ln->img].dc->height <= y1c)
+						GrBlot(dc, log_x + YH_IND, y, yh.imgs[ln->img].dc);
+				}
 				else
 				{
-					skip = 0;
-					if (ln->img >= 0 && yh.imgs[ln->img].state == 2)
-					{
-						y -= (rows - 1) * YH_ROW_H;
-						if (y >= log_y)
-							GrBlot(dc, log_x + 12, y, yh.imgs[ln->img].dc);
-						y -= YH_ROW_H;
-					}
-					else
+					y -= YH_ROW_H;
+					if (y >= log_y && y + FONT_HEIGHT <= y1c)
 					{
 						dc->color = de_theme.text_dim;
 						if (ln->img >= 0 && yh.imgs[ln->img].state != 3)
-							GrPrint(dc, log_x + 12, y, "[image loading...]");
+							GrPrint(dc, log_x + YH_IND, y, "[image loading...]");
 						else
-							GrPrint(dc, log_x + 12, y, "[image: %s]", ln->text);
-						y -= YH_ROW_H;
+							GrPrint(dc, log_x + YH_IND, y, "[image]");
 					}
 				}
 			}
-			else
-			{
-				YhLineHead(ln, head, &head_pen, &body_pen);
-				hlen = StrLen(head);
-				ax = log_x;
-				avail = cpl - hlen;
-				if (ln->kind == YH_LK_MSG || ln->kind == YH_LK_SELF)
-				{//Indent for the 10x10 avatar chip.
-					ax = log_x + 12;
-					avail -= 2;
+			else if (ln->kind == YH_LK_MSG || ln->kind == YH_LK_SELF)
+			{//Message: optional pill row, wrapped text, optional group header.
+				if (ln->react[0])
+				{
+					y -= YH_PILL_H;
+					if (y >= log_y && y + 12 <= y1c)
+						YhDrawPills(dc, log_x + YH_IND, y, ln->react,
+									log_x + log_w);
 				}
-				avail = MaxI64(8, avail);
+				avail = MaxI64(8, cpl - 3);	//3 chars = the avatar indent.
 				blen = StrLen(ln->text);
 				rows = MaxI64(1, (blen + avail - 1) / avail);
-				for (r = rows - 1; r >= 0 && y + FONT_HEIGHT > log_y; r--)
+				y -= rows * YH_ROW_H;
+				hov = log_x <= mx < log_x + log_w &&
+					  y <= my < y + rows * YH_ROW_H;
+				if (hov)
 				{
-					if (skip)
-						skip--;
-					else
+					dc->color = de_theme.panel;
+					YhCRect(dc, log_x - 2, y - 1, log_w + 2,
+							rows * YH_ROW_H + 1, log_y, y1c);
+				}
+				dc->color = de_theme.text;
+				for (r = 0; r < rows; r++)
+				{
+					if (y + r * YH_ROW_H >= log_y &&
+						y + r * YH_ROW_H + FONT_HEIGHT <= y1c)
 					{
 						seg = MinI64(avail, blen - r * avail);
 						if (seg < 0)
 							seg = 0;
 						MemCopy(seg_buf, &ln->text[r * avail], seg);
 						seg_buf[seg] = 0;
-						dc->color = body_pen;
+						GrPrint(dc, log_x + YH_IND, y + r * YH_ROW_H,
+								"%s", seg_buf);
+					}
+				}
+				YhHitPush(y, y + rows * YH_ROW_H, 0, 0, yh.cur_chan, i);
+				if (YhIsGroupHead(cb, i, first))
+				{//Header row: 16x16 avatar, colored name, dim time.
+					y -= YH_HDR_H;
+					hov = log_x <= mx < log_x + log_w &&
+						  y <= my < y + YH_HDR_H;
+					if (y >= log_y && y + 16 <= y1c)
+					{
+						if (hov)
+						{
+							dc->color = de_theme.panel;
+							GrRect(dc, log_x - 2, y, log_w + 2, YH_HDR_H);
+						}
+						if (ln->av >= 0 && yh.imgs[ln->av].state == 2)
+							GrBlot(dc, log_x, y, yh.imgs[ln->av].dc);
+						else
+						{//Colored initial chip (webp / still loading).
+							dc->color = YhNickPen(ln->nick);
+							GrRect(dc, log_x, y, 16, 16);
+							dc->color = de_theme.win_bg;
+							GrPrint(dc, log_x + 4, y + 4, "%c", ln->nick[0]);
+						}
+						dc->color = YhNickPen(ln->nick);
+						GrPrint(dc, log_x + YH_IND, y + 4, "%s", ln->nick);
+						dc->color = de_theme.text_dim;
+						GrPrint(dc, log_x + YH_IND +
+								(StrLen(ln->nick) + 1) * FONT_WIDTH, y + 4,
+								" %02d:%02d", ln->hh, ln->mm);
+					}
+					YhHitPush(y, y + YH_HDR_H, log_x,
+							  log_x + YH_IND + StrLen(ln->nick) * FONT_WIDTH,
+							  yh.cur_chan, i);
+					y -= YH_GAP;
+				}
+			}
+			else
+			{//Status / error / reply / system rows.
+				YhLineHead(ln, head, &head_pen, &body_pen);
+				hlen = StrLen(head);
+				avail = MaxI64(8, cpl - hlen - 3);
+				blen = StrLen(ln->text);
+				rows = MaxI64(1, (blen + avail - 1) / avail);
+				y -= rows * YH_ROW_H;
+				for (r = 0; r < rows; r++)
+				{
+					if (y + r * YH_ROW_H >= log_y &&
+						y + r * YH_ROW_H + FONT_HEIGHT <= y1c)
+					{
+						seg = MinI64(avail, blen - r * avail);
+						if (seg < 0)
+							seg = 0;
+						MemCopy(seg_buf, &ln->text[r * avail], seg);
+						seg_buf[seg] = 0;
 						if (r == 0)
 						{
-							if (ln->kind == YH_LK_MSG || ln->kind == YH_LK_SELF)
-							{
-								hov = log_x <= mx < log_x + log_w &&
-									  y - 1 <= my < y + YH_ROW_H - 1;
-								if (hov)
-								{//Hover highlight behind the whole head row.
-									dc->color = de_theme.panel;
-									GrRect(dc, log_x - 2, y - 1, log_w + 2, YH_ROW_H);
-								}
-								if (ln->av >= 0 && yh.imgs[ln->av].state == 2)
-									GrBlot(dc, log_x, y - 1, yh.imgs[ln->av].dc);
-								else
-								{//Colored initial chip (webp / still loading).
-									dc->color = YhNickPen(ln->nick);
-									GrRect(dc, log_x, y - 1, 10, 10);
-								}
-								YhHitPush(y - 1, y + YH_ROW_H - 1, log_x,
-										  ax + hlen * FONT_WIDTH, yh.cur_chan, i);
+							if (ln->kind == YH_LK_REPLY)
+							{//Accent quote bar, webapp-style.
+								dc->color = de_theme.accent_dim;
+								GrRect(dc, log_x + YH_IND, y, 2, YH_ROW_H);
 							}
 							dc->color = head_pen;
-							GrPrint(dc, ax, y, "%s", head);
-							dc->color = body_pen;
+							GrPrint(dc, log_x + YH_IND + 6, y, "%s", head);
 						}
-						GrPrint(dc, ax + hlen * FONT_WIDTH, y, "%s", seg_buf);
-						y -= YH_ROW_H;
+						dc->color = body_pen;
+						GrPrint(dc, log_x + YH_IND + 6 + hlen * FONT_WIDTH,
+								y + r * YH_ROW_H, "%s", seg_buf);
 					}
 				}
 			}
@@ -983,10 +1080,10 @@ U0 YhChatClick(I64 mx, I64 my)
 		{//No `continue` in ZealC.
 			if (yh.chans[i].server == yh.cur_srv)
 			{
-				y = log_y + 18 + r * YH_ROW_H;
+				y = log_y + 22 + r * (YH_ROW_H + 4);	//Matches the draw pass.
 				if (y + FONT_HEIGHT > log_y + log_h)
 					break;
-				if (y <= my < y + YH_ROW_H)
+				if (y <= my < y + YH_ROW_H + 4)
 				{
 					YhSwitchChan(i);
 					return;

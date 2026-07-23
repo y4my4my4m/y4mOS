@@ -55,8 +55,9 @@ public U0 YHarmony()
 	SettingsPush;
 	old_inhibit = Fs->win_inhibit;
 	StrCopy(Fs->task_title, "yHarmony");
-	WinHorz(MaxI64(1, (TEXT_COLS - 116) / 2), MaxI64(1, (TEXT_COLS - 116) / 2) + 115);
-	WinVert(MaxI64(2, (TEXT_ROWS - 56) / 2), MaxI64(2, (TEXT_ROWS - 56) / 2) + 55);
+	//Big window: 140x62 cells on the 160x90 (1280x720) screen.
+	WinHorz(MaxI64(1, (TEXT_COLS - 140) / 2), MaxI64(1, (TEXT_COLS - 140) / 2) + 139);
+	WinVert(MaxI64(2, (TEXT_ROWS - 62) / 2), MaxI64(2, (TEXT_ROWS - 62) / 2) + 61);
 	//L/R-DOWN must deliver instantly (skip the double-click timeout).
 	Fs->win_inhibit = old_inhibit | WIF_FOCUS_TASK_MS_L_D | WIF_FOCUS_TASK_MS_R_D;
 	WinFocus;

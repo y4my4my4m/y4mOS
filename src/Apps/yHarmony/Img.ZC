@@ -24,7 +24,13 @@ I64 YhImgGet(U8 *url, I64 maxw, I64 maxh)
 }
 
 U0 YhImgAbs(U8 *src, U8 *dst, I64 max)
-{//Absolutize an image URL: "/x.png" -> https://{instance host}/x.png.
+{//Absolutize an image URL ("/x.png" -> https://{host}/x.png) and normalize
+//Supabase imgproxy transform URLs back to the RAW OBJECT: render/image
+//transcodes to webp (no decoder yet); the object URL serves the original
+//png/jpg/gif bytes. Transform query params dropped on rewrite.
+	U8	*p, *q;
+	I64	 n;
+
 	if (!StrNICompare(src, "http", 4))
 		StrPrint(dst, "%s", src);
 	else if (src[0] == '/' && yh.f_host[0])
@@ -32,6 +38,20 @@ U0 YhImgAbs(U8 *src, U8 *dst, I64 max)
 	else
 		StrPrint(dst, "%s", src);
 	dst[max - 1] = 0;
+
+	p = StrFind("/storage/v1/render/image/", dst);
+	if (p)
+	{//".../render/image/<tail>" -> ".../object/<tail>", minus the query.
+		q = MStrPrint("%s", p + 25);	//Tail after "render/image/".
+		StrPrint(p, "/storage/v1/object/%s", q);
+		Free(q);
+		p = StrFirstOcc(dst, "?");
+		if (p)
+			*p = 0;
+		n = StrLen(dst);
+		while (n && dst[n - 1] == '/')
+			dst[--n] = 0;
+	}
 }
 
 U0 YhImgLoaderTask()

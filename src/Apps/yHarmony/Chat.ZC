@@ -36,6 +36,7 @@ U0 YhAdd(I64 ci, I64 kind, U8 *nick, U8 *text, U8 hh=255, U8 mm=0)
 	ln->kind = kind;
 	ln->nick[0] = 0;
 	ln->id[0] = 0;
+	ln->react[0] = 0;
 	ln->av = -1;
 	ln->img = -1;
 	if (nick)
@@ -124,7 +125,7 @@ U0 YhProfileAdd(U8 *id, U8 *name, U8 *av_url=NULL)
 	if (av_url && *av_url)
 	{
 		YhImgAbs(av_url, abs, sizeof(abs));
-		yh.profiles[i].av = YhImgGet(abs, 10, 10);
+		yh.profiles[i].av = YhImgGet(abs, 16, 16);
 	}
 	if (i == yh.num_profiles)
 		yh.num_profiles++;
@@ -580,12 +581,13 @@ U0 YhFetchReactions(I64 ci)
 		}
 	}
 
-	//Per message line: per-emoji counts appended once.
+	//Per message line: rebuild the pill list ('|'-separated tokens).
 	for (i = first; i < ch->count; i++)
 	{
 		ln = &ch->lines[i % YH_MAX_LINES];
 		if (ln->id[0] && (ln->kind == YH_LK_MSG || ln->kind == YH_LK_SELF))
 		{
+			ln->react[0] = 0;
 			for (j = 0; j < n_emoji; j++)
 			{
 				cnt = 0;
@@ -601,11 +603,11 @@ U0 YhFetchReactions(I64 ci)
 				if (cnt)
 				{
 					if (cnt > 1)
-						StrPrint(chip, " {%s x%d}", enames[j], cnt);
+						StrPrint(chip, "%s x%d|", enames[j], cnt);
 					else
-						StrPrint(chip, " {%s}", enames[j]);
-					if (StrLen(ln->text) + StrLen(chip) < YH_TEXT_LEN - 1)
-						CatPrint(ln->text, "%s", chip);
+						StrPrint(chip, "%s|", enames[j]);
+					if (StrLen(ln->react) + StrLen(chip) < YH_REACT_LEN - 1)
+						CatPrint(ln->react, "%s", chip);
 				}
 			}
 		}
@@ -792,11 +794,11 @@ U0 YhReactAdd(CYhLine *ln)
 
 	body = MStrPrint("{\"message_id\":\"%s\",\"emoji_id\":\"%s\",\"user_id\":\"%s\"}",
 					 ln->id, eids[sel], yh.prof_id);
-	//Reuse the parsed emoji name for the local chip before freeing.
+	//Reuse the parsed emoji name for the local pill before freeing.
 	row = json->child;
 	while (sel--)
 		row = row->next;
-	StrPrint(chip, " {%s}", YhjStr(YhjGet(row, "name"), "?"));
+	StrPrint(chip, "%s|", YhjStr(YhjGet(row, "name"), "?"));
 	YhjFree(json);
 
 	json = YhRest("POST", "/rest/v1/reactions", body);
@@ -804,8 +806,8 @@ U0 YhReactAdd(CYhLine *ln)
 	if (json)
 	{
 		YhjFree(json);
-		if (StrLen(ln->text) + StrLen(chip) < YH_TEXT_LEN - 1)
-			CatPrint(ln->text, "%s", chip);
+		if (StrLen(ln->react) + StrLen(chip) < YH_REACT_LEN - 1)
+			CatPrint(ln->react, "%s", chip);
 	}
 	else
 		YhStatus("Reaction failed.");
