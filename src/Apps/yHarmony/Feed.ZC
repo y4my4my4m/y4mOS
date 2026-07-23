@@ -124,7 +124,7 @@ U0 YhPostRowAdd(I64 ci, CYhJson *row, U8 *missing, I64 missing_max)
 		{
 			if (*YhjStr(YhjGet(att, "url")))
 			{
-				YhImgAbs(YhjStr(YhjGet(att, "url")), abs, sizeof(abs));
+				YhImgAbs(YhjStr(YhjGet(att, "url")), abs, sizeof(abs), "user_media");
 				YhAdd(ci, YH_LK_IMG, NULL, abs);
 				ln = YhLineLast(ci);
 				if (ln)

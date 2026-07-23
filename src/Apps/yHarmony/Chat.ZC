@@ -306,7 +306,7 @@ U0 YhEmbedParts(I64 ci, CYhJson *content)
 		}
 		if (url)
 		{
-			YhImgAbs(url, abs, sizeof(abs));
+			YhImgAbs(url, abs, sizeof(abs), "user_media");
 			YhAdd(ci, YH_LK_IMG, NULL, abs);
 			ln = YhLineLast(ci);
 			if (ln)
@@ -581,7 +581,7 @@ U0 YhFetchReactions(I64 ci)
 						enames[j][MinI64(StrLen(nm), 31)] = 0;
 						if (*YhjStr(YhjGet(row, "url")))
 						{//The pill shows the actual emoji image (12x12).
-							YhImgAbs(YhjStr(YhjGet(row, "url")), abs, sizeof(abs));
+							YhImgAbs(YhjStr(YhjGet(row, "url")), abs, sizeof(abs), "emojis");
 							eimg[j] = YhImgGet(abs, 12, 12);
 						}
 					}
@@ -811,7 +811,7 @@ U0 YhEmojiLoad()
 			yh.em_img[yh.em_n] = -1;
 			if (*yh.em_url[yh.em_n])
 			{
-				YhImgAbs(yh.em_url[yh.em_n], abs, sizeof(abs));
+				YhImgAbs(yh.em_url[yh.em_n], abs, sizeof(abs), "emojis");
 				yh.em_img[yh.em_n] = YhImgGet(abs, 12, 12);
 			}
 			yh.em_n++;
@@ -1297,7 +1297,7 @@ U0 YhFetchServers()
 		sv->icon = -1;
 		if (*YhjStr(YhjGet(row, "icon")))
 		{
-			YhImgAbs(YhjStr(YhjGet(row, "icon")), abs, sizeof(abs));
+			YhImgAbs(YhjStr(YhjGet(row, "icon")), abs, sizeof(abs), "server_icons");
 			sv->icon = YhImgGet(abs, 16, 16);
 		}
 		yh.num_servers++;

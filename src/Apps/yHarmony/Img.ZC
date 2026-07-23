@@ -28,20 +28,38 @@ I64 YhImgGet(U8 *url, I64 maxw, I64 maxh)
 	return yh.img_count++;
 }
 
-U0 YhImgAbs(U8 *src, U8 *dst, I64 max)
-{//Absolutize an image URL ("/x.png" -> https://{host}/x.png) and normalize
-//Supabase imgproxy transform URLs back to the RAW OBJECT: render/image
-//transcodes to webp (no decoder yet); the object URL serves the original
-//png/jpg/gif bytes. Transform query params dropped on rewrite.
-	U8	*p, *q;
+U0 YhImgAbs(U8 *src, U8 *dst, I64 max, U8 *bucket="avatars")
+{//Turn any stored image reference into a fetchable https URL, or blank dst
+//(= skip) when it can't be fetched. Handles:
+//  http(s)://...            kept (+ imgproxy render/image -> raw object)
+//  /path                    prefixed with the instance host
+//  bucket/path OR uuid/f    a bare Supabase STORAGE OBJECT PATH -> built into
+//                           https://{host}/storage/v1/object/public/{bucket}/..
+//                           (this is the bug that ARP'd a UUID as a hostname:
+//                            avatar_url/media rows can be bare storage paths)
+//  blob:/data:/garbage      NOT fetchable -> dst = "" (loader skips it)
+	U8	*p, *q, *base;
 	I64	 n;
 
-	if (!StrNICompare(src, "http", 4))
+	dst[0] = 0;
+	if (!src || !*src)
+		return;
+
+	if (!StrNICompare(src, "http://", 7) || !StrNICompare(src, "https://", 8))
 		StrPrint(dst, "%s", src);
+	else if (!StrNICompare(src, "blob:", 5) || !StrNICompare(src, "data:", 5))
+		return;	//Client-only / inline: unfetchable, skip.
 	else if (src[0] == '/' && yh.f_host[0])
 		StrPrint(dst, "https://%s%s", yh.f_host, src);
-	else
-		StrPrint(dst, "%s", src);
+	else if (yh.f_host[0])
+	{//Bare storage path. Strip a leading "public/" or "{bucket}/" if the row
+	 //already carries one, then build the canonical public object URL.
+		base = src;
+		if (!StrNICompare(base, "public/", 7))
+			base += 7;
+		StrPrint(dst, "https://%s/storage/v1/object/public/%s/%s",
+				 yh.f_host, bucket, base);
+	}
 	dst[max - 1] = 0;
 
 	p = StrFind("/storage/v1/render/image/", dst);
@@ -56,6 +74,25 @@ U0 YhImgAbs(U8 *src, U8 *dst, I64 max)
 		n = StrLen(dst);
 		while (n && dst[n - 1] == '/')
 			dst[--n] = 0;
+	}
+
+	//Final guard: must be scheme://host-with-a-dot, else it's garbage (a UUID,
+	//a hostname-less path). Blank it so we never ARP/DNS a non-host.
+	p = StrFind("://", dst);
+	if (!p)
+		dst[0] = 0;
+	else
+	{
+		q = StrFirstOcc(p + 3, "/");	//End of host.
+		if (!q)
+			q = p + 3 + StrLen(p + 3);
+		//Require a '.' inside the host span.
+		n = 0;
+		for (base = p + 3; base < q; base++)
+			if (*base == '.')
+				n = 1;
+		if (!n)
+			dst[0] = 0;
 	}
 }
 
