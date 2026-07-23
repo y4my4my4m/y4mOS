@@ -11,7 +11,7 @@
 #define ZH_ELEM		1
 #define ZH_TEXT		2
 
-#define ZH_MAX_NODES	20000	// per-page parse budget
+#define ZH_MAX_NODES	80000	// live-node budget (refunded on detach, see JsNodeDetach)
 #define ZH_STACK_DEPTH	64
 
 class CZAttr
@@ -79,6 +79,12 @@ U0 ZNodeFree(CZNode *node)
 
 	if (!node)
 		return;
+
+	if (zh_node_budget < ZH_MAX_NODES)
+		zh_node_budget++; // refund: innerHTML churn (o.innerHTML='...' in the vercel
+						  // game's toast/log) frees old subtrees via here every update
+						  // -> without a refund the create-budget bleeds out over time
+						  // and createElement starts returning NULL.
 
 	child = node->first_child;
 	while (child)
@@ -296,7 +302,35 @@ U0 ZDecPutCodePoint(U8 *out, I64 *n, I64 max, I64 cp)
 	else if (cp == 0xF1)						ZDecPut(out, n, max, "n");
 	else if (0xF2 <= cp <= 0xF6)				ZDecPut(out, n, max, "o");
 	else if (0xF9 <= cp <= 0xFC)				ZDecPut(out, n, max, "u");
-	else										ZDecPut(out, n, max, "?");
+	else
+	{ // No ASCII approximation (CJK, etc.): re-emit the RAW UTF-8 bytes so the
+	  // browser's font layer (GrFont's grf_cjk fallback) can render the real
+	  // glyph. This keeps multibyte text inside Zinc's own byte pipeline - the
+	  // ZealOS core / DolDoc never sees it, so nothing else has to become UTF-8.
+		U8	u[5];
+		I64	k = 0;
+
+		if (cp < 0x800)
+		{
+			u[k++] = 0xC0 | (cp >> 6);
+			u[k++] = 0x80 | (cp & 0x3F);
+		}
+		else if (cp < 0x10000)
+		{
+			u[k++] = 0xE0 | (cp >> 12);
+			u[k++] = 0x80 | ((cp >> 6) & 0x3F);
+			u[k++] = 0x80 | (cp & 0x3F);
+		}
+		else
+		{
+			u[k++] = 0xF0 | (cp >> 18);
+			u[k++] = 0x80 | ((cp >> 12) & 0x3F);
+			u[k++] = 0x80 | ((cp >> 6) & 0x3F);
+			u[k++] = 0x80 | (cp & 0x3F);
+		}
+		u[k] = 0;
+		ZDecPut(out, n, max, u);
+	}
 }
 
 #define ZH_ENTITY_COUNT 24

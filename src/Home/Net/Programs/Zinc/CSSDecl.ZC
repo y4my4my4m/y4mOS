@@ -1,0 +1,764 @@
+// ============================================================================
+// Zinc CSS engine - Declaration applier (split from CSS.ZC).
+// ZCssDeclApply: one property name/value -> CZStyle fields. The big property
+// dispatch (display/flex/position/margins/colors/background/transform/...).
+// Included from CSS.ZC after CSSVal. Not standalone.
+// ============================================================================
+
+U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
+{
+	I64	 color, n, depth;
+	U8	*p, tok[64];
+	U8	 vbuf[512], ubuf[192];
+
+	if (name[0] == '-' && name[1] == '-')
+	{ // custom property definition: store, no direct style effect
+		ZCssVarSet(name + 2, val);
+		return;
+	}
+	if (StrFind("var(", val))
+	{ // expand variable references before parsing the value
+		ZCssVarSubst(val, vbuf, 512);
+		val = vbuf;
+	}
+
+	if (!StrICompare(name, "color"))
+	{
+		color = ZCssColor(val);
+		if (color >= 0)
+			out->fg = color;
+	}
+	else if (!StrICompare(name, "background") ||
+			 !StrICompare(name, "background-color"))
+	{
+		color = ZCssColor(val);
+		if (color < 0)
+		{ // shorthand: "url(x) #202124 no-repeat" - first color-like token wins
+			p = val;
+			while (*p && color < 0)
+			{
+				while (*p == ' ' || *p == '\t')
+					p++;
+				n = 0;
+				depth = 0;
+				while (*p && (*p != ' ' || depth) && *p != '\t')
+				{ // token; keep spaces inside rgb(...) together
+					if (*p == '(')
+						depth++;
+					else if (*p == ')' && depth)
+						depth--;
+					if (n < 63)
+						tok[n++] = *p;
+					p++;
+				}
+				tok[n] = 0;
+				if (!n)
+					break;
+				if (tok[0] == '#' || !StrNICompare(tok, "rgb", 3) ||
+					!StrNICompare(tok, "hsl", 3))
+					color = ZCssColor(tok);
+			}
+		}
+		if (color >= 0)
+			out->bg = color;
+		if (!StrICompare(name, "background") && ZCssUrlExtract(val, ubuf, 192))
+		{ // shorthand can also carry the image: background:url(x) #fff ...
+			n = ZCssBgImgAdd(ubuf);
+			if (n >= 0)
+				out->bg_img = n;
+		}
+		if (!StrICompare(name, "background") && StrFind("no-repeat", val))
+			out->bg_repeat = 1; // shorthand repeat keyword (position/size stay longhand)
+		if (!StrICompare(name, "background") && StrFind("gradient", val))
+		{ // background: linear-gradient(...) shorthand
+			n = ZCssParseGradient(val);
+			if (n >= 0)
+				out->grad = n;
+		}
+	}
+	else if (!StrICompare(name, "background-image"))
+	{
+		if (ZCssUrlExtract(val, ubuf, 192))
+		{
+			n = ZCssBgImgAdd(ubuf);
+			if (n >= 0)
+				out->bg_img = n;
+		}
+		else if (StrFind("gradient", val))
+		{ // linear-gradient(...) / radial-gradient(...) -> interned gradient
+			n = ZCssParseGradient(val);
+			if (n >= 0)
+				out->grad = n;
+		}
+	}
+	else if (!StrICompare(name, "background-position"))
+		ZCssBgPosParse(val, out);
+	else if (!StrICompare(name, "background-size"))
+		ZCssBgSizeParse(val, out);
+	else if (!StrICompare(name, "background-repeat"))
+	{
+		if (StrFind("no-repeat", val))
+			out->bg_repeat = 1;
+		else if (StrFind("repeat-x", val))
+			out->bg_repeat = 2;
+		else if (StrFind("repeat-y", val))
+			out->bg_repeat = 3;
+		else
+			out->bg_repeat = 0;
+	}
+	else if (!StrICompare(name, "float"))
+	{
+		if (StrFind("left", val))
+			out->float_side = 1;
+		else if (StrFind("right", val))
+			out->float_side = 2;
+		else
+			out->float_side = 0;
+	}
+	else if (!StrICompare(name, "clear"))
+	{
+		if (StrFind("both", val))
+			out->clear_side = 3;
+		else if (StrFind("left", val))
+			out->clear_side = 1;
+		else if (StrFind("right", val))
+			out->clear_side = 2;
+		else
+			out->clear_side = 0;
+	}
+	else if (!StrICompare(name, "box-shadow"))
+	{
+		if (!StrFind("none", val) && !StrFind("inset", val))
+		{ // "<dx> <dy> <blur> [spread] <color>" - inset shadows are skipped
+			I64 li = 0, lvpx;
+
+			p = val;
+			while (*p)
+			{
+				while (*p == ' ' || *p == '\t' || *p == ',')
+					p++;
+				n = 0;
+				depth = 0;
+				while (*p && (depth || (*p != ' ' && *p != '\t' && *p != ',')))
+				{ // keep rgb()/hsl() commas together
+					if (*p == '(')
+						depth++;
+					else if (*p == ')' && depth)
+						depth--;
+					if (n < 63)
+						tok[n++] = *p;
+					p++;
+				}
+				tok[n] = 0;
+				if (!n)
+					break;
+				color = ZCssColor(tok);
+				if (color >= 0)
+					out->sh_col = color;
+				else
+				{
+					lvpx = ZCssPxSigned(tok);
+					if (lvpx != ZCSS_OFF_UNSET)
+					{
+						if (li == 0)
+							out->sh_dx = lvpx;
+						else if (li == 1)
+							out->sh_dy = lvpx;
+						else if (li == 2 && lvpx > 0)
+							out->sh_blur = lvpx;
+						li++;
+					}
+				}
+			}
+		}
+	}
+	else if (!StrICompare(name, "line-height"))
+	{
+		if (!StrNICompare(val, "normal", 6))
+			out->line_h = -1;
+		else
+		{
+			//Unitless (1.5) multiplies the font size; anything with a unit
+			//goes through the normal length parser.
+			depth = TRUE; // reused as "is unitless" flag
+			p = val;
+			while (*p)
+			{
+				if (!('0' <= *p <= '9') && *p != '.' && *p != ' ')
+					depth = FALSE;
+				p++;
+			}
+			if (depth)
+			{
+				n = 0; // value in tenths: "1.5" -> 15
+				p = val;
+				while (*p == ' ')
+					p++;
+				while ('0' <= *p <= '9')
+				{
+					n = n * 10 + *p - '0';
+					p++;
+				}
+				n *= 10;
+				if (*p == '.' && '0' <= p[1] <= '9')
+					n += p[1] - '0';
+				if (out->fsize > 0)
+					out->line_h = ClampI64(out->fsize * n / 10, 8, 64);
+				else
+					out->line_h = ClampI64(16 * n / 10, 8, 64);
+			}
+			else
+			{
+				n = ZCssPx(val);
+				if (n > 0)
+					out->line_h = ClampI64(n, 8, 64);
+			}
+		}
+	}
+	else if (!StrICompare(name, "font-weight"))
+	{
+		if (!StrNICompare(val, "bold", 4) || Str2I64(val) >= 600)
+			out->bold = 1;
+		else if (!StrICompare(val, "normal"))
+			out->bold = 0;
+	}
+	else if (!StrICompare(name, "font-style"))
+	{
+		if (!StrNICompare(val, "italic", 6) || !StrNICompare(val, "oblique", 7))
+			out->underline = 1;
+		else if (!StrICompare(val, "normal"))
+			out->underline = 0;
+	}
+	else if (!StrICompare(name, "font-size"))
+		ZCssFontSizeSet(val, out);
+	else if (!StrICompare(name, "font-family"))
+	{ // pick the monospace vs proportional family; specific faces ignored
+		if (StrIMatch("mono", val) || StrIMatch("courier", val) ||
+			StrIMatch("consol", val) || StrIMatch("menlo", val) ||
+			StrIMatch("monaco", val) || StrIMatch("fixed", val))
+			out->mono = 1;
+		else
+			out->mono = 0;
+	}
+	else if (!StrICompare(name, "font"))
+	{ // shorthand: pick out a weight and a size; family is ignored
+		p = val;
+		while (*p)
+		{
+			while (*p == ' ' || *p == '\t')
+				p++;
+			n = 0;
+			while (*p && *p != ' ' && *p != '\t' && *p != ',')
+			{
+				if (n < 39)
+					tok[n++] = *p;
+				p++;
+			}
+			tok[n] = 0;
+			if (!n)
+				break;
+			if (!StrICompare(tok, "bold") || Str2I64(tok) >= 600)
+				out->bold = 1;
+			else if ('0' <= tok[0] <= '9' && ZCssPx(tok) > 0)
+				ZCssFontSizeSet(tok, out);
+			if (*p == ',')
+				break;	// family list reached
+		}
+	}
+	else if (!StrICompare(name, "text-decoration") ||
+			 !StrICompare(name, "text-decoration-line"))
+	{
+		if (StrIMatch("underline", val))
+			out->underline = 1;
+		else if (!StrNICompare(val, "none", 4))
+			out->underline = 0;
+	}
+	else if (!StrICompare(name, "text-align"))
+	{
+		if (!StrNICompare(val, "center", 6))
+			out->align = 1;
+		else if (!StrNICompare(val, "right", 5) || !StrNICompare(val, "end", 3))
+			out->align = 2;
+		else
+			out->align = 0;
+	}
+	else if (!StrICompare(name, "margin"))
+	{
+		ZCssMarginSet(val, &out->mt, &out->mr, &out->mb, &out->ml);
+		if (ZCssHasAuto(val))
+			out->ml_auto = 1; // "margin: X auto" centers a sized block
+	}
+	else if (!StrICompare(name, "margin-top"))
+	{
+		n = ZCssPx(val);
+		if (n >= 0)
+			out->mt = MinI64(n, ZCSS_SPACE_MAX);
+	}
+	else if (!StrICompare(name, "margin-bottom"))
+	{
+		n = ZCssPx(val);
+		if (n >= 0)
+			out->mb = MinI64(n, ZCSS_SPACE_MAX);
+	}
+	else if (!StrICompare(name, "margin-left") ||
+			 !StrICompare(name, "margin-right"))
+	{
+		if (ZCssHasAuto(val))
+			out->ml_auto = 1;
+		n = ZCssPx(val);
+		if (n >= 0)
+		{
+			if (name[7] == 'l')
+				out->ml = MinI64(n, ZCSS_SPACE_MAX);
+			else
+				out->mr = MinI64(n, ZCSS_SPACE_MAX);
+		}
+	}
+	else if (!StrICompare(name, "width") || !StrICompare(name, "max-width"))
+	{
+		if (!StrNICompare(val, "calc(", 5) || !StrNICompare(val, "min(", 4) ||
+			!StrNICompare(val, "max(", 4)  || !StrNICompare(val, "clamp(", 6))
+		{ // calc()/min()/max()/clamp() widths -> concrete px
+			n = ZCssLenPx(val);
+			if (n > 15)
+				out->width = MinI64(n, 4000);
+			return;
+		}
+		p = val;
+		while (*p && *p != '%')
+			p++;
+		if (*p == '%')
+		{
+			n = Str2I64(val);
+			if (1 <= n <= 99)
+				out->width = -n;
+		}
+		else
+		{
+			n = ZCssPx(val);
+			if (n > 15)
+			{ // max-width narrows an existing width, plain width replaces it
+				if (name[0] == 'm' || name[0] == 'M')
+				{
+					if (out->width <= 0 || n < out->width)
+						out->width = MinI64(n, 4000);
+				}
+				else
+					out->width = MinI64(n, 4000);
+			}
+		}
+	}
+	else if (!StrICompare(name, "padding"))
+		ZCssMarginSet(val, &out->pt, &out->pr, &out->pb, &out->pl);
+	else if (!StrICompare(name, "padding-right"))
+	{
+		n = ZCssPx(val);
+		if (n >= 0)
+			out->pr = MinI64(n, ZCSS_SPACE_MAX);
+	}
+	else if (!StrICompare(name, "height") || !StrICompare(name, "min-height"))
+	{ // px/vh/calc()/min()/max()/clamp(), plus REAL percent heights: N% encodes
+	  // as -(3000+N) and the layout resolves it against the nearest ancestor
+	  // with a resolved height (gx.anc_h chain; viewport at the root).
+		p = val;
+		while (*p && *p != '%')
+			p++;
+		if (*p == '%' && !StrFind("(", val))
+		{
+			n = Str2I64(val);
+			if (1 <= n <= 100)
+				out->height = -(3000 + n);
+		}
+		else
+		{
+			n = ZCssLenPx(val);
+			if (15 < n <= 2000 && n > out->height)
+				out->height = n;
+		}
+	}
+	else if (!StrICompare(name, "inset"))
+	{ // inset:0 = top/right/bottom/left all set - the full-bleed overlay idiom
+	  // (position:absolute;inset:0). Map to our top/left/right offsets + width
+	  // 100% so the abs box spans its containing block.
+		n = ZCssPx(val);
+		if (n >= 0)
+		{
+			out->off_t = n;
+			out->off_l = n;
+			out->off_r = n;
+			if (n == 0 && out->width == 0)
+				out->width = -100; // span the containing block
+			if (n == 0 && !out->height)
+				out->height = zcss_view_h; // full-bleed overlay: viewport tall,
+										   // so flex centering can center it
+		}
+	}
+	else if (!StrICompare(name, "gap") || !StrICompare(name, "column-gap") ||
+			 !StrICompare(name, "grid-gap"))
+	{
+		n = ZCssPx(val);
+		if (0 <= n <= 200)
+			out->gap = n;
+	}
+	else if (!StrICompare(name, "flex-grow"))
+	{
+		n = Str2I64(val);
+		if (0 <= n <= 8)
+			out->grow = n;
+	}
+	else if (!StrICompare(name, "flex"))
+	{ // shorthand: "1", "1 1 auto", "none", "auto" - first number = grow
+		if (!StrNICompare(val, "none", 4))
+			out->grow = 0;
+		else if (!StrNICompare(val, "auto", 4))
+			out->grow = 1;
+		else if ('0' <= val[0] <= '9')
+		{
+			n = Str2I64(val);
+			out->grow = ClampI64(n, 0, 8);
+		}
+	}
+	else if (!StrICompare(name, "flex-basis"))
+	{
+		n = ZCssPx(val);
+		if (n > 15 && !out->width)
+			out->width = MinI64(n, 4000);
+	}
+	else if (!StrICompare(name, "border-radius"))
+	{
+		n = ZCssPx(val);
+		if (0 <= n <= 48)
+			out->radius = n;
+		else if (StrFind("%", val) || n > 48)
+			out->radius = 48; // 50% pills etc: cap, draw clamps to h/2
+	}
+	else if (!StrICompare(name, "position"))
+	{
+		if (!StrNICompare(val, "relative", 8))
+			out->pos = 1;
+		else if (!StrNICompare(val, "absolute", 8))
+			out->pos = 2;
+		else if (!StrNICompare(val, "fixed", 5))
+			out->pos = 3;
+		else if (!StrNICompare(val, "sticky", 6))
+			out->pos = 1; // sticky flows like relative (no scroll pinning)
+		else
+			out->pos = 0; // static flows normally
+	}
+	else if (!StrICompare(name, "top"))
+	{//Percent offsets (top:20%) encode as -(2000+p): resolved against the
+	//containing block at layout time (wikipedia rings its globe this way).
+		n = ZCssPx(val);
+		if (0 <= n <= 4000)
+			out->off_t = n;
+		else
+		{
+			n = ZCssPct(val);
+			if (0 <= n <= 100)
+				out->off_t = -(2000 + n);
+		}
+	}
+	else if (!StrICompare(name, "left"))
+	{
+		n = ZCssPx(val);
+		if (0 <= n <= 4000)
+			out->off_l = n;
+		else
+		{
+			n = ZCssPct(val);
+			if (0 <= n <= 100)
+				out->off_l = -(2000 + n);
+		}
+	}
+	else if (!StrICompare(name, "right"))
+	{
+		n = ZCssPx(val);
+		if (0 <= n <= 4000)
+			out->off_r = n;
+		else
+		{
+			n = ZCssPct(val);
+			if (0 <= n <= 100)
+				out->off_r = -(2000 + n);
+		}
+	}
+	else if (!StrICompare(name, "padding-top"))
+	{
+		n = ZCssPx(val);
+		if (n >= 0)
+			out->pt = MinI64(n, ZCSS_SPACE_MAX);
+	}
+	else if (!StrICompare(name, "padding-bottom"))
+	{
+		n = ZCssPx(val);
+		if (n >= 0)
+			out->pb = MinI64(n, ZCSS_SPACE_MAX);
+	}
+	else if (!StrICompare(name, "padding-left"))
+	{
+		n = ZCssPx(val);
+		if (n >= 0)
+			out->pl = MinI64(n, ZCSS_SPACE_MAX);
+	}
+	else if (!StrICompare(name, "border") || !StrICompare(name, "border-top") ||
+			 !StrICompare(name, "border-bottom") ||
+			 !StrICompare(name, "border-left") ||
+			 !StrICompare(name, "border-right") ||
+			 !StrICompare(name, "outline"))
+		ZCssBorderSet(val, out);
+	else if (!StrICompare(name, "border-color"))
+	{
+		color = ZCssColor(val);
+		if (color >= 0)
+			out->border = color;
+	}
+	else if (!StrICompare(name, "display"))
+	{
+		if (!StrNICompare(val, "none", 4))
+			out->display = ZCSS_DISP_NONE;
+		else if (!StrNICompare(val, "inline-block", 12))
+			out->display = ZCSS_DISP_INLINE; // flows in the line (nav pills etc)
+		else if (!StrNICompare(val, "inline-flex", 11) ||
+				 !StrNICompare(val, "inline-grid", 11))
+			out->display = ZCSS_DISP_FLEX;
+		else if (!StrNICompare(val, "inline", 6))
+			out->display = ZCSS_DISP_INLINE;
+		else if (!StrNICompare(val, "flex", 4) || !StrNICompare(val, "grid", 4))
+			out->display = ZCSS_DISP_FLEX; // rows of children (approx flex/grid)
+		else
+			out->display = ZCSS_DISP_BLOCK;
+	}
+	else if (!StrICompare(name, "flex-direction") || !StrICompare(name, "flex-flow"))
+	{
+		if (StrFind("column", val))
+			out->flex_col = 1;
+		else
+			out->flex_col = 0;
+	}
+	else if (!StrICompare(name, "grid-template-columns") ||
+			 !StrICompare(name, "grid-template"))
+	{ // parse the real column tracks (fixed px vs fr) into the side table so the
+	  // layout sizes a 12.25rem sidebar + 1fr content correctly, not equal cols.
+	  // grid-template's "<rows> / <cols>" form: parser reads after the '/'.
+		if (out->grid_idx < 0 && zcss_grid_count < ZCSS_GRID_MAX)
+		{ // one slot per rule; grid-template-areas below reuses it
+			out->grid_idx = zcss_grid_count;
+			zcss_grid_count++;
+			zcss_gtrk_n[out->grid_idx] = 0;
+			zcss_gacount[out->grid_idx] = 0;
+		}
+		if (out->grid_idx >= 0)
+		{
+			n = ZCssGridParse(val, out->grid_idx);
+			if (n >= 1)
+				out->grid_cols = ClampI64(n, 1, 12);
+		}
+	}
+	else if (!StrICompare(name, "grid-template-areas"))
+	{ // named cell map: gives full-width rows (siteNotice/footer span all cols)
+		if (out->grid_idx < 0 && zcss_grid_count < ZCSS_GRID_MAX)
+		{
+			out->grid_idx = zcss_grid_count;
+			zcss_grid_count++;
+			zcss_gtrk_n[out->grid_idx] = 0;
+			zcss_gacount[out->grid_idx] = 0;
+		}
+		if (out->grid_idx >= 0)
+			ZCssGridAreas(val, out->grid_idx);
+	}
+	else if (!StrICompare(name, "grid-area"))
+	{ // child placement by area NAME (numeric line forms are ignored)
+		if (val[0] && !('0' <= val[0] <= '9') && val[0] != '.')
+			out->grid_area_idx = ZCssAreaIntern(val);
+	}
+	else if (!StrICompare(name, "grid-column") ||
+			 !StrICompare(name, "grid-column-start") ||
+			 !StrICompare(name, "grid-column-end"))
+	{ // how many columns this grid item occupies: "span N", or "1 / -1" = full.
+	  // Drives the responsive collapse (100r's @media sets .projects span 2 to
+	  // turn a repeat(4,1fr) grid into 2-up on narrow screens).
+		if (StrFind("span", val))
+		{
+			n = Str2I64(StrFind("span", val) + 4);
+			if (1 <= n <= 6)
+				out->grid_span = n;
+		}
+		else if (StrFind("-1", val))
+			out->grid_span = 99; // 1 / -1 : span every column
+	}
+	else if (!StrICompare(name, "justify-content") ||
+			 !StrICompare(name, "place-content") ||
+			 !StrICompare(name, "align-items") ||
+			 !StrICompare(name, "place-items") ||
+			 !StrICompare(name, "justify-items") ||
+			 !StrICompare(name, "text-align-last"))
+	{//align (inherited text centering) keeps working as before; justify-content
+	 //ADDITIONALLY records the real main-axis mode for the flex layouts
+	 //(space-between/around/evenly need distribution, not just an offset).
+		if (StrFind("center", val))
+			out->align = 1;
+		else if (StrFind("end", val) || StrFind("right", val))
+			out->align = 2;
+		else if (StrFind("start", val) || StrFind("left", val))
+			out->align = 0;
+		if (name[0] == 'j' || name[0] == 'J' ||
+			!StrICompare(name, "place-content"))
+		{
+			if (StrFind("space-between", val))
+				out->justify = 3;
+			else if (StrFind("space-around", val))
+				out->justify = 4;
+			else if (StrFind("space-evenly", val) || StrFind("evenly", val))
+				out->justify = 5;
+			else if (StrFind("center", val))
+				out->justify = 1;
+			else if (StrFind("end", val))
+				out->justify = 2;
+			else
+				out->justify = 0;
+		}
+	}
+	else if (!StrICompare(name, "content"))
+	{ // ::before/::after generated content: plain quoted strings only
+	  // (counter()/attr()/url() forms are skipped)
+		if (*val == '"' || *val == 0x27)
+		{
+			if (zcss_content_count < ZCSS_CONTENT_MAX)
+			{
+				p = val + 1;
+				n = 0;
+				while (*p && *p != val[0] && n < 46)
+				{
+					if (*p == '\\' && p[1])
+						p++; // CSS escape: keep the escaped char
+					zcss_content[zcss_content_count][n++] = *p++;
+				}
+				zcss_content[zcss_content_count][n] = 0;
+				out->content_idx = zcss_content_count;
+				zcss_content_count++;
+			}
+		}
+	}
+	else if (!StrICompare(name, "overflow") || !StrICompare(name, "overflow-y"))
+	{ // hidden/clip cull content below the box's declared height. auto/scroll
+	  // render as visible (no scrollable inner boxes).
+		if (!StrNICompare(val, "hidden", 6) || !StrNICompare(val, "clip", 4))
+			out->ovf_hide = 1;
+		else if (!StrNICompare(val, "visible", 7))
+			out->ovf_hide = 0;
+	}
+	else if (!StrICompare(name, "z-index"))
+	{
+		if (StrNICompare(val, "auto", 4)) // numeric only
+			out->zidx = ClampI64(Str2I64(val), -99, 99);
+	}
+	else if (!StrICompare(name, "transform"))
+	{//translate(x[,y]) / translateX/Y: the other half of the classic centering
+	 //idiom (left:50% + translateX(-50%)). Percent = of the element's own box,
+	 //applied post-layout as a subtree shift. rotate/scale are ignored.
+		p = StrFind("translate", val);
+		if (p)
+		{
+			p += 9; // past "translate"
+			n = 0;	// axis selector: 0 both/x-first, 1 X only, 2 Y only
+			if (*p == 'X' || *p == 'x')
+			{
+				n = 1;
+				p++;
+			}
+			else if (*p == 'Y' || *p == 'y')
+			{
+				n = 2;
+				p++;
+			}
+			if (*p == '(')
+			{
+				p++;
+				out->tf_set = 1;
+				if (n != 2)
+				{
+					out->tf_x = ZCssTfLen(p, &out->tf_xp);
+					while (*p && *p != ',' && *p != ')')
+						p++;
+				}
+				if (n == 2)
+				{
+					out->tf_y = ZCssTfLen(p, &out->tf_yp);
+				}
+				else if (*p == ',')
+				{
+					p++;
+					out->tf_y = ZCssTfLen(p, &out->tf_yp);
+				}
+			}
+		}
+	}
+	else if (!StrICompare(name, "visibility"))
+	{
+		if (!StrNICompare(val, "hidden", 6))
+			out->display = ZCSS_DISP_NONE;
+	}
+	else if (!StrICompare(name, "clip") || !StrICompare(name, "clip-path"))
+	{//The "screen-reader only" idiom (clip:rect(0 0 0 0) / clip-path:inset(50%))
+	 //visually removes an element while keeping it for a11y. We have no clip, so
+	 //treat it as hidden - otherwise these off-screen labels (e.g. DuckDuckGo's
+	 //hidden <h1>) render as big stray text.
+		if (StrFind("rect(", val) || StrFind("inset(", val) ||
+			StrFind("circle(0", val) || StrFind("polygon(", val))
+			out->display = ZCSS_DISP_NONE;
+	}
+	else if (!StrICompare(name, "opacity"))
+	{
+		if (!StrCompare(val, "0") || !StrNCompare(val, "0.0", 3))
+			out->display = ZCSS_DISP_NONE;
+	}
+	else if (!StrICompare(name, "text-transform"))
+	{ // 0 none, 1 uppercase, 2 capitalize (first letter of each word)
+		if (!StrNICompare(val, "uppercase", 9))
+			out->uppercase = 1;
+		else if (!StrNICompare(val, "capitalize", 10))
+			out->uppercase = 2;
+		else
+			out->uppercase = 0;
+	}
+	else if (!StrICompare(name, "columns") || !StrICompare(name, "column-count"))
+	{ // CSS multi-column: first integer is the column count
+		n = Str2I64(val);
+		if (val[0] && !('0' <= val[0] <= '9'))
+			n = 0; // "columns: 12em auto" width-only form: skip (no count)
+		if (1 <= n <= 6)
+			out->columns = n;
+	}
+	else if (!StrICompare(name, "filter"))
+	{ // only invert(...) is honored (dark-mode image/logo inversion)
+		if (StrFind("invert", val))
+			out->invert = 1;
+		else
+			out->invert = 0;
+	}
+	else if (!StrICompare(name, "list-style-type"))
+	{ // numbering style for the marker (only the count-format matters to us)
+		if (StrFind("decimal-leading-zero", val))
+			out->list_num = 2;
+		else if (StrFind("decimal", val))
+			out->list_num = 1;
+		else if (StrIMatch("none", val))
+			out->list_none = 1;
+		else
+			out->list_num = 0; // disc/circle/square -> bullet
+	}
+	else if (!StrICompare(name, "white-space"))
+	{
+		if (!StrNICompare(val, "pre", 3))
+			out->pre = 1;
+		else
+			out->pre = 0;
+	}
+	else if (!StrICompare(name, "list-style") ||
+			 !StrICompare(name, "list-style-type"))
+	{
+		if (StrIMatch("none", val))
+			out->list_none = 1;
+	}
+}
+

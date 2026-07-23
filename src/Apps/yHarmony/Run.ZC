@@ -1,0 +1,97 @@
+//yHarmony - native client for Harmony (Discord-style federated chat on
+//Supabase). Talks straight to the instance's Supabase APIs - GoTrue auth
+//(incl. TOTP MFA), PostgREST for data, Phoenix realtime over the native
+//WebSocket - so the Harmony backend needs zero changes.
+//
+//Needs the net stack (BrowserBoot: TCP/TLS/HTTP/WS) and the DE theme.
+//Launched from the YDE menu via Cd + ExeFile("Run").
+//
+//UI: login form (instance domain + email + password; Supabase URL and anon
+//key are auto-discovered from the instance's public /instance-info endpoint
+//and cached) -> chat. Server tabs + DMs + the Fediverse feed on
+//top, channel panel on the left, wheel/<PGUP>/<PGDN> scroll, <UP>/<DOWN>
+//input history, <ESC> quits, /config for settings.
+//
+//Realtime: WebSocket postgres_changes subscription; falls back to polling
+//when the socket dies. Settings persist to ::/Home/YHARMONY.CFG.
+//
+//Files:
+//  JSON.ZC  recursive-descent JSON parser (CYhJson tree)
+//  Data.ZC  defines, data model, globals, config load/save
+//  Img.ZC   async image cache (avatars / icons / embeds)
+//  Chat.ZC  buffers, profiles, REST, content, messages, servers/channels, DMs
+//  Feed.ZC  ActivityPub timeline (posts) + posting
+//  Auth.ZC  discovery, GoTrue login, MFA, token refresh
+//  RT.ZC    Phoenix realtime over WS
+//  UI.ZC    drawing, login flow, input, pump
+
+Cd(__DIR__);;
+
+#include "JSON"
+#include "Data"
+#include "Img"
+#include "Chat"
+#include "Feed"
+#include "Auth"
+#include "RT"
+#include "UI"
+
+public U0 YHarmony()
+{
+	I64 i, old_inhibit;
+
+	MemSet(&yh, 0, sizeof(CYhGlobals));	//Globals are NOT zeroed on load.
+	yh.last_z = mouse.pos.z;
+	yh.cur_chan = -1;
+	yh.ui_task = Fs;	//Image DCs are allocated on this heap.
+
+	yh.c_red   = ColorRGB(0xD8, 0x6A, 0x6A);
+	yh.c_green = ColorRGB(0x5E, 0xC8, 0x7A);
+	for (i = 0; i < 16; i++)
+		yh.c_nick[i] = DEHue2RGB(i * 360 / 16, 170, 210 + (i & 1) * 35);
+
+	StrCopy(yh.f_host, "har.mony.lol");	//Flagship default; config overrides.
+	YhConfigLoad;	//f_url/f_anon stay empty until discovery caches them.
+
+	SettingsPush;
+	old_inhibit = Fs->win_inhibit;
+	StrCopy(Fs->task_title, "yHarmony");
+	//Big window: 140x62 cells on the 160x90 (1280x720) screen.
+	WinHorz(MaxI64(1, (TEXT_COLS - 140) / 2), MaxI64(1, (TEXT_COLS - 140) / 2) + 139);
+	WinVert(MaxI64(2, (TEXT_ROWS - 62) / 2), MaxI64(2, (TEXT_ROWS - 62) / 2) + 61);
+	//L/R-DOWN must deliver instantly (skip the double-click timeout).
+	Fs->win_inhibit = old_inhibit | WIF_FOCUS_TASK_MS_L_D | WIF_FOCUS_TASK_MS_R_D;
+	WinFocus;
+	DocCursor(OFF);
+	DocClear;
+	Fs->draw_it = &YhDrawIt;
+
+	if (yh.f_autoconn && yh.f_email[0] && yh.f_pass[0] &&
+		(yh.f_host[0] || (yh.f_url[0] && yh.f_anon[0])))
+		YhLogin;
+
+	while (!yh.quit)
+	{
+		YhPoll;
+		if (yh.state == YH_ST_CHAT)
+			YhNetPump;
+		Sleep(30);
+	}
+
+	YhWsShutdown;
+	if (yh.img_task && TaskValidate(yh.img_task))
+		Kill(yh.img_task);
+	yh.img_task = NULL;
+	Fs->draw_it = NULL;
+	Fs->win_inhibit = old_inhibit;
+	for (i = 0; i < yh.num_chans; i++)
+		Free(yh.chans[i].lines);
+	for (i = 0; i < yh.img_count; i++)
+		if (yh.imgs[i].state == 2 && yh.imgs[i].dc)
+			DCDel(yh.imgs[i].dc);
+	DocCursor(ON);
+	DocClear;
+	SettingsPop;
+}
+
+YHarmony;

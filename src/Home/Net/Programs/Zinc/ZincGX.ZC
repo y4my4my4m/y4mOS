@@ -61,6 +61,13 @@ class CGxOp
 	U8				*img_url;	//GXO_IMG: absolute URL (MAlloc'ed).
 	I64				 radius;	//GXO_WIDGET: border-radius px (-1 = unset).
 	Bool			 bold, ul, has_bg;
+	I16				 bg_px, bg_py, bg_sw, bg_sh;	//GXO_BOX: CSS background-position/size (CSS.ZC encoding).
+	I8				 bg_rep;						//GXO_BOX: background-repeat (-1 unset / 0 repeat / 1 no-repeat / 2 x / 3 y).
+	I16				 grad;							//GXO_BOX: CSS linear-gradient index (-1 = none).
+	I32				 sh_col;						//GXO_BOX: box-shadow color 0xRRGGBB (-1 = none).
+	I16				 sh_dx, sh_dy, sh_blur;			//GXO_BOX: box-shadow offset/blur px.
+	I16				 z;								//z-index paint bucket: 0 flow, >0 late (on top).
+	Bool			 pinned;						//position:fixed - ignores scroll.
 };
 
 //Decoded-image cache, keyed by absolute URL. Persists across relayout so we
@@ -113,6 +120,15 @@ class CGxGlobals
 	//offsets (top/left/right) resolve against this, not the page edge.
 	//cb_h: CB height for percent top offsets; 0 = unknown (no explicit height).
 	I64		 cb_x, cb_y, cb_w, cb_h;
+	I64		 anc_h;			//nearest ancestor's resolved height (percent-height base)
+	//flex-column stretch: width a stretched flex item should fill. L2FlexCol sets
+	//it around each child; GxWidget consumes it so buttons/inputs fill the column
+	//(the default flex behavior every modern menu relies on). 0 = inactive.
+	I64		 flex_stretch_w;
+	//Text selection: drag anchor/end in DOC coordinates. On release the selected
+	//run text goes to the OS clipboard (sys_clip_doc) - paste anywhere with Ctrl-V.
+	Bool	 sel_drag, sel_on;
+	I64		 sel_x0, sel_y0, sel_x1, sel_y1;
 	//Current visual background RGB under the cursor (-1 none): the nearest
 	//ancestor box's bg, so scalable-font text anti-aliases against the RIGHT
 	//color (background is not inherited, so run styles rarely carry it).
@@ -245,6 +261,11 @@ CDC *GxImgViewDecode(U8 *buf, I64 len)
 		dc = PNGReadBuf(buf, len, 255, sys_task);
 	else if (buf[0] == 0xFF && buf[1] == 0xD8)
 		dc = JPGReadBuf(buf, len, sys_task);
+	else if (buf[0] == 'G' && buf[1] == 'I' && buf[2] == 'F')
+		dc = GIFReadBuf(buf, len, sys_task);
+	else if (len > 12 && !MemCompare(buf, "RIFF", 4) &&
+			 !MemCompare(buf + 8, "WEBP", 4))
+		dc = WEBPReadBuf(buf, len, sys_task);
 	else
 	{
 		while (*b0 == ' ' || *b0 == '\n' || *b0 == '\r' || *b0 == '\t')
@@ -322,14 +343,28 @@ CGxOp *GxOpAdd(I64 type, I64 x, I64 y, I64 w, I64 h)
 	op->type = type;
 	op->x = x;	op->y = y;
 	op->w = w;	op->h = h;
+	op->grad = -1; // gradient: none unless the box emit sets it (0 is a valid index)
+	op->sh_col = -1; // box-shadow: none unless the box emit sets it (0 is valid black)
 	return op;
 }
 
 //--- Layout ------------------------------------------------------------------
+// While measuring intrinsic content width (V3Measure/L2Measure) we must NOT
+// center/right-align: alignment shifts ops toward the middle/right of the
+// scratch width, so maxx came back as ~half the container and centered flex
+// items measured ~2x too wide (100r's .nav_link stacked 1 per row).
+public Bool zinc_no_align = FALSE;
+
 U0 GxLineAlign()
 {//Close the current line: shift its ops for text-align center/right.
 	I64 i, right = 0, shift;
 
+	if (zinc_no_align)
+	{
+		gx.line_start_op = gx.op_count;
+		gx.line_align = 0;
+		return;
+	}
 	if (gx.line_align > 0 && gx.op_count > gx.line_start_op)
 	{
 		for (i = gx.line_start_op; i < gx.op_count; i++)
@@ -390,6 +425,7 @@ U0 GxRunFlush()
 			if (op)
 			{
 				op->sc	 = fdc;		//owned; freed on reset (type != GXO_IMG)
+				op->text = StrNew(gx.run); //kept for selection/clipboard copy
 				op->fg	 = GxPen(gx.run_style.fg, gx.text_pen);
 				op->ul	 = gx.run_style.underline == 1 ||
 						   (gx.run_link && gx.run_style.underline != 0);
@@ -448,37 +484,134 @@ U0 GxRunFlush()
 	gx.run_len = 0;
 }
 
+// ---- CSS floats ----
+// Active float regions. Content reflows around them: GxNewline/GxWord narrow the
+// line to [line-left..line-right] using gx_float_lx/rx, recomputed per line from
+// the floats overlapping the current y. When gx_float_n==0 the insets stay at
+// their neutral values, so non-float pages lay out exactly as before.
+#define GX_FLOATS	16
+
+class CGxFloatRgn
+{
+	I64	side;		// 0 left, 1 right
+	I64	x0, x1;		// absolute x span
+	I64	top, bot;	// absolute y span
+};
+
+CGxFloatRgn	gx_floats[GX_FLOATS];
+I64			gx_float_n	= 0;
+I64			gx_float_lx	= 0;			// active left-float right edge (0 = none)
+I64			gx_float_rx	= 0x40000000;	// active right-float left edge (huge = none)
+
+U0 GxFloatReset()
+{ // called at the start of each layout
+	gx_float_n	= 0;
+	gx_float_lx	= 0;
+	gx_float_rx	= 0x40000000;
+}
+
+U0 GxFloatRecompute(I64 y)
+{ // set the left/right float insets for content at vertical position y
+	I64 i, lx = 0, rx = 0x40000000;
+
+	for (i = 0; i < gx_float_n; i++)
+		if (gx_floats[i].top <= y < gx_floats[i].bot)
+		{
+			if (gx_floats[i].side == 0)
+			{
+				if (gx_floats[i].x1 > lx)
+					lx = gx_floats[i].x1;
+			}
+			else if (gx_floats[i].x0 < rx)
+				rx = gx_floats[i].x0;
+		}
+	gx_float_lx = lx;
+	gx_float_rx = rx;
+}
+
+U0 GxFloatAdd(I64 side, I64 x0, I64 x1, I64 top, I64 bot)
+{
+	if (gx_float_n < GX_FLOATS)
+	{
+		gx_floats[gx_float_n].side = side;
+		gx_floats[gx_float_n].x0	 = x0;
+		gx_floats[gx_float_n].x1	 = x1;
+		gx_floats[gx_float_n].top	 = top;
+		gx_floats[gx_float_n].bot	 = bot;
+		gx_float_n++;
+	}
+}
+
+I64 GxFloatBottom(I64 side)
+{ // lowest bottom among active floats of a side (side < 0 = any). For clear.
+	I64 i, b = 0;
+
+	for (i = 0; i < gx_float_n; i++)
+		if (side < 0 || gx_floats[i].side == side)
+			if (gx_floats[i].bot > b)
+				b = gx_floats[i].bot;
+
+	return b;
+}
+
+public Bool zinc_floats  = TRUE; //Floats(FALSE) disables CSS float layout (bisect tool).
+public Bool zinc_shadows = TRUE; //Shadows(FALSE) disables box-shadow rendering.
+
+public U0 Floats(Bool on)
+{//Runtime toggle for CSS float layout. Reload the page to re-lay.
+	zinc_floats = on;
+}
+
+public U0 Shadows(Bool on)
+{//Runtime toggle for box-shadow rendering. Takes effect next frame.
+	zinc_shadows = on;
+}
+
 U0 GxNewline(I64 extra)
 {
 	GxRunFlush;
 	GxLineAlign;
-	gx.x = GX_MARGIN + gx.indent;
 	gx.y += gx.line_h + extra;
 	gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+	gx.x = GX_MARGIN + gx.indent;
+	if (gx_float_n)
+	{ // wrap the new line past any left float that spans this y
+		GxFloatRecompute(gx.y);
+		if (gx_float_lx > gx.x)
+			gx.x = gx_float_lx;
+	}
 }
 
 U0 GxWord(U8 *word, I64 len, CZStyle *style, I64 scale)
 {//Place one word, wrapping as needed, merging into the current run.
-	I64 cw, need, px = 0, i, glyph_h, lh;
+	I64 cw, need, px = 0, i, glyph_h, lh, rw, lstart;
 
 	if (len <= 0)
 		return;
+	lstart = GX_MARGIN + gx.indent;
+	rw	   = gx.wrap_w;
+	if (gx_float_n)
+	{ // narrow the line to the space left/right of active floats
+		if (gx_float_lx > lstart)
+			lstart = gx_float_lx;
+		if (gx_float_rx < rw)
+			rw = gx_float_rx;
+	}
 	if (zinc_ttf)
 	{//advance widths from the chosen font's own metrics (mono vs proportional)
 		CGrFont *wf = GrFontPick(style->mono == 1);
 		px	 = GxFontPx(style);
-		need = 0;
-		for (i = 0; i < len; i++)
-			need += GrFontAdvPx(wf, word[i], px);
-		cw = GrFontAdvPx(wf, ' ', px);
+		need = GrFontRunW(wf, px, word, len); //UTF-8 aware (CJK counts as 1)
+		cw	 = GrFontAdvPx(wf, ' ', px);
 	}
 	else
 	{
 		cw	 = FONT_WIDTH * scale;
 		need = len * cw;
 	}
-	//First content on a fresh line decides that line's text-align.
-	if (gx.x <= GX_MARGIN + gx.indent && style->align > 0)
+	//First content on a fresh line decides that line's text-align (never while
+	//measuring intrinsic width - see zinc_no_align).
+	if (!zinc_no_align && gx.x <= lstart && style->align > 0)
 		gx.line_align = style->align;
 	//Style/link/scale change or wrap breaks the run.
 	if (gx.run_len &&
@@ -486,7 +619,7 @@ U0 GxWord(U8 *word, I64 len, CZStyle *style, I64 scale)
 		 MemCompare(&gx.run_style, style, sizeof(CZStyle))))
 		GxRunFlush;
 
-	if (gx.x + need > gx.wrap_w && gx.x > GX_MARGIN + gx.indent)
+	if (gx.x + need > rw && gx.x > lstart)
 	{
 		GxRunFlush;
 		GxNewline(0);
@@ -509,6 +642,17 @@ U0 GxWord(U8 *word, I64 len, CZStyle *style, I64 scale)
 		gx.run_y = gx.y;
 	}
 	MemCopy(&gx.run[gx.run_len], word, len);
+	if (style->uppercase == 1)
+	{ // text-transform:uppercase - ASCII a-z (leaves UTF-8/CJK bytes alone)
+		for (i = 0; i < len; i++)
+			if ('a' <= gx.run[gx.run_len + i] <= 'z')
+				gx.run[gx.run_len + i] -= 32;
+	}
+	else if (style->uppercase == 2)
+	{ // text-transform:capitalize - first letter of this word
+		if ('a' <= gx.run[gx.run_len] <= 'z')
+			gx.run[gx.run_len] -= 32;
+	}
 	gx.run_len += len;
 	gx.run[gx.run_len++] = ' ';
 	gx.x += need + cw;
@@ -628,6 +772,8 @@ U0 GxWidget(CZNode *node, I64 kind)
 		w = MaxI64(60, StrLen(label) * FONT_WIDTH + 16);
 		if (kind == GXW_AREA)
 			h = 40;
+		if (gx.flex_stretch_w > w)
+			w = gx.flex_stretch_w; // stretched flex-column item: fill the column
 	}
 	if (gx.x + w > gx.wrap_w)
 		GxNewline(0);
@@ -637,8 +783,19 @@ U0 GxWidget(CZNode *node, I64 kind)
 		op->node  = node;
 		op->wkind = kind;
 		op->text  = StrNew(label);
-		ZCssApply(node, &wa); // honor the page's border-radius (no default pill)
+		ZCssApply(node, &wa); // honor the page's own widget styling
 		op->radius = wa.radius;
+		if (wa.bg >= 0)
+		{ // author background wins over the light UA default
+			op->has_bg = TRUE;
+			op->fg = GxPenBg(wa.bg, de_theme.win_bg);
+		}
+		if (wa.border >= 0)
+			op->bg = GxPenBg(wa.border, de_theme.panel_edge);
+		else
+			op->bg = ColorRGB(0xC8, 0xCC, 0xD0); // UA border
+		op->sh_col = wa.fg; // widget TEXT color rides in sh_col (-1 = UA default;
+							// GXO_WIDGET has no box-shadow, the slot is free)
 	}
 	gx.x += w + FONT_WIDTH;
 	if (h + GX_LINE_LEAD > gx.line_h)
@@ -957,7 +1114,10 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 			if (op)
 			{
 				op->img_url = abs; //Owned by op; freed on reset.
-				op->fg = de_theme.panel;
+				// light placeholder: unloaded/failed images (e.g. Google's SVG icon
+				// buttons we can't fetch) were dark-navy de_theme.panel = looked like
+				// solid dark pills on a light page. Web pages expect a light canvas.
+				op->fg = ColorRGB(0xE8, 0xE8, 0xEA);
 			}
 			else
 				Free(abs);
@@ -969,7 +1129,7 @@ U0 GxNode(CZNode *node, CZStyle *inherited)
 		attr = ZNodeAttr(node, "alt");
 		op = GxOpAdd(GXO_RECT, gx.x, gx.y, 60, 16);
 		if (op)
-			op->fg = de_theme.panel;
+			op->fg = ColorRGB(0xE8, 0xE8, 0xEA); // light broken-image box (was dark navy)
 		if (attr && *attr)
 			GxText(attr, &style, 1, FALSE);
 		else
@@ -1501,8 +1661,18 @@ U0 GxPageStyle()
 			gx.page_fg = a.fg;
 	}
 	el = GxFindTag(zinc_dom, "body");
+	zcss_body_class[0] = 0; // capture the <body> class for body.page_X-scoped CSS
 	if (el)
 	{
+		attr = ZNodeAttr(el, "class");
+		if (attr)
+		{
+			c = StrLen(attr);
+			if (c > 255)
+				c = 255;
+			MemCopy(zcss_body_class, attr, c);
+			zcss_body_class[c] = 0; // c is reassigned before its next use below
+		}
 		ZCssApply(el, &a);
 		if (a.bg >= 0)
 			gx.page_bg = a.bg;
@@ -1527,23 +1697,229 @@ U0 GxPageStyle()
 			//bgcolor pages paint the page that way).
 			gx.page_bg = GxBgProbe(el, 0);
 	}
-	gx.page_has_bg = gx.page_bg >= 0;
-	if (gx.page_has_bg)
-	{
-		if (gx.page_fg >= 0)
-			gx.text_pen = GxPenBg(gx.page_fg, de_theme.text);
-		else
-			gx.text_pen = ColorRGB(0, 0, 0); //CSS default: black text.
-	}
-	else if (gx.page_fg >= 0)
-		gx.text_pen = GxPen(gx.page_fg, de_theme.text);
+	// UA default: white page + black text (like every real browser). Pages that
+	// WANT dark set their own body bg (the vercel game etc, still honored). The
+	// old dark de_theme fallback made every plain/undetected-bg site look broken.
+	if (gx.page_bg < 0)
+		gx.page_bg = 0xFFFFFF;
+	gx.page_has_bg = TRUE;
+	if (gx.page_fg >= 0)
+		gx.text_pen = GxPenBg(gx.page_fg, ColorRGB(0, 0, 0));
 	else
-		gx.text_pen = de_theme.text;
+		gx.text_pen = ColorRGB(0, 0, 0);
 }
 
 //Layout v2: box-model engine (flex, position, 4-side box) built on the v1
 //inline flow above. Provides L2Node + the zinc_layout2/Layout2() toggle.
-#include "Zinc/Layout"
+#include "Layout"
+//Layout v3: UNIFIED engine (one dispatch + one box model, no v1<->v2 seam).
+//Selected via zinc_v3 (Layout3() / the ZincV3 entry).
+#include "LayoutV3"
+
+CDC *GxBgSpriteDC(CDC *src, I64 bw, I64 bh, I64 e_px, I64 e_py, I64 e_sw, I64 e_sh, I64 rep)
+{//Build a bw x bh DC showing the CSS-background image positioned / sized /
+//cropped / tiled per the encoded params (CSS.ZC encodings). Gaps stay
+//TRANSPARENT (no-repeat). Owned by caller (sys_task). This is what makes CSS
+//sprite atlases (4chan flags etc) crop one sub-rect via background-position.
+	CDC *dst;
+	I64  iw, ih, ox = 0, oy = 0, dx, dy, sx, sy, srcx, srcy, rw, rh;
+	I64  sw = src->width, sh = src->height, swi = src->width_internal;
+	U32 *sb = src->body, *db;
+
+	//--- rendered image size (background-size) ---
+	iw = sw;
+	ih = sh;
+	if (e_sw == -200 || e_sh == -200 || e_sw == -201 || e_sh == -201)
+	{//cover (fill box, max ratio) / contain (fit box, min ratio); aspect kept
+		rw = bw * 1000 / sw;
+		rh = bh * 1000 / sh;
+		if (e_sw == -200 || e_sh == -200)
+		{
+			if (rh > rw)
+				rw = rh;
+		}
+		else if (rh < rw)
+			rw = rh;
+		iw = sw * rw / 1000;
+		ih = sh * rw / 1000;
+	}
+	else
+	{
+		if (e_sw > 0)
+			iw = e_sw;
+		else if (-100 <= e_sw < 0)
+			iw = bw * -e_sw / 100;
+		if (e_sh > 0)
+			ih = e_sh;
+		else if (-100 <= e_sh < 0)
+			ih = bh * -e_sh / 100;
+		if (e_sw != 0 && e_sh == 0)
+			ih = sh * iw / sw;	// one axis set, other auto: keep aspect
+		else if (e_sh != 0 && e_sw == 0)
+			iw = sw * ih / sh;
+	}
+	if (iw < 1)
+		iw = 1;
+	if (ih < 1)
+		ih = 1;
+
+	//--- position (background-position); percent = (box - image)*pct/100 ---
+	if (e_px != ZCSS_OFF_UNSET)
+	{
+		if (e_px <= -2000)
+			ox = (bw - iw) * (-(e_px) - 2000) / 100;
+		else
+			ox = e_px;
+	}
+	if (e_py != ZCSS_OFF_UNSET)
+	{
+		if (e_py <= -2000)
+			oy = (bh - ih) * (-(e_py) - 2000) / 100;
+		else
+			oy = e_py;
+	}
+
+	dst = DCNew(bw, bh, sys_task);
+	DCFill(dst, TRANSPARENT);
+	for (dy = 0; dy < bh; dy++)
+	{
+		db = dst->body + dy * dst->width_internal;
+		for (dx = 0; dx < bw; dx++)
+		{
+			sx = dx - ox;
+			sy = dy - oy;
+			if (rep == 1)
+			{//no-repeat: outside the placed image = transparent gap
+				if (sx < 0 || sx >= iw || sy < 0 || sy >= ih)
+					goto gx_sprite_skip;
+			}
+			else if (rep == 2)
+			{//repeat-x: tile horizontally, gap vertically
+				if (sy < 0 || sy >= ih)
+					goto gx_sprite_skip;
+				sx = ((sx % iw) + iw) % iw;
+			}
+			else if (rep == 3)
+			{//repeat-y: tile vertically, gap horizontally
+				if (sx < 0 || sx >= iw)
+					goto gx_sprite_skip;
+				sy = ((sy % ih) + ih) % ih;
+			}
+			else
+			{//repeat (default): tile both
+				sx = ((sx % iw) + iw) % iw;
+				sy = ((sy % ih) + ih) % ih;
+			}
+			srcx = sx * sw / iw;
+			srcy = sy * sh / ih;
+			if (srcx < 0)
+				srcx = 0;
+			if (srcy < 0)
+				srcy = 0;
+			if (srcx >= sw)
+				srcx = sw - 1;
+			if (srcy >= sh)
+				srcy = sh - 1;
+			db[dx] = sb[srcy * swi + srcx];
+gx_sprite_skip:;
+		}
+	}
+
+	return dst;
+}
+
+public Bool zinc_gradients = TRUE; //Gradients(FALSE) disables CSS gradient rendering (debug/perf).
+
+public U0 Gradients(Bool on)
+{//Runtime toggle for CSS linear-gradient backgrounds. Reload the page to re-render.
+//Use Gradients(OFF); in a terminal to bisect a gradient-related hang/slowness.
+	zinc_gradients = on;
+}
+
+CDC *GxGradientDC(I64 gi, I64 bw, I64 bh)
+{//Render zcss_grad[gi] into a bw x bh DC (owned, sys_task): a linear gradient
+//along the CSS angle, colours interpolated between the stops.
+	CDC		*dst;
+	CZGrad	*g = &zcss_grad[gi];
+	F64		 ar, dxf, dyf, proj, pmin, pmax, span, c00, c10, c01, c11;
+	I64		 dx, dy, i, k, ns, tpct, p0, p1, col0, col1, rr, gg, bb, f;
+	I64		 sp[ZCSS_GRAD_STOPS];
+	U32		*db;
+
+	ns = g->nstops;
+	if (ns < 2)
+		return NULL;
+	for (i = 0; i < ns; i++)
+	{ // resolve stop positions; auto-distribute the unset ones across 0..100
+		if (g->pos[i] >= 0)
+			sp[i] = g->pos[i];
+		else
+			sp[i] = i * 100 / (ns - 1);
+	}
+	for (i = 1; i < ns; i++)
+		if (sp[i] < sp[i - 1])
+			sp[i] = sp[i - 1];
+
+	ar	= g->angle * pi / 180.0;
+	dxf	= Sin(ar);
+	dyf	= -Cos(ar);
+	c00	= 0;
+	c10	= bw * dxf;
+	c01	= bh * dyf;
+	c11	= bw * dxf + bh * dyf;
+	pmin = c00;
+	pmax = c00;
+	if (c10 < pmin) pmin = c10;
+	if (c10 > pmax) pmax = c10;
+	if (c01 < pmin) pmin = c01;
+	if (c01 > pmax) pmax = c01;
+	if (c11 < pmin) pmin = c11;
+	if (c11 > pmax) pmax = c11;
+	span = pmax - pmin;
+	if (span < 1.0)
+		span = 1.0;
+
+	dst = DCNew(bw, bh, sys_task);
+	if (!dst)
+		return NULL;
+	dst->flags |= DCF_NO_TRANSPARENTS;
+	for (dy = 0; dy < bh; dy++)
+	{
+		if (!(dy & 63))
+			Yield; //Big gradients: yield so the layout core never starves the UI.
+		db = dst->body + dy * dst->width_internal;
+		for (dx = 0; dx < bw; dx++)
+		{
+			proj = dx * dxf + dy * dyf;
+			tpct = ToI64((proj - pmin) * 100.0 / span);
+			if (tpct < 0)
+				tpct = 0;
+			if (tpct > 100)
+				tpct = 100;
+			k = 0;
+			while (k < ns - 2 && sp[k + 1] < tpct)
+				k++;
+			p0	 = sp[k];
+			p1	 = sp[k + 1];
+			col0 = g->col[k];
+			col1 = g->col[k + 1];
+			if (p1 <= p0)
+				f = 0;
+			else
+				f = (tpct - p0) * 256 / (p1 - p0);
+			if (f < 0)
+				f = 0;
+			if (f > 256)
+				f = 256;
+			rr = ((col0 >> 16 & 0xFF) * (256 - f) + (col1 >> 16 & 0xFF) * f) / 256;
+			gg = ((col0 >> 8  & 0xFF) * (256 - f) + (col1 >> 8  & 0xFF) * f) / 256;
+			bb = ((col0       & 0xFF) * (256 - f) + (col1       & 0xFF) * f) / 256;
+			db[dx] = rr << 16 | gg << 8 | bb;
+		}
+	}
+
+	return dst;
+}
 
 U0 GxBgImgAttach()
 {//Post-layout: give every CSS-background box its picture. Box heights are
@@ -1557,19 +1933,35 @@ U0 GxBgImgAttach()
 	for (i = 0; i < gx.op_count; i++)
 	{
 		op = &gx.ops[i];
-		if (op->type != GXO_BOX || !op->img_url || op->sc)
+		if (op->type != GXO_BOX || op->sc)
 			goto gx_bg_next;
-		ce = GxImgGet(op->img_url);
-		if (ce && !ce->fetched && !StrNICompare(op->img_url, "data:", 5))
-		{//Inline data: URI backgrounds decode right here, no network.
-			ce->fetched = TRUE;
-			ce->dc = DataURIToDC(op->img_url, sys_task);
-		}
-		if (ce && ce->dc && op->w > 2 && op->h > 2)
+		if (op->img_url)
 		{
+			ce = GxImgGet(op->img_url);
+			if (ce && !ce->fetched && !StrNICompare(op->img_url, "data:", 5))
+			{//Inline data: URI backgrounds decode right here, no network.
+				ce->fetched = TRUE;
+				ce->dc = DataURIToDC(op->img_url, sys_task);
+			}
+			if (ce && ce->dc && op->w > 2 && op->h > 2)
+			{
+				bw = MinI64(op->w, 1024);
+				bh = MinI64(op->h, 1024);
+				if (op->bg_px != ZCSS_OFF_UNSET || op->bg_py != ZCSS_OFF_UNSET ||
+					op->bg_sw != 0 || op->bg_sh != 0 || op->bg_rep >= 1)
+					//Sprite/positioned/sized/repeat-x/y/no-repeat: crop a sub-rect.
+					op->sc = GxBgSpriteDC(ce->dc, bw, bh, op->bg_px, op->bg_py,
+										  op->bg_sw, op->bg_sh, op->bg_rep);
+				else
+					//Plain background image: keep the stretch-to-box default.
+					op->sc = DEDCScaleNew(ce->dc, bw, bh, sys_task);
+			}
+		}
+		else if (zinc_gradients && op->grad >= 0 && op->grad < zcss_grad_count && op->w > 2 && op->h > 2)
+		{//CSS linear-gradient background.
 			bw = MinI64(op->w, 1024);
 			bh = MinI64(op->h, 1024);
-			op->sc = DEDCScaleNew(ce->dc, bw, bh, sys_task);
+			op->sc = GxGradientDC(op->grad, bw, bh);
 		}
 gx_bg_next:;
 	}
@@ -1631,12 +2023,18 @@ U0 GxLayout()
 
 	gx.busy = TRUE;
 	GxOpsReset;
+	GxFloatReset;
 	GxPageStyle;
+	// viewport units (vw/vh/vmin/vmax in CSS.ZC) resolve against the real window
+	zcss_view_w = MaxI64(320, Fs->pix_width - GX_SBAR_W);
+	zcss_view_h = MaxI64(240, Fs->pix_height - GX_CHROME_H - GX_STATUS_H);
+	gx.anc_h = zcss_view_h; // html/body height:100% chain resolves to the viewport
 	gx.wrap_w = Fs->pix_width - GX_SBAR_W - GX_MARGIN;
 	gx.last_w = Fs->pix_width;
 	gx.x = GX_MARGIN;
 	gx.y = 8;
 	gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+	gx.flex_stretch_w = 0;
 	gx.link_depth = 0;
 	gx.indent = 0;
 	gx.list_sp = 0;
@@ -1655,7 +2053,14 @@ U0 GxLayout()
 	root.fsize = 16;
 	if (zinc_dom)
 	{
-		if (zinc_layout2)
+		if (zinc_v3)
+		{ // unified v3 engine; depth counters re-zeroed (a caught fault mid-
+		  // layout would otherwise leave them stuck above the caps)
+			v3_depth = 0;
+			v3_meas_depth = 0;
+			V3Node(zinc_dom, &root);
+		}
+		else if (zinc_layout2)
 			L2Node(zinc_dom, &root);
 		else
 			GxNode(zinc_dom, &root);
@@ -1810,9 +2215,116 @@ U0 GxRoundRect(CDC *dc, I64 x, I64 y, I64 w, I64 h, I64 r, U32 fill, U32 border)
 		GxRoundFill(dc, x + 1, y + 1, w - 2, h - 2, r - 1, fill);
 }
 
+Bool GxOpSelRange(CGxOp *op, I64 *c0, I64 *c1)
+{ // CHARACTER-granular selection, like a real browser. Returns the selected
+  // char span [c0,c1) of this text op: whole runs on middle lines, partial by
+  // x on the anchor/end lines (char width = run width / run length; exact for
+  // the 8x8 font, proportional approximation for TTF runs).
+	I64 x0, y0, x1, y1, t, len, cw;
+
+	*c0 = 0;
+	*c1 = 0;
+	if (!gx.sel_on || op->type != GXO_TEXT || !op->text)
+		return FALSE;
+	len = StrLen(op->text);
+	if (!len)
+		return FALSE;
+	x0 = gx.sel_x0;
+	y0 = gx.sel_y0;
+	x1 = gx.sel_x1;
+	y1 = gx.sel_y1;
+	if (y1 < y0)
+	{ // normalize: anchor above end
+		t = y0; y0 = y1; y1 = t;
+		t = x0; x0 = x1; x1 = t;
+	}
+	else if (y1 - y0 < FONT_HEIGHT && x1 < x0)
+	{ // single line, dragged right-to-left
+		t = x0; x0 = x1; x1 = t;
+	}
+	if (op->y + op->h <= y0 || op->y > y1)
+		return FALSE;
+	cw = MaxI64(1, op->w / len);
+	*c0 = 0;
+	*c1 = len;
+	if (y0 >= op->y && y0 < op->y + op->h)
+		*c0 = ClampI64((x0 - op->x + cw / 2) / cw, 0, len); // anchor line
+	if (y1 >= op->y && y1 < op->y + op->h)
+		*c1 = ClampI64((x1 - op->x + cw / 2) / cw, 0, len); // end line
+	return *c1 > *c0;
+}
+
+U0 GxSelCopy()
+{ // put the selected text on the OS clipboard (sys_clip_doc): reuses the stock
+  // DolDoc clip, so Ctrl-V pastes it in any editor/terminal in the system.
+	U8	*buf;
+	I64	 i, n = 0, last_y = I64_MIN, c0, c1, k;
+	U8	*s;
+
+	buf = MAlloc(8192);
+	for (i = 0; i < gx.op_count && n < 8000; i++)
+	{
+		if (!GxOpSelRange(&gx.ops[i], &c0, &c1))
+			goto gx_selcopy_next;
+		if (last_y != I64_MIN && gx.ops[i].y >= last_y + FONT_HEIGHT)
+			buf[n++] = '\n'; // new layout line -> newline
+		else if (last_y != I64_MIN)
+			buf[n++] = ' ';	 // same line, separate run
+		s = gx.ops[i].text;
+		for (k = c0; k < c1 && s[k] && n < 7996; k++)
+		{
+			if (s[k] == 0x24)
+				buf[n++] = 0x24; // literal dollars must be DOUBLED for DolDoc
+			buf[n++] = s[k];
+		}
+		last_y = gx.ops[i].y;
+gx_selcopy_next:;
+	}
+	buf[n] = 0;
+	if (n)
+	{
+		ClipDel;
+		DocPrint(sys_clip_doc, "%s", buf);
+		StrCopy(zinc_note, "selection copied to clipboard (Ctrl-V to paste)");
+	}
+	Free(buf);
+}
+
+I64 GxClipTextGet(U8 *out, I64 max)
+{ // plain text from the OS clipboard (sys_clip_doc): text entry tags + newlines.
+  // This is what makes Ctrl-V in the browser paste text copied ANYWHERE in the OS.
+	CDocEntry *e;
+	U8		  *s;
+	I64		   n = 0;
+	Bool	   unlock = DocLock(sys_clip_doc);
+
+	e = sys_clip_doc->head.next;
+	while (e != sys_clip_doc && n < max - 2)
+	{
+		if (e->type_u8 == DOCT_TEXT && e->tag)
+		{
+			s = e->tag;
+			while (*s && n < max - 2)
+			{
+				if (*s == 0x24 && s[1] == 0x24)
+					s++; // doubled dollar -> one literal
+				out[n++] = *s++;
+			}
+		}
+		else if (e->type_u8 == DOCT_NEW_LINE || e->type_u8 == DOCT_SOFT_NEW_LINE)
+			out[n++] = '\n';
+		e = e->next;
+	}
+	out[n] = 0;
+	if (unlock)
+		DocUnlock(sys_clip_doc);
+	return n;
+}
+
 U0 GxDrawIt(CTask *task, CDC *dc)
 {
-	I64	 i, oy, view_top = GX_CHROME_H, mx, my, wr;
+	I64	 i, oy, view_top = GX_CHROME_H, mx, my, wr, zpass;
+	I64	 selc0, selc1, selcw, selx, selw;
 	I64	 view_h = task->pix_height - GX_CHROME_H - GX_STATUS_H, th, ty;
 	CGxOp *op;
 	U8	*hover = NULL;
@@ -1833,10 +2345,18 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 		return;
 	}
 
+	for (zpass = 0; zpass < 2; zpass++)
 	for (i = 0; i < gx.op_count; i++)
-	{
+	{ // two z buckets: flow content first, then z-index>0 late (on top)
 		op = &gx.ops[i];
-		oy = op->y - gx.scroll + view_top;
+		if (zpass == 0 && op->z > 0)
+			goto gx_draw_next;
+		if (zpass == 1 && op->z <= 0)
+			goto gx_draw_next;
+		if (op->pinned)
+			oy = op->y + view_top; // position:fixed - viewport-pinned
+		else
+			oy = op->y - gx.scroll + view_top;
 		if (oy + op->h < view_top || oy > view_top + view_h)
 			goto gx_draw_next;
 		switch (op->type)
@@ -1846,12 +2366,24 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 				GrRect(dc, op->x, oy, op->w, op->h);
 				break;
 			case GXO_BOX:
+				if (zinc_shadows && op->sh_col >= 0)
+				{//box-shadow: one offset rect behind the box (cheap, drawn per frame
+				//so NO per-pixel blur loop - a soft blur would be a pre-rendered DC).
+					dc->color = ColorRGB(op->sh_col >> 16 & 0xFF,
+										 op->sh_col >> 8 & 0xFF, op->sh_col & 0xFF);
+					GrRect(dc, op->x + op->sh_dx - op->sh_blur,
+						   oy + op->sh_dy - op->sh_blur,
+						   op->w + op->sh_blur * 2, op->h + op->sh_blur * 2);
+				}
 				if (op->wkind > 0)
 				{//Rounded box (wkind carries the border-radius for GXO_BOX).
 					if (gx.page_has_bg)
 						dc->color = GxPenBg(gx.page_bg, de_theme.win_bg);
 					else
-						dc->color = de_theme.win_bg;
+						dc->color = ColorRGB(0xFF, 0xFF, 0xFF); // border-only rounded
+						// boxes fill their interior to form the corners; when the page
+						// bg wasn't detected assume a WHITE canvas (web default) - was
+						// dark-navy de_theme.win_bg = Google's search pills went dark.
 					wr = dc->color; //fill for border-only rounded boxes
 					if (op->has_bg && op->ul)
 						GxRoundRect(dc, op->x, oy, op->w, op->h, op->wkind,
@@ -1888,6 +2420,17 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 						oy <= my < oy + op->h)
 						hover = op->href;
 					GrBlot(dc, op->x, oy, op->sc);
+					if (GxOpSelRange(op, &selc0, &selc1))
+					{//selection tint OVER the selected chars: alternate scanlines
+					 //(the run DC is opaque - stripes read as a translucent
+					 //highlight while the glyphs stay visible between them)
+						selcw = MaxI64(1, op->w / MaxI64(1, StrLen(op->text)));
+						selx = op->x + selc0 * selcw;
+						selw = (selc1 - selc0) * selcw;
+						dc->color = de_theme.accent;
+						for (wr = 0; wr < op->h; wr += 2)
+							GrRect(dc, selx, oy + wr, selw, 1);
+					}
 					if (op->ul)
 					{//underline sits ~at the baseline (~4/5 down the line box)
 						dc->color = op->fg;
@@ -1899,6 +2442,12 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 				{
 					dc->color = op->bg;
 					GrRect(dc, op->x, oy, op->w, op->h);
+				}
+				if (GxOpSelRange(op, &selc0, &selc1))
+				{//selection highlight behind the SELECTED chars only (8x8: exact)
+					dc->color = de_theme.bttn_focus;
+					GrRect(dc, op->x + selc0 * FONT_WIDTH, oy,
+						   (selc1 - selc0) * FONT_WIDTH, op->h);
 				}
 				if (op->href && op->x <= mx < op->x + op->w && oy <= my < oy + FONT_HEIGHT)
 				{
@@ -1939,11 +2488,23 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 				if (op->radius >= 0)
 					wr = MinI64(op->radius, op->h / 2);
 				if (op->wkind == GXW_SUBMIT || op->wkind == GXW_BUTTON)
-					GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
-								de_theme.bttn, de_theme.panel_edge);
+				{ // author background/border when styled, light UA default else
+					if (op->has_bg)
+						GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
+									op->fg, op->bg);
+					else
+						GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
+									ColorRGB(0xF1, 0xF3, 0xF4), op->bg);
+				}
 				else if (op->wkind == GXW_TEXT || op->wkind == GXW_AREA)
-					GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
-								de_theme.win_bg, de_theme.panel_edge);
+				{
+					if (op->has_bg)
+						GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
+									op->fg, op->bg);
+					else // UA default: white field
+						GxRoundRect(dc, op->x, oy, op->w, op->h, wr,
+									ColorRGB(0xFF, 0xFF, 0xFF), op->bg);
+				}
 				else
 				{//check / radio / select: keep the crisp square look.
 					dc->color = de_theme.win_bg;
@@ -1982,7 +2543,7 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 						dc->color = de_theme.bttn_focus;
 						GrRect(dc, op->x + 5, fy - 1, fn * FONT_WIDTH, FONT_HEIGHT + 2);
 					}
-					dc->color = de_theme.text;
+					dc->color = ColorRGB(0x20, 0x21, 0x24); // dark: field is white now
 					GrPrint(dc, op->x + 6, fy, "%s", buf);
 					if (!gx.field_selall && Blink)
 					{
@@ -1992,8 +2553,11 @@ U0 GxDrawIt(CTask *task, CDC *dc)
 					}
 				}
 				else if (op->wkind != GXW_CHECK && op->wkind != GXW_RADIO)
-				{
-					dc->color = de_theme.text;
+				{ // author color if styled, else dark UA text on the light default
+					if (op->sh_col >= 0)
+						dc->color = GxPenBg(op->sh_col, de_theme.text);
+					else
+						dc->color = ColorRGB(0x20, 0x21, 0x24);
 					GrPrint(dc, op->x + 6, oy + (op->h - FONT_HEIGHT) / 2, "%s", op->text);
 				}
 				break;
@@ -2036,6 +2600,12 @@ gx_draw_next:;
 	}
 
 	gx.hover_href = hover;
+	// TODO(cursor): we know the hover context here (hover != NULL over a link,
+	// over a text run = I-beam, else arrow) but ZealOS draws ONE system pointer
+	// sprite in the kernel compositor with no per-task/per-context API. Switching
+	// pointer/I-beam/arrow needs a kernel-side hook that takes a requested cursor
+	// shape from the focused task (e.g. a `sys_cursor_shape` global the compositor
+	// reads) - a kernel change, not a Zinc-local one. Left for that pass.
 	GxDrawChrome(dc);
 }
 
@@ -2055,6 +2625,10 @@ I64	 gx_fetch_status;
 I64	 gx_fetch_len;	//Body byte count: image bodies are binary (NULs inside).
 Bool gx_fetch_html, gx_fetch_ok;
 Bool gx_fetch_img;	//Response IS an image (content-type / magic): view it.
+U8	 gx_fetch_final[512]; //URL that ACTUALLY served the page (after redirects);
+					//"" = same as requested. Base for relative resources: with
+					//the typed wikipedia.org (301 -> www) every relative <img>
+					//resolved to a redirect body = silent broken images.
 
 U0 GxJsReset()
 {//Stop the background script fetcher and drop queued/fetched scripts.
@@ -2108,10 +2682,13 @@ U0 GxFetchTask()
 	gx_fetch_html = TRUE;
 	gx_fetch_img = FALSE;
 	gx_fetch_ok = FALSE;
+	gx_fetch_final[0] = 0;
 	r = ZincNavFetch(gx.load_url); // POSTs the pending form body if one is queued
 	if (r && r->body)
 	{
 		gx_fetch_status = r->status;
+		if (r->final_url && StrLen(r->final_url) < 511)
+			StrCopy(gx_fetch_final, r->final_url);
 		gx_fetch_len = r->body_length;
 		gx_fetch_body = MAlloc(r->body_length + 1, sys_task);
 		MemCopy(gx_fetch_body, r->body, r->body_length + 1);
@@ -2132,6 +2709,12 @@ U0 GxFetchTask()
 				gx_fetch_body[3] == 'G')
 				gx_fetch_img = TRUE;
 			else if (gx_fetch_body[0] == 0xFF && gx_fetch_body[1] == 0xD8)
+				gx_fetch_img = TRUE;
+			else if (gx_fetch_body[0] == 'G' && gx_fetch_body[1] == 'I' &&
+					 gx_fetch_body[2] == 'F')
+				gx_fetch_img = TRUE;
+			else if (gx_fetch_len > 12 && !MemCompare(gx_fetch_body, "RIFF", 4) &&
+					 !MemCompare(gx_fetch_body + 8, "WEBP", 4))
 				gx_fetch_img = TRUE;
 		}
 		if (gx_fetch_img)
@@ -2206,9 +2789,14 @@ U0 GxImgTask()
 			{//Sniff by content: PNG (0x89 P N G) or JPEG (FFD8).
 				dc = NULL;
 				if (r->body[1] == 'P' && r->body[2] == 'N' && r->body[3] == 'G')
-					dc = PNGReadBuf(r->body, r->body_length, 255, sys_task);
+					dc = PNGReadBuf(r->body, r->body_length, 128, sys_task);
 				else if (r->body[0] == 0xFF && r->body[1] == 0xD8)
 					dc = JPGReadBuf(r->body, r->body_length, sys_task);
+				else if (r->body[0] == 'G' && r->body[1] == 'I' && r->body[2] == 'F')
+					dc = GIFReadBuf(r->body, r->body_length, sys_task);
+				else if (r->body_length > 12 && !MemCompare(r->body, "RIFF", 4) &&
+						 !MemCompare(r->body + 8, "WEBP", 4))
+					dc = WEBPReadBuf(r->body, r->body_length, sys_task);
 					else
 					{//Text beginning with '<' with an <svg root = vector image.
 						U8 *b0 = r->body;
@@ -2232,6 +2820,24 @@ U0 GxImgTask()
 					ce->dc = dc;
 					gx.img_dirty = TRUE;
 				}
+				else
+				{//diagnose silent image losses: status bar + Network Log
+					NetLog("IMG: undecodable %02X %02X %02X %02X len=%d %s",
+						   r->body[0], r->body[1], r->body[2], r->body[3],
+						   r->body_length, ce->url);
+					StrPrint(zinc_note, "img undecodable (%02X%02X) len=%d",
+							 r->body[0], r->body[1], r->body_length);
+				}
+			}
+			else if (r)
+			{
+				NetLog("IMG: HTTP %d len=%d %s", r->status, r->body_length, ce->url);
+				StrPrint(zinc_note, "img HTTP %d", r->status);
+			}
+			else
+			{
+				NetLog("IMG: no response %s", ce->url);
+				StrCopy(zinc_note, "img: no response");
 			}
 			if (r)
 				HttpResponseFree(r);
@@ -2534,8 +3140,14 @@ U0 GxClickContent(I64 x, I64 y)
 		op = &gx.ops[i];
 		if (!(op->x <= x < op->x + op->w && op->y <= cy < op->y + op->h))
 			goto gx_click_next;
-		if (op->type == GXO_TEXT && op->href)
-		{
+		if (op->node && !StrCompare(op->node->tag, "details"))
+		{ // click the summary toggles the <details> open/closed
+			op->node->checked = !op->node->checked;
+			gx.relayout = TRUE;
+			return;
+		}
+		if ((op->type == GXO_TEXT || op->type == GXO_IMG) && op->href)
+		{ // a linked image (<a><img></a>, e.g. 100r's rabbit nav) navigates too
 			GxNavTo(ZincResolveLink(op->href));
 			return;
 		}
@@ -2782,9 +3394,72 @@ U0 GxClick(I64 x, I64 y)
 		GxClickContent(x, y);
 }
 
+CZNode *GxMetaRefreshNode(CZNode *node, I64 depth)
+{//First <meta http-equiv=refresh> node in the subtree, or NULL. depth-capped.
+	CZNode	*n, *r;
+	U8		*equiv;
+	I64		 guard = 0;
+
+	if (!node || depth > 64)
+		return NULL;
+	if (!StrICompare(node->tag, "meta"))
+	{
+		equiv = ZNodeAttr(node, "http-equiv");
+		if (equiv && !StrICompare(equiv, "refresh"))
+			return node;
+	}
+	n = node->first_child;
+	while (n && guard++ < 100000)
+	{
+		r = GxMetaRefreshNode(n, depth + 1);
+		if (r)
+			return r;
+		n = n->next;
+	}
+
+	return NULL;
+}
+
+U8 *GxMetaRefresh(U8 *cur_url)
+{//If the loaded page carries <meta http-equiv=refresh content="N; url=X">,
+//return a StrNew'd absolute X to redirect to (else NULL). Pure self-refresh
+//(no url=) and same-URL targets are ignored so it can't loop. Delay ignored.
+	CZNode	*m;
+	U8		*content, *p, *url, *resolved;
+	I64		 n;
+
+	m = GxMetaRefreshNode(zinc_dom, 0);
+	if (!m)
+		return NULL;
+	content = ZNodeAttr(m, "content");
+	if (!content)
+		return NULL;
+	p = StrFind("url=", content);
+	if (!p)
+		p = StrFind("URL=", content);
+	if (!p)
+		return NULL;
+	p += 4;
+	while (*p == ' ' || *p == 0x27 || *p == 0x22)
+		p++;
+	url = StrNew(p);
+	n = StrLen(url);
+	while (n > 0 && (url[n - 1] == ' ' || url[n - 1] == 0x27 || url[n - 1] == 0x22 ||
+					 url[n - 1] == '\r' || url[n - 1] == '\n'))
+		url[--n] = 0;
+	resolved = ZincResolveLink(url);
+	Free(url);
+	if (resolved && cur_url && StrCompare(resolved, cur_url))
+		return resolved;
+	if (resolved)
+		Free(resolved);
+
+	return NULL;
+}
+
 public U0 ZincGX(U8 *start_url=NULL)
 {
-	U8	*current, *target, *sub;
+	U8	*current, *target, *sub, *meta_url;
 	I64	 msg, a1, a2, view_h, vi, nav_chain = 0, cancel_deadline = 0, ti, tn;
 	U8	 title[80];
 
@@ -2807,15 +3482,19 @@ public U0 ZincGX(U8 *start_url=NULL)
 	//FileRead lives in BlkDev - available here in the browser. gate on
 	//grf_ready (statically FALSE), NOT grf_ui_font.ok (a global = JIT garbage
 	//until written). Any failure => that font's .ok stays FALSE => fallback.
-		I64	 fsz = 0, msz = 0;
+		I64	 fsz = 0, msz = 0, csz = 0;
 		U8	*fbuf = FileRead("::/System/Gr/UISANS.TTF", &fsz);
 		U8	*mbuf = FileRead("::/System/Gr/UIMONO.TTF", &msz);
+		U8	*cbuf = FileRead("::/System/Gr/CJK.TTF", &csz);
 		GrFontInit(fbuf, fsz);							//slot 0, sets grf_ready
 		GrFontInitInto(&grf_mono_font, 1, mbuf, msz);	//slot 1 (may fail -> sans)
+		GrFontInitInto(&grf_cjk, 2, cbuf, csz);			//slot 2 (missing -> no CJK)
 		if (fbuf)
 			Free(fbuf);
 		if (mbuf)
 			Free(mbuf);
+		if (cbuf)
+			Free(cbuf);
 	}
 	zinc_ttf = grf_ready;
 
@@ -2868,6 +3547,8 @@ public U0 ZincGX(U8 *start_url=NULL)
 			{//Built-in page: parse directly in THIS (main) task's heap.
 				if (!StrICompare(current, "zinc:test"))
 					ZincSetPage(current, zinc_testpage);
+				else if (!StrICompare(current, "zinc:hi"))
+					ZincSetPage(current, zinc_hipage);
 				else if (!StrICompare(current, "zinc:css"))
 					ZincSetPage(current, zinc_csspage);
 				else
@@ -2897,8 +3578,10 @@ public U0 ZincGX(U8 *start_url=NULL)
 				{
 					while (msg = MessageScan(&a1, &a2))
 						if (msg == MESSAGE_MS_L_DOWN)
-						{//Stop button lives where Reload normally is.
-							if (GX_TAB_H <= a2 < GX_CHROME_H && 64 <= a1 < 90)
+						{//ANY chrome-strip click while loading = Stop. The old
+						//26px X-only zone felt dead - clicks on back/reload did
+						//nothing until the fetch resolved.
+							if (a2 < GX_CHROME_H)
 								gx.cancel = TRUE;
 						}
 						else if (msg == MESSAGE_KEY_DOWN && (a1 == CH_ESC || a1 == CH_SHIFT_ESC))
@@ -2911,7 +3594,7 @@ public U0 ZincGX(U8 *start_url=NULL)
 						// hard-Kill as a backstop if it doesn't stop in time.
 						net_abort = TRUE;
 						if (!cancel_deadline)
-							cancel_deadline = counts.jiffies + 2000 * JIFFY_FREQ / 1000;
+							cancel_deadline = counts.jiffies + 800 * JIFFY_FREQ / 1000;
 						else if (counts.jiffies > cancel_deadline)
 						{
 							Kill(gx.load_task);
@@ -2940,6 +3623,12 @@ public U0 ZincGX(U8 *start_url=NULL)
 				{
 					if (gx_fetch_status != 200)
 						StrPrint(zinc_note, "HTTP status %d", gx_fetch_status);
+					if (gx_fetch_final[0] && StrCompare(current, gx_fetch_final))
+					{//Redirected: adopt the REAL URL. Relative resources, the
+					//address bar and history all follow the serving host.
+						Free(current);
+						current = StrNew(gx_fetch_final);
+					}
 					zinc_base_ok = (HttpUrlParse(current, &zinc_base) >= 0);
 					if (gx_fetch_img)
 					{//The URL IS a picture: show it in the image view.
@@ -2947,8 +3636,8 @@ public U0 ZincGX(U8 *start_url=NULL)
 						gx.iv_dc = GxImgViewDecode(gx_fetch_body, gx_fetch_len);
 						if (!gx.iv_dc)
 							StrCopy(zinc_note,
-								"Image format unsupported (progressive JPEG / "
-								"GIF / WebP not decodable yet).");
+								"Image format unsupported ("
+								"WebP not decodable yet).");
 					}
 					else if (gx_fetch_html)
 						ZincSetPage(current, gx_fetch_body);
@@ -2966,12 +3655,27 @@ public U0 ZincGX(U8 *start_url=NULL)
 				gx_fetch_body = NULL;
 			}
 			gx.fetch = FALSE;
+			meta_url = NULL;
+			if (nav_chain < 5)
+				meta_url = GxMetaRefresh(current); // <meta http-equiv=refresh url=..>
 			if (zinc_js && zinc_js->navigate && nav_chain < 5)
-			{
+			{//Script navigated DURING load = a redirect: REPLACE, don't push.
+			//Pushing put the redirector in history, so Back landed on it and
+			//it immediately bounced you forward again ("back doesn't work").
 				nav_chain++;
 				target = StrNew(zinc_js->navigate);
 				zinc_js->navigate = NULL;
-				current = ZincNavPush(current, target);
+				if (meta_url)
+					Free(meta_url);
+				Free(current);
+				current = target;
+				gx.fetch = TRUE;
+			}
+			else if (meta_url)
+			{//HTML meta-refresh redirect: same replace semantics.
+				nav_chain++;
+				Free(current);
+				current = meta_url;
 				gx.fetch = TRUE;
 			}
 			else
@@ -3001,10 +3705,15 @@ public U0 ZincGX(U8 *start_url=NULL)
 		{
 			if (gx.tab_new)
 			{
+				//New tab opens to the RIGHT of the rightmost tab (browser convention).
 				ti = -1;
-				for (tn = 0; tn < GX_TABS; tn++)
-					if (ti < 0 && !gx.tab[tn].used)
-						ti = tn;
+				for (tn = GX_TABS - 1; tn >= 0 && ti < 0; tn--)
+					if (gx.tab[tn].used && tn + 1 < GX_TABS && !gx.tab[tn + 1].used)
+						ti = tn + 1;
+				if (ti < 0)
+					for (tn = 0; tn < GX_TABS; tn++)
+						if (ti < 0 && !gx.tab[tn].used)
+							ti = tn;
 				if (ti >= 0)
 				{
 					GxTabSaveCur(current);
@@ -3152,13 +3861,33 @@ public U0 ZincGX(U8 *start_url=NULL)
 			}
 		}
 
-		//Wheel scroll.
+		//Wheel scroll - only when THIS window has focus (the wheel counter is
+		//global; without the gate an unfocused browser scrolled underneath).
 		view_h = Fs->pix_height - GX_CHROME_H - GX_STATUS_H;
 		if (mouse.pos.z != gx.last_wheel)
 		{
-			gx.scroll += (mouse.pos.z - gx.last_wheel) * 40;
-			gx.last_wheel = mouse.pos.z;
-			gx.scroll = ClampI64(gx.scroll, 0, MaxI64(0, gx.doc_h - view_h));
+			if (sys_focus_task == Fs)
+			{
+				gx.scroll += (mouse.pos.z - gx.last_wheel) * 40;
+				gx.scroll = ClampI64(gx.scroll, 0, MaxI64(0, gx.doc_h - view_h));
+			}
+			gx.last_wheel = mouse.pos.z; //always resync: no jump on refocus
+		}
+
+		//Text selection drag: track the end point live; on release copy to the
+		//OS clipboard (a short drag counts as a plain click - no selection).
+		if (gx.sel_drag)
+		{
+			gx.sel_x1 = mouse.pos.x - Fs->pix_left - Fs->scroll_x;
+			gx.sel_y1 = mouse.pos.y - Fs->pix_top - Fs->scroll_y
+						- GX_CHROME_H + gx.scroll;
+			if (!mouse.lb)
+			{ // release: selection STAYS highlighted; Ctrl-C copies it
+				gx.sel_drag = FALSE;
+				if (AbsI64(gx.sel_x1 - gx.sel_x0) +
+					AbsI64(gx.sel_y1 - gx.sel_y0) < 8)
+					gx.sel_on = FALSE; // just a click
+			}
 		}
 
 		while (msg = MessageScan(&a1, &a2))
@@ -3167,6 +3896,19 @@ public U0 ZincGX(U8 *start_url=NULL)
 			{
 				case MESSAGE_MS_L_DOWN:
 					GxClick(a1, a2);
+					//Begin a potential text-selection drag in the page area.
+					gx.sel_x0 = mouse.pos.x - Fs->pix_left - Fs->scroll_x;
+					gx.sel_y0 = mouse.pos.y - Fs->pix_top - Fs->scroll_y
+								- GX_CHROME_H + gx.scroll;
+					if (gx.sel_y0 > 0)
+					{
+						gx.sel_x1  = gx.sel_x0;
+						gx.sel_y1  = gx.sel_y0;
+						gx.sel_drag = TRUE;
+						gx.sel_on	= TRUE;
+					}
+					else
+						gx.sel_on = FALSE;
 					break;
 				case MESSAGE_MS_R_DOWN:
 					GxRightClick(a1, a2);
@@ -3280,12 +4022,14 @@ public U0 ZincGX(U8 *start_url=NULL)
 							gx.url_focus = FALSE;
 						else if (a1 == 1)  //Ctrl+A: select all.
 							gx.url_selall = TRUE;
-						else if (a1 == 3)  //Ctrl+C: copy the URL.
+						else if (a1 == 3)  //Ctrl+C: copy the URL to the OS clipboard.
 						{
 							MemCopy(gx_clip, gx.url, gx.url_len + 1);
 							gx_clip_len = gx.url_len;
+							ClipDel;
+							DocPrint(sys_clip_doc, "%s", gx.url);
 						}
-						else if (a1 == 22) //Ctrl+V: paste.
+						else if (a1 == 22) //Ctrl+V: paste from the OS clipboard.
 						{
 							if (gx.url_selall)
 							{
@@ -3294,6 +4038,7 @@ public U0 ZincGX(U8 *start_url=NULL)
 								gx.url[0] = 0;
 								gx.url_selall = FALSE;
 							}
+							gx_clip_len = GxClipTextGet(gx_clip, 250);
 							for (vi = 0; vi < gx_clip_len; vi++)
 								if (' ' <= gx_clip[vi] < 0x7F)
 									GxUrlIns(gx_clip[vi]);
@@ -3335,6 +4080,10 @@ public U0 ZincGX(U8 *start_url=NULL)
 						case CH_ESC:
 						case CH_SHIFT_ESC:
 							gx.quit = TRUE;
+							break;
+						case 3: //Ctrl+C: copy the page text selection.
+							if (gx.sel_on)
+								GxSelCopy;
 							break;
 						case 12: //Ctrl+L: focus the URL bar, all selected.
 							gx.url_focus = TRUE;
@@ -3412,4 +4161,13 @@ gx_next:
 	DocCursor(ON);
 	DocClear;
 	"ZincGX closed.\n";
+}
+
+public U0 ZincV3(U8 *start_url=NULL)
+{//Browser with the UNIFIED v3 layout engine (LayoutV3.ZC). Same chrome, same
+//fetch/paint pipeline - only the layout dispatch differs. Flag restored on
+//exit so a subsequent plain ZincGX gets the default engine.
+	zinc_v3 = TRUE;
+	ZincGX(start_url);
+	zinc_v3 = FALSE;
 }

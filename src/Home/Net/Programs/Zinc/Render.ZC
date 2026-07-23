@@ -550,13 +550,16 @@ U0 ZnWidgetButton(CZNode *node, CZStyle *style)
 }
 
 Bool ZnTagSkipped(U8 *tag)
-{
+{ // svg is NOT here on purpose: GxNode/L2Node route it to the inline-SVG render
+  // branch (which always returns), so its raw path text never leaks as text. It
+  // used to be in this list, which made the entire SVG renderer dead code -
+  // inline logos (Google) never drew while PNG <img> doodles did.
 	return !StrCompare(tag, "script") || !StrCompare(tag, "style")	  ||
 		   !StrCompare(tag, "title")  || !StrCompare(tag, "head")	  ||
 		   !StrCompare(tag, "meta")	  || !StrCompare(tag, "link")	  ||
 		   !StrCompare(tag, "base")	  || !StrCompare(tag, "template") ||
 		   !StrCompare(tag, "noscript") || !StrCompare(tag, "option") ||
-		   !StrCompare(tag, "iframe") || !StrCompare(tag, "svg")	  ||
+		   !StrCompare(tag, "iframe") ||
 		   !StrCompare(tag, "canvas") || !StrCompare(tag, "object");
 }
 

@@ -25,11 +25,11 @@
 
 Cd(__DIR__);;
 
-#include "Zinc/HTML"
-#include "Zinc/CSS"
-#include "Zinc/JS"
-#include "Zinc/SVG"
-#include "Zinc/Render"
+#include "HTML"
+#include "CSS"
+#include "JS"
+#include "SVG"
+#include "Render"
 
 #define ZINC_HISTORY	64
 #define ZINC_BAR_WIDTH	60
@@ -46,31 +46,54 @@ I64	 zinc_back_count = 0, zinc_fwd_count = 0;
 
 U8 *zinc_welcome =
 	"<html><head><title>Zinc</title><style>"
-	"h1{color:red} .dim{color:gray} a{color:blue}"
+	"body{background:#0e1420;color:#dfe6f2;margin:0}"
+	"a{color:#6fb3ff;text-decoration:none}"
+	".hero{background:linear-gradient(180deg,#16203a,#0e1420);"
+	"padding:44px 0 28px 0;text-align:center}"
+	".zn{font-size:44px;font-weight:bold;color:#eef3fb}"
+	".zn b{color:#4ea3ff}"
+	".tag{color:#8b96ab;font-size:15px;margin-top:6px}"
+	".wrap{width:680px;margin:0 auto;padding:10px}"
+	".card{background:#151d2e;border:1px solid #263450;border-radius:10px;"
+	"padding:14px 18px;margin:12px 0}"
+	".card h3{color:#9fb6d8;margin:0 0 8px 0;font-size:15px}"
+	".row{display:flex;gap:10px}"
+	".row .card{flex:1}"
+	".dim{color:#8b96ab;font-size:14px}"
+	".s input{background:#0b101c;color:#dfe6f2;border:1px solid #2d3c5c}"
 	"</style></head><body>"
-	"<h1>Zinc</h1>"
-	"<p class=dim><i>Like Chrome, but a cheaper element.</i></p>"
-	"<p>A small web browser for <b>ZealOS</b>: HTML, a CSS subset, a JS "
-	"subset, GET forms, http and https (TLS 1.3, unverified certs).</p>"
-	"<p class=dim>Tip: click the address bar and type an address "
-	"(<b>example.com</b>) or just a <b>search</b> - plain words are sent to "
-	"DuckDuckGo. A typed URL always goes to that site unchanged.</p>"
-	"<hr>"
-	"<ul>"
-	"<li><a href=\"https://duckduckgo.com/\">DuckDuckGo</a> (default search)</li>"
-	"<li><a href=\"http://frogfind.com/\">FrogFind</a> no-JS reader search</li>"
-	"<li><a href=\"http://textfiles.com/\">textfiles.com</a></li>"
-	"<li><a href=\"http://info.cern.ch/\">info.cern.ch</a> the first website</li>"
-	"<li><a href=\"https://example.com/\">example.com</a> https test</li>"
-	"</ul>"
+	"<div class=hero>"
+	"<div class=zn>Z<b>i</b>nc</div>"
+	"<div class=tag>the native ZealOS browser - HTML + CSS3 + JS, TLS 1.3, "
+	"zero ELFs</div>"
+	"</div>"
+	"<div class=wrap>"
+	"<div class=\"card s\">"
+	"<h3>Search the web</h3>"
 	"<form action=\"https://html.duckduckgo.com/html/\">"
-	"Search: <input type=text name=q> <input type=submit value=Go>"
+	"<input type=text name=q> <input type=submit value=Search>"
 	"</form>"
-	"<hr>"
-	"<p class=dim>Diagnostics: <a href=\"zinc:test\">zinc:test</a> checks "
-	"the JS engine, <a href=\"zinc:css\">zinc:css</a> the CSS renderer. "
-	"Before first https use, run <b>CryptoSelfTest;</b> in a terminal to "
-	"verify the crypto.</p>"
+	"<p class=dim>Or type an address in the bar above - plain words search "
+	"DuckDuckGo, a URL goes straight there.</p>"
+	"</div>"
+	"<div class=row>"
+	"<div class=card>"
+	"<h3>Places</h3>"
+	"<p><a href=\"https://en.wikipedia.org/\">Wikipedia</a></p>"
+	"<p><a href=\"https://news.ycombinator.com/\">Hacker News</a></p>"
+	"<p><a href=\"http://frogfind.com/\">FrogFind</a></p>"
+	"<p><a href=\"http://info.cern.ch/\">The first website</a></p>"
+	"</div>"
+	"<div class=card>"
+	"<h3>Diagnostics</h3>"
+	"<p><a href=\"zinc:test\">zinc:test</a> <span class=dim>JS engine</span></p>"
+	"<p><a href=\"zinc:css\">zinc:css</a> <span class=dim>CSS renderer</span></p>"
+	"<p><a href=\"zinc:hi\">zinc:hi</a> <span class=dim>layout torture</span></p>"
+	"<p class=dim>https flaky? run <b>CryptoSelfTest;</b></p>"
+	"</div>"
+	"</div>"
+	"<p class=dim>Like Chrome, but a cheaper element.</p>"
+	"</div>"
 	"</body></html>";
 
 U8 *zinc_testpage =
@@ -99,6 +122,71 @@ U8 *zinc_testpage =
 	"<p><button type=button onclick=\"document.getElementById('o').innerHTML="
 	"'clicked at '+Date.now()\">Click event test</button> "
 	"<span id=o>(not clicked)</span></p>"
+	"<p><a href=\"zinc:welcome\">back to welcome</a></p>"
+	"</body></html>";
+
+// Minimal document.write probes to isolate WHERE values corrupt: a bare string
+// literal, a two-string concat, and a bare number. Expected: "hi ab 42".
+// Modern-JS torture page: each numbered token localizes a parse gap. Targets
+// the vercel bundle's shapes (nested ternary, regex-in-context, optchain, arrow).
+U8 *zinc_hipage =
+	"<html><body><h1>JS torture</h1><script>"
+	"var s={sleeping:1,fatigue:5,weather:'fog'};"
+	"document.write('1:'+(s.sleeping?s.fatigue?90:45:0)+' ');"
+	"document.write('2:'+(s.weather==='fog'?6:0)+' ');"
+	"document.write('3:'+('a@b'.match(/@/)?'m':'n')+' ');"
+	"document.write('4:'+('a<b'.match(/</)?'m':'n')+' ');"
+	"document.write('5:'+('x  y'.replace(/ +/g,'_'))+' ');"
+	"document.write('6:'+(s.missing?.prop??'def')+' ');"
+	"var f=s.sleeping?function(){return 'A'}:function(){return 'B'};"
+	"document.write('7:'+f()+' ');"
+	"var g=(a,b)=>a+b;document.write('8:'+g(2,3)+' ');"
+	"document.write('9:'+(1<2?3>1?'yy':'yn':'n')+' ');"
+	"</script>"
+	"<p>expected: 1:45 2:6 3:m 4:m 5:x_y 6:def 7:A 8:5 9:yy</p>"
+	"<h1>API batch</h1><script>"
+	"document.write('10:'+(new Uint8Array([1,2,3]).length)+' ');"
+	"document.write('11:'+([1,2,3].some(x=>x>2)?'T':'F')+' ');"
+	"document.write('12:'+([1,2,3].at(-1))+' ');"
+	"var q=[1,2,3,4];q.splice(1,2);document.write('13:'+q.join('')+' ');"
+	"var u=new Uint8Array(3);u.set([9,8],1);document.write('14:'+u.join('')+' ');"
+	"var d=new DataView(new ArrayBuffer(4));d.setUint16(0,258);"
+	"document.write('15:'+d.getUint16(0)+' ');"
+	"document.write('16:'+(new Headers({a:'1'}).get('a'))+' ');"
+	"document.write('17:'+([1,[2,3]].flat().join(''))+' ');"
+	"var mm=('a1b2'.match(/([a-z])([0-9])/));"
+	"document.write('18full:'+mm[0]+' 18cap1:'+mm[1]+' 18cap2:'+mm[2]+' ');"
+	"document.write('19:'+('a1b2'.replace(/([a-z])([0-9])/g,'X'))+' ');"
+	"</script>"
+	"<p>expected: 10:3 11:T 12:3 13:14 14:098 15:258 16:1 17:123</p>"
+	"<p>expected: 18full:a1 18cap1:a 18cap2:1  19:XX  (captures back)</p>"
+	"<h1>SVG logo test</h1><p>the Google logo should render below:</p>"
+	"<p>arc diagnostics: A=red semicircle-bowl, B=blue quarter-arc wedge</p>"
+	"<svg viewBox=\"0 0 40 40\" width=\"40\" height=\"40\">"
+	"<path d=\"M5 20a15 15 0 0 0 30 0z\" fill=\"#f00\"/></svg>"
+	"<svg viewBox=\"0 0 40 40\" width=\"40\" height=\"40\">"
+	"<path d=\"M20 20m0-15a15 15 0 0 0-15 15l15 0z\" fill=\"#39f\"/></svg>"
+
+	"<svg class=\"lnXdpd\" aria-label=\"Google\" height=\"92\" role=\"img\" viewBox=\"0 0 272 92\" width="
+	"\"272\" xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M31.32 70.33c17.65.17 29.67-11.68 29.67-29.92"
+	"q.01-2.29-.43-5.08H31.2v8.76h20.6c-1.1 11.47-9.18 17.44-20.27 17.44-12.44 0-21.96-9.35-21.96-22.94 0"
+	"-13.41 9.1-22.77 21.96-22.77 6.48 0 11.26 2 16.04 6.9l6.14-6.43c-5.38-6.3-13.16-9.31-22.3-9.31C13.7 "
+	"6.98 0 20.27 0 38.46c0 17.4 13.25 31.7 31.32 31.87\" fill=\"#3186FF\"></path><path d=\"M88.2 70.33c1"
+	"3.2 0 22.77-9.69 22.77-23.15 0-13.2-9.35-22.98-22.77-22.98-12.7 0-22.68 9.02-22.68 22.98 0 13.33 9.4"
+	"3 23.15 22.68 23.15m0-8.04c-8.04 0-13.67-6.6-13.67-15.1s5.93-14.95 13.67-14.95c8.17 0 13.67 6.6 13.6"
+	"7 14.94 0 8.64-5.63 15.11-13.67 15.11\" fill=\"#FC413D\"></path><path d=\"M137.42 70.33c13.29 0 22.7"
+	"7-9.73 22.77-23.15 0-13.2-9.35-22.98-22.77-22.98-12.7 0-22.68 9.02-22.68 22.98 0 13.33 9.43 23.15 22"
+	".68 23.15m0-8.04c-8.04 0-13.67-6.6-13.67-15.1s5.93-14.95 13.67-14.95c8.17 0 13.67 6.6 13.67 14.94 0 "
+	"8.64-5.63 15.11-13.67 15.11\" fill=\"#FFBE00\"></path><path d=\"M185.37 88.57q21.51 0 21.5-24.63V25."
+	"77h-8.8v5.37h-.17c-2.75-4.27-7.96-6.68-13.84-6.68-12.7 0-20.44 9.69-20.44 22.6 0 12.86 7.53 22.34 20"
+	".78 22.34 6.52 0 11.34-3.72 13.37-6.77h.3v3.94c0 8.67-4.49 13.8-12.82 13.8-5.46 0-9.1-3.01-11.77-8.0"
+	"5l-7.96 3.52c4.2 8.84 10.16 12.73 19.85 12.73m0-27.55c-7.74 0-12.7-5.71-12.7-14.22 0-8.2 4.92-14.13 "
+	"12.75-14.13s12.65 5.5 12.65 14.09c0 8.68-5.08 14.26-12.7 14.26\" fill=\"#3186FF\"></path><path d=\"M"
+	"222.91 8.33h-9.22v60.6h9.22z\" fill=\"#00AF57\"></path><path d=\"M250.17 70.25a22.1 22.1 0 0 0 19-10"
+	".54l-6.86-4.49c-3 4.2-7.1 6.6-11.72 6.6a13.6 13.6 0 0 1-11.93-7.23l30.93-13.12a20 20 0 0 0-.84-3.22c"
+	"-3.69-9.48-10.12-13.8-18.8-13.8-13.24 0-22.25 9.66-22.25 23.03 0 13.67 9.47 22.77 22.47 22.77m-13.5-"
+	"22.81v-.51c0-8.76 5.03-14.64 12.95-14.64 3.76 0 7.15 1.69 9.44 5.67z\" fill=\"#FC413D\"></path></svg"
+	">"
 	"<p><a href=\"zinc:welcome\">back to welcome</a></p>"
 	"</body></html>";
 
@@ -319,7 +407,7 @@ U0 ZincCollectCss(CZNode *node, I64 *external_left)
 //load and the interpreter can't digest framework bundles anyway, so this is
 //a time cap, not a hard capability limit -- raise it freely.
 #define ZINC_EXT_JS_MAX		8
-#define ZINC_EXT_JS_BYTES	262144
+#define ZINC_EXT_JS_BYTES	2097152	// = HTTP_BODY_MAX, the real ceiling
 
 I64 zinc_ext_js_left = ZINC_EXT_JS_MAX;
 
@@ -410,7 +498,8 @@ U0 ZincSetPage(U8 *url, U8 *html)
 	ZincPageFree;
 	zinc_base_ok = (HttpUrlParse(url, &zinc_base) >= 0);
 	zinc_dom = ZHtmlParse(html);
-	zcss_viewport_w = MaxI64(320, Fs->pix_width - 30); // for @media width tests
+	zcss_view_w = MaxI64(320, Fs->pix_width - 30);  // @media widths + vw units
+	zcss_view_h = MaxI64(240, Fs->pix_height - 60); // vh units + % height root
 	ZincCollectCss(zinc_dom, &external_css);
 	ZincFormInit(zinc_dom);
 	zinc_js = JsInterpNew(zinc_dom, url);
@@ -469,6 +558,8 @@ U0 ZincLoad(U8 *url)
 	{ // built-in pages: no real base URL to resolve links against
 		if (!StrICompare(url, "zinc:test"))
 			ZincSetPage(url, zinc_testpage);
+		else if (!StrICompare(url, "zinc:hi"))
+			ZincSetPage(url, zinc_hipage);
 		else if (!StrICompare(url, "zinc:css"))
 			ZincSetPage(url, zinc_csspage);
 		else
@@ -507,6 +598,13 @@ U0 ZincLoad(U8 *url)
 	}
 	if (!is_html && response->body[0] == '<')
 		is_html = TRUE; // servers lie
+
+	// Resolve relative links/images against the URL that ACTUALLY served the
+	// page (after redirects), not what was typed: wikipedia.org 301s to
+	// www.wikipedia.org, so a bare-host base leaves every relative resource
+	// pointing at a redirect (the logo etc silently failed to load).
+	if (response->final_url)
+		url = response->final_url;
 
 	if (is_html)
 		ZincSetPage(url, response->body);
@@ -911,9 +1009,15 @@ U8 *ZincResolveInput(U8 *s)
 
 U8 *ZincResolveLink(U8 *href)
 { // absolute URL from a page link; MAlloc'ed or NULL
+	U8 buf[576];
 	if (!StrNICompare(href, "http://", 7) || !StrNICompare(href, "https://", 8) ||
 		!StrNICompare(href, "zinc:", 5) || !StrNICompare(href, "data:", 5))
 		return StrNew(href); // data: is self-contained (inline image blobs)
+	if (href[0] == '/' && href[1] == '/')
+	{ // protocol-relative (//en.wikipedia.org/...): inherit the https scheme
+		StrPrint(buf, "https:%s", href);
+		return StrNew(buf);
+	}
 	if (zinc_base_ok)
 		return HttpUrlResolve(&zinc_base, href);
 

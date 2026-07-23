@@ -1,0 +1,2193 @@
+/***** drawing *****/
+
+U0 YhDrawEdge(CDC *dc, I64 x, I64 y, I64 w, I64 h)
+{
+	dc->color = de_theme.panel_edge;
+	GrRect(dc, x, y, w, 1);
+	GrRect(dc, x, y + h - 1, w, 1);
+	GrRect(dc, x, y, 1, h);
+	GrRect(dc, x + w - 1, y, 1, h);
+}
+
+//Login-form geometry, shared by draw + hit test.
+#define YH_FORM_W	420
+#define YH_FORM_H	234
+#define YH_NUM_F	3		//Instance / Email / Password.
+#define YH_CB_DY	142
+#define YH_CB_SZ	14
+#define YH_BTN_DY	170
+
+U0 YhDrawForm(CTask *task, CDC *dc)
+{
+	I64	 fx = (task->pix_width - YH_FORM_W) / 2;
+	I64	 fy = (task->pix_height - YH_FORM_H) / 2;
+	I64	 i, y, off;
+	U8	*labels[YH_NUM_F], *vals[YH_NUM_F];
+	U8	 buf[96];
+
+	labels[0] = "Instance";	vals[0] = yh.f_host;
+	labels[1] = "Email";	vals[1] = yh.f_email;
+	labels[2] = "Password";	vals[2] = yh.f_pass;
+
+	dc->color = de_theme.panel;
+	GrRect(dc, fx, fy, YH_FORM_W, YH_FORM_H);
+	YhDrawEdge(dc, fx, fy, YH_FORM_W, YH_FORM_H);
+	dc->color = de_theme.accent;
+	GrPrint(dc, fx + (YH_FORM_W - 16 * FONT_WIDTH) / 2, fy + 12, "yHarmony - Login");
+
+	for (i = 0; i < YH_NUM_F; i++)
+	{
+		y = fy + 40 + i * 32;
+		dc->color = de_theme.text_dim;
+		GrPrint(dc, fx + 16, y + 5, "%s", labels[i]);
+		dc->color = de_theme.win_bg;
+		GrRect(dc, fx + 96, y, YH_FORM_W - 112, 20);
+		if (yh.f_focus == i)
+			dc->color = de_theme.accent;
+		else
+			dc->color = de_theme.bttn;
+		GrRect(dc, fx + 96, y, YH_FORM_W - 112, 1);
+		GrRect(dc, fx + 96, y + 19, YH_FORM_W - 112, 1);
+		GrRect(dc, fx + 96, y, 1, 20);
+		GrRect(dc, fx + YH_FORM_W - 17, y, 1, 20);
+		dc->color = de_theme.text;
+		//Long values show the tail; password masked.
+		off = 0;
+		if (StrLen(vals[i]) > 36)
+			off = StrLen(vals[i]) - 36;
+		if (i == 2)
+		{
+			for (off = 0; off < MinI64(StrLen(vals[i]), 36); off++)
+				buf[off] = '*';
+			buf[off] = 0;
+		}
+		else
+			StrCopy(buf, vals[i] + off);
+		if (yh.f_focus == i && Blink)
+			CatPrint(buf, "_");
+		GrPrint(dc, fx + 102, y + 6, "%s", buf);
+	}
+
+	//Auto-connect checkbox.
+	y = fy + YH_CB_DY;
+	dc->color = de_theme.win_bg;
+	GrRect(dc, fx + 16, y, YH_CB_SZ, YH_CB_SZ);
+	YhDrawEdge(dc, fx + 16, y, YH_CB_SZ, YH_CB_SZ);
+	if (yh.f_autoconn)
+	{
+		dc->color = de_theme.accent;
+		GrRect(dc, fx + 19, y + 3, YH_CB_SZ - 6, YH_CB_SZ - 6);
+	}
+	dc->color = de_theme.text_dim;
+	GrPrint(dc, fx + 16 + YH_CB_SZ + 8, y + 3, "Auto-connect on launch");
+
+	//Buttons.
+	y = fy + YH_BTN_DY;
+	if (yh.f_focus == YH_NUM_F)
+		dc->color = de_theme.bttn_focus;
+	else
+		dc->color = de_theme.bttn_hot;
+	GrRect(dc, fx + 96, y, 120, 24);
+	YhDrawEdge(dc, fx + 96, y, 120, 24);
+	dc->color = de_theme.text;
+	GrPrint(dc, fx + 96 + (120 - 5 * FONT_WIDTH) / 2, y + 8, "Login");
+	dc->color = de_theme.bttn;
+	GrRect(dc, fx + 232, y, 120, 24);
+	YhDrawEdge(dc, fx + 232, y, 120, 24);
+	dc->color = de_theme.text_dim;
+	GrPrint(dc, fx + 232 + (120 - 4 * FONT_WIDTH) / 2, y + 8, "Quit");
+
+	dc->color = de_theme.text_dim;
+	GrPrint(dc, fx + 16, fy + YH_BTN_DY + 34,
+			"Instance = your Harmony domain (keys auto-discovered).");
+	if (yh.f_status[0])
+	{
+		dc->color = yh.c_red;
+		GrPrint(dc, fx + 16, fy + YH_BTN_DY + 48, "%s", yh.f_status);
+	}
+}
+
+U0 YhLineHead(CYhLine *ln, U8 *head, CColorROPU32 *head_pen, CColorROPU32 *body_pen)
+{
+	U8 ts[8];
+
+	StrPrint(ts, "%02d:%02d", ln->hh, ln->mm);
+	switch (ln->kind)
+	{
+		case YH_LK_MSG:
+			StrPrint(head, "%s <%s> ", ts, ln->nick);
+			*head_pen = YhNickPen(ln->nick);
+			*body_pen = de_theme.text;
+			break;
+		case YH_LK_SELF:
+			StrPrint(head, "%s <%s> ", ts, ln->nick);
+			*head_pen = YhNickPen(ln->nick);
+			*body_pen = de_theme.text;
+			break;
+		case YH_LK_ERROR:
+			StrPrint(head, "%s !! ", ts);
+			*head_pen = yh.c_red;
+			*body_pen = yh.c_red;
+			break;
+		case YH_LK_SYSTEM:
+			StrPrint(head, "%s ** ", ts);
+			*head_pen = de_theme.accent_dim;
+			*body_pen = de_theme.text_dim;
+			break;
+		case YH_LK_REPLY:
+			if (ln->nick[0])
+				StrPrint(head, "re %s: ", ln->nick);
+			else
+				StrPrint(head, "re: ");
+			*head_pen = de_theme.accent_dim;
+			*body_pen = de_theme.text_dim;
+			break;
+		case YH_LK_IMG:
+			StrPrint(head, "      ");
+			*head_pen = de_theme.text_dim;
+			*body_pen = de_theme.text_dim;
+			break;
+		default:	//YH_LK_STATUS
+			StrPrint(head, "%s -- ", ts);
+			*head_pen = de_theme.accent_dim;
+			*body_pen = de_theme.text_dim;
+	}
+}
+
+U0 YhHitPush(I64 y0, I64 y1, I64 nx0, I64 nx1, I64 ci, I64 ring, I64 act=0)
+{//Record a clickable row for this frame (read by click handlers). act: 0
+//normal (name/avatar x range), 5 inline image, 1..4 feed footer buttons.
+	CYhHit *h;
+
+	if (yh.hit_count >= YH_HIT_MAX)
+		return;
+	h = &yh.hits[yh.hit_count];
+	h->y0 = y0;
+	h->y1 = y1;
+	h->nx0 = nx0;
+	h->nx1 = nx1;
+	h->ci = ci;
+	h->ring = ring;
+	h->act = act;
+	yh.hit_count++;
+}
+
+U0 YhCRect(CDC *dc, I64 x, I64 y, I64 w, I64 h, I64 y0, I64 y1)
+{//GrRect clipped to the vertical band [y0, y1).
+	I64 a = MaxI64(y, y0), b = MinI64(y + h, y1);
+
+	if (b > a)
+		GrRect(dc, x, a, w, b - a);
+}
+
+Bool YhIsGroupHead(CYhChan *cb, I64 i, I64 first)
+{//Discord-style grouping: consecutive lines from the same author within a
+//few minutes share one avatar/name header.
+	CYhLine	*ln = &cb->lines[i % YH_MAX_LINES], *pl;
+
+	if (i - 1 < first)
+		return TRUE;
+	pl = &cb->lines[(i - 1) % YH_MAX_LINES];
+	if (pl->kind != YH_LK_MSG && pl->kind != YH_LK_SELF)
+		return TRUE;	//Reply banner / status / image above breaks the group.
+	if (StrCompare(pl->nick, ln->nick))
+		return TRUE;
+	if (pl->hh != ln->hh)
+		return TRUE;
+	if (ln->mm < pl->mm || ln->mm - pl->mm > 5)
+		return TRUE;
+	return FALSE;
+}
+
+I64 YhNDig(I64 v)
+{//Printed width of a non-negative count (for laying out footer buttons).
+	I64 d = 1;
+
+	while (v >= 10)
+	{
+		v /= 10;
+		d++;
+	}
+	return d;
+}
+
+U0 YhDrawTextRun(CDC *dc, I64 x, I64 y, U8 *seg, CColorROPU32 pen)
+{//Draw a text segment, substituting cached custom-emoji IMAGES for :name:
+//shortcodes (falls back to the literal :name: when the emoji isn't cached
+//or its image hasn't decoded yet). The emoji cache is the current server's.
+	U8	*p = seg, *colon;
+	U8	 name[40];
+	I64	 i, k, len, e;
+	Bool matched;
+
+	while (*p)
+	{
+		matched = FALSE;
+		if (*p == ':')
+		{
+			colon = StrFirstOcc(p + 1, ":");
+			len = 0;
+			if (colon)
+				len = colon - (p + 1);
+			k = -1;
+			if (colon && len >= 1 && len <= 31)
+			{
+				MemCopy(name, p + 1, len);
+				name[len] = 0;
+				for (i = 0; i < yh.em_n; i++)
+					if (!StrCompare(yh.em_names[i], name))
+						k = i;
+			}
+			if (k >= 0 && yh.em_img[k] >= 0)
+			{
+				e = yh.em_img[k];
+				if (yh.imgs[e].state == 2 && yh.imgs[e].dc)
+				{
+					GrBlot(dc, x, y - 1, yh.imgs[e].dc);
+					x += yh.imgs[e].dc->width + 1;
+				}
+				else
+				{//Not decoded yet: keep the shortcode text.
+					dc->color = pen;
+					GrPrint(dc, x, y, ":%s:", name);
+					x += (len + 2) * FONT_WIDTH;
+				}
+				p = colon + 1;
+				matched = TRUE;
+			}
+		}
+		if (!matched)
+		{
+			dc->color = pen;
+			GrPrint(dc, x, y, "%c", *p);
+			x += FONT_WIDTH;
+			p++;
+		}
+	}
+}
+
+U0 YhDrawPills(CDC *dc, I64 x, I64 y, U8 *react, I64 xmax, I64 mx, I64 my)
+{//Reaction pills: '|'-separated "imgidx~name~count" tokens. The emoji image
+//is drawn when decoded (12x12); hovering a pill arms the name tooltip.
+	U8	 tok[64], name[40], label[16];
+	I64	 n, w, img, cnt, i, j;
+	U8	*p = react;
+
+	while (*p)
+	{
+		n = 0;
+		while (*p && *p != '|' && n < 63)
+			tok[n++] = *p++;
+		tok[n] = 0;
+		if (*p == '|')
+			p++;
+		if (n)
+		{
+			//Parse "img~name~cnt".
+			img = Str2I64(tok);
+			name[0] = 0;
+			cnt = 1;
+			i = 0;
+			while (tok[i] && tok[i] != '~')
+				i++;
+			if (tok[i] == '~')
+			{
+				i++;
+				j = 0;
+				while (tok[i] && tok[i] != '~' && j < 39)
+					name[j++] = tok[i++];
+				name[j] = 0;
+				if (tok[i] == '~')
+					cnt = Str2I64(&tok[i + 1]);
+			}
+			StrPrint(label, "%d", cnt);	//Always show the count (Discord-style).
+
+			//16px-tall pill so the 12x12 emoji sits with a little padding.
+			if (img >= 0 && yh.imgs[img].state == 2)
+				w = 16 + StrLen(label) * FONT_WIDTH + 8;
+			else
+				w = (StrLen(name) + 2 + StrLen(label)) * FONT_WIDTH + 12;
+			if (x + w > xmax)
+				return;
+			dc->color = de_theme.bttn;
+			GrRect(dc, x, y, w, 16);
+			dc->color = de_theme.accent_dim;
+			GrRect(dc, x, y, w, 1);
+			GrRect(dc, x, y + 15, w, 1);
+			GrRect(dc, x, y, 1, 16);
+			GrRect(dc, x + w - 1, y, 1, 16);
+			if (img >= 0 && yh.imgs[img].state == 2)
+			{
+				GrBlot(dc, x + 2, y + 2, yh.imgs[img].dc);
+				dc->color = de_theme.text;
+				GrPrint(dc, x + 18, y + 4, "%s", label);
+			}
+			else
+			{
+				dc->color = de_theme.text;
+				GrPrint(dc, x + 5, y + 4, "%s %s", name, label);
+			}
+			if (x <= mx < x + w && y <= my < y + 16)
+			{//Arm the hover tooltip (drawn last in YhDrawChat).
+				StrPrint(yh.tip, ":%s:", name);
+				yh.tip_x = mx + 10;
+				yh.tip_y = my - 14;
+			}
+			x += w + 4;
+		}
+	}
+}
+
+U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
+			  I64 log_x, I64 log_y, I64 log_w, I64 log_h, I64 mx, I64 my)
+{//Mastodon-style cards, NEWEST AT THE TOP (social-feed order; the chat
+//keeps its bottom-up log). yh.scroll rows shift toward older cards below.
+	I64	 y = log_y + 4 - yh.scroll * YH_ROW_H;
+	I64	 first = MaxI64(0, cb->count - YH_MAX_LINES);
+	I64	 i = cb->count - 1, j, r, rows, avail, blen, seg, ytop, ih, ay, cardh;
+	I64	 imgn, imgi[4], fbx, w;
+	I64	 y0c = log_y, y1c = log_y + log_h;
+	I64	 cw = log_w - 4, tx = log_x + 12;
+	CYhLine	*ln, *boost, *il;
+	U8		 seg_buf[200], ts[8];
+	Bool	 hov;
+
+	avail = MaxI64(16, (cw - 20) / FONT_WIDTH);
+	imgn = 0;
+	while (i >= first && y < y1c)
+	{
+		ln = &cb->lines[i % YH_MAX_LINES];
+		if (ln->kind == YH_LK_IMG)
+		{//Media rides above its post in ring order; collect for the card.
+			if (imgn < 4)
+				imgi[imgn++] = i;
+			i--;
+		}
+		else if ((ln->kind == YH_LK_MSG || ln->kind == YH_LK_SELF) && ln->id[0])
+		{
+			boost = NULL;
+			if (i - 1 >= first)
+			{
+				il = &cb->lines[(i - 1) % YH_MAX_LINES];
+				if (il->kind == YH_LK_SYSTEM && !StrNCompare(il->text, "boosted", 7))
+					boost = il;
+			}
+			blen = StrLen(ln->text);
+			rows = MaxI64(1, (blen + avail - 1) / avail);
+			ih = 0;
+			for (j = 0; j < imgn; j++)
+			{
+				il = &cb->lines[imgi[j] % YH_MAX_LINES];
+				if (il->img >= 0 && yh.imgs[il->img].state == 2)
+					ih += yh.imgs[il->img].dc->height + 6;
+				else
+					ih += YH_ROW_H;
+			}
+			cardh = 16 + YH_HDR_H + rows * YH_ROW_H + ih + YH_ROW_H + 4;
+			if (boost)
+				cardh += YH_ROW_H;
+			ytop = y;
+
+			if (ytop < y1c && ytop + cardh > y0c)
+			{
+				hov = log_x <= mx < log_x + cw && ytop <= my < ytop + cardh;
+				dc->color = de_theme.panel;
+				YhCRect(dc, log_x, ytop, cw, cardh, y0c, y1c);
+				if (hov)
+					dc->color = de_theme.accent_dim;
+				else
+					dc->color = de_theme.panel_edge;
+				YhCRect(dc, log_x, ytop, cw, 1, y0c, y1c);
+				YhCRect(dc, log_x, ytop + cardh - 1, cw, 1, y0c, y1c);
+				YhCRect(dc, log_x, ytop, 1, cardh, y0c, y1c);
+				YhCRect(dc, log_x + cw - 1, ytop, 1, cardh, y0c, y1c);
+
+				ay = ytop + 8;
+				if (boost)
+				{
+					if (ay >= y0c && ay + FONT_HEIGHT <= y1c)
+					{
+						dc->color = de_theme.text_dim;
+						GrPrint(dc, tx, ay, "^ %s %s", boost->nick, boost->text);
+					}
+					ay += YH_ROW_H;
+				}
+				//Header: 16x16 avatar + author + time.
+				if (ay >= y0c && ay + 16 <= y1c)
+				{
+					if (ln->av >= 0 && yh.imgs[ln->av].state == 2)
+						GrBlot(dc, tx, ay, yh.imgs[ln->av].dc);
+					else
+					{
+						dc->color = YhNickPen(ln->nick);
+						GrRect(dc, tx, ay, 16, 16);
+						dc->color = de_theme.win_bg;
+						GrPrint(dc, tx + 4, ay + 4, "%c", ln->nick[0]);
+					}
+					dc->color = YhNickPen(ln->nick);
+					GrPrint(dc, tx + YH_IND, ay + 4, "%s", ln->nick);
+					StrPrint(ts, "%02d:%02d", ln->hh, ln->mm);
+					dc->color = de_theme.text_dim;
+					GrPrint(dc, log_x + cw - 6 * FONT_WIDTH, ay + 4, "%s", ts);
+					YhHitPush(ay, ay + YH_HDR_H, tx,
+							  tx + YH_IND + StrLen(ln->nick) * FONT_WIDTH,
+							  yh.cur_chan, i);
+				}
+				ay += YH_HDR_H;
+				//Body text.
+				dc->color = de_theme.text;
+				for (r = 0; r < rows; r++)
+				{
+					if (ay >= y0c && ay + FONT_HEIGHT <= y1c)
+					{
+						seg = MinI64(avail, blen - r * avail);
+						if (seg < 0)
+							seg = 0;
+						MemCopy(seg_buf, &ln->text[r * avail], seg);
+						seg_buf[seg] = 0;
+						YhDrawTextRun(dc, tx, ay, seg_buf, de_theme.text);
+					}
+					ay += YH_ROW_H;
+				}
+				//Media (restore original order: collected newest-first).
+				for (j = imgn - 1; j >= 0; j--)
+				{
+					il = &cb->lines[imgi[j] % YH_MAX_LINES];
+					if (il->img >= 0 && yh.imgs[il->img].state == 2)
+					{
+						if (ay >= y0c && ay + yh.imgs[il->img].dc->height <= y1c)
+						{
+							GrBlot(dc, tx, ay, yh.imgs[il->img].dc);
+							//nx0 = -1 marks an image hit (click -> lightbox).
+							YhHitPush(ay, ay + yh.imgs[il->img].dc->height,
+									  0, 0, yh.cur_chan, imgi[j], 5);
+						}
+						ay += yh.imgs[il->img].dc->height + 6;
+					}
+					else
+					{
+						if (ay >= y0c && ay + FONT_HEIGHT <= y1c)
+						{
+							dc->color = de_theme.text_dim;
+							GrPrint(dc, tx, ay, "[media loading...]");
+						}
+						ay += YH_ROW_H;
+					}
+				}
+					//Action footer: reply / boost / fav / bookmark. Distinct nx0
+					//codes let the click handler tell the buttons apart.
+					ay += 2;
+					if (ay >= y0c && ay + FONT_HEIGHT <= y1c)
+					{
+						fbx = tx;
+						dc->color = de_theme.accent_dim;
+						GrPrint(dc, fbx, ay, "reply %d", ln->rc);
+						w = (7 + YhNDig(ln->rc)) * FONT_WIDTH;
+						YhHitPush(ay, ay + YH_ROW_H, fbx, fbx + w, yh.cur_chan, i, 1);
+						fbx += w;
+						dc->color = yh.c_green;
+						GrPrint(dc, fbx, ay, "boost %d", ln->bc);
+						w = (7 + YhNDig(ln->bc)) * FONT_WIDTH;
+						YhHitPush(ay, ay + YH_ROW_H, fbx, fbx + w, yh.cur_chan, i, 2);
+						fbx += w;
+						dc->color = de_theme.accent;
+						GrPrint(dc, fbx, ay, "fav %d", ln->fc);
+						w = (5 + YhNDig(ln->fc)) * FONT_WIDTH;
+						YhHitPush(ay, ay + YH_ROW_H, fbx, fbx + w, yh.cur_chan, i, 3);
+						fbx += w;
+						dc->color = de_theme.text_dim;
+						GrPrint(dc, fbx, ay, "mark");
+						YhHitPush(ay, ay + YH_ROW_H, fbx, fbx + 5 * FONT_WIDTH, yh.cur_chan, i, 4);
+					}
+			}
+			y = ytop + cardh + 8;	//Card gap.
+			imgn = 0;
+			if (boost)
+				i--;
+			i--;
+		}
+		else
+		{//Status / error lines: plain dim row.
+			if (y >= y0c && y + FONT_HEIGHT <= y1c)
+			{
+				dc->color = de_theme.text_dim;
+				GrPrint(dc, log_x + 4, y, "%s", ln->text);
+			}
+			y += YH_ROW_H;
+			i--;
+		}
+	}
+	if (yh.scroll)
+	{
+		dc->color = de_theme.chip_hot;
+		GrPrint(dc, log_x + log_w - 10 * FONT_WIDTH, log_y, "(scrolled)");
+	}
+}
+
+U0 YhDrawChat(CTask *task, CDC *dc)
+{
+	CYhChan		*ch, *cb = NULL;
+	CYhServer	*sv;
+	CYhLine		*ln;
+	CColorROPU32 head_pen, body_pen;
+	I64	 i, x, y, w, r, rows, avail, blen, hlen, first, seg, cpl, y1c;
+	I64	 tab_y = 4, tab_h = 20, tab_lim;
+	I64	 in_h = 22;
+	I64	 in_y = task->pix_height - in_h - 4;
+	I64	 log_y = tab_h + 12;
+	I64	 log_x = YH_CHAN_PANEL_W + 16;
+	I64	 log_w = task->pix_width - log_x - 8;
+	I64	 log_h = in_y - 6 - log_y;
+	I64	 mx = mouse.pos.x - task->pix_left - task->scroll_x;
+	I64	 my = mouse.pos.y - task->pix_top - task->scroll_y;
+	Bool hov;
+	U8	 head[72], seg_buf[200], buf2[240];
+
+	if (yh.cur_chan >= 0)
+		cb = &yh.chans[yh.cur_chan];
+	cpl = MaxI64(16, log_w / FONT_WIDTH);
+	yh.hit_count = 0;	//Rebuilt below; read by the click handlers.
+	yh.tip[0] = 0;		//Pill tooltip re-armed by hover each frame.
+
+	//Right-pinned: [Fediverse][DMs][live] from the right edge, always visible.
+	x = task->pix_width - 8 - 5 * FONT_WIDTH;	//Realtime state chip.
+	if (yh.ws_ok)
+	{
+		dc->color = yh.c_green;
+		GrPrint(dc, x, tab_y + 4, "live");
+	}
+	else
+	{
+		dc->color = de_theme.text_dim;
+		GrPrint(dc, x, tab_y + 4, "poll");
+	}
+	w = 3 * FONT_WIDTH + 16;	//DMs tab.
+	x -= w + 4;
+	yh.dm_tab_x = x;
+	yh.dm_tab_w = w;
+	if (yh.cur_srv == YH_SRV_DM)
+		dc->color = de_theme.accent_dim;
+	else
+		dc->color = de_theme.bttn;
+	GrRect(dc, x, tab_y, w, tab_h);
+	YhDrawEdge(dc, x, tab_y, w, tab_h);
+	if (yh.cur_srv == YH_SRV_DM)
+		dc->color = de_theme.text;
+	else
+		dc->color = de_theme.text_dim;
+	GrPrint(dc, x + 8, tab_y + (tab_h - FONT_HEIGHT) / 2, "DMs");
+	w = 9 * FONT_WIDTH + 16;	//Fediverse tab.
+	x -= w + 4;
+	yh.feed_tab_x = x;
+	yh.feed_tab_w = w;
+	if (yh.cur_srv == YH_SRV_FEED)
+		dc->color = de_theme.accent_dim;
+	else
+		dc->color = de_theme.bttn;
+	GrRect(dc, x, tab_y, w, tab_h);
+	YhDrawEdge(dc, x, tab_y, w, tab_h);
+	if (yh.cur_srv == YH_SRV_FEED)
+		dc->color = de_theme.text;
+	else
+		dc->color = de_theme.chip_hot;
+	GrPrint(dc, x + 8, tab_y + (tab_h - FONT_HEIGHT) / 2, "Fediverse");
+	tab_lim = x - 8;	//Server tabs must stay left of this.
+
+	//Server tabs, scrolling window starting at yh.tab_scroll; "<"/">" arrow
+	//chips appear when tabs overflow either side.
+	for (i = 0; i < yh.num_servers; i++)
+		yh.servers[i].tab_w = 0;	//Hidden unless drawn below.
+	yh.tab_scroll = ClampI64(yh.tab_scroll, 0, MaxI64(0, yh.num_servers - 1));
+	x = 8;
+	yh.tl_w = 0;
+	yh.tr_w = 0;
+	if (yh.tab_scroll > 0)
+	{
+		yh.tl_x = x;
+		yh.tl_w = 18;
+		dc->color = de_theme.bttn_hot;
+		GrRect(dc, x, tab_y, 18, tab_h);
+		YhDrawEdge(dc, x, tab_y, 18, tab_h);
+		dc->color = de_theme.text;
+		GrPrint(dc, x + 5, tab_y + (tab_h - FONT_HEIGHT) / 2, "<");
+		x += 22;
+	}
+	for (i = yh.tab_scroll; i < yh.num_servers; i++)
+	{
+		sv = &yh.servers[i];
+		w = StrLen(sv->name) * FONT_WIDTH + 16 + 18;	//Always an icon slot.
+		sv->tab_x = x;
+		if (x + w > tab_lim - 22)
+		{//Out of room: show the ">" scroll chip and stop.
+			yh.tr_x = x;
+			yh.tr_w = 18;
+			dc->color = de_theme.bttn_hot;
+			GrRect(dc, x, tab_y, 18, tab_h);
+			YhDrawEdge(dc, x, tab_y, 18, tab_h);
+			dc->color = de_theme.text;
+			GrPrint(dc, x + 5, tab_y + (tab_h - FONT_HEIGHT) / 2, ">");
+			break;
+		}
+		sv->tab_w = w;
+		if (i == yh.cur_srv)
+			dc->color = de_theme.accent_dim;
+		else
+			dc->color = de_theme.bttn;
+		GrRect(dc, x, tab_y, w, tab_h);
+		YhDrawEdge(dc, x, tab_y, w, tab_h);
+		//Icon: real 16x16 if decoded, else a colored initial chip. Every
+		//server gets one (null-icon servers used to show nothing at all).
+		if (sv->icon >= 0 && yh.imgs[sv->icon].state == 2)
+			GrBlot(dc, x + 3, tab_y + 2, yh.imgs[sv->icon].dc);
+		else
+		{
+			dc->color = YhNickPen(sv->name);
+			GrRect(dc, x + 3, tab_y + 2, 16, 16);
+			dc->color = de_theme.win_bg;
+			GrPrint(dc, x + 3 + (16 - FONT_WIDTH) / 2, tab_y + 2 + (16 - FONT_HEIGHT) / 2,
+					"%c", sv->name[0]);
+		}
+		r = x + 22;	//Text start (past the icon).
+		if (i == yh.cur_srv)
+			dc->color = de_theme.text;
+		else
+			dc->color = de_theme.text_dim;
+		GrPrint(dc, r, tab_y + (tab_h - FONT_HEIGHT) / 2, "%s", sv->name);
+		x += w + 4;
+	}
+
+	//Channel panel (left).
+	dc->color = de_theme.panel;
+	GrRect(dc, 8, log_y - 2, YH_CHAN_PANEL_W, log_h + 2);
+	YhDrawEdge(dc, 8, log_y - 2, YH_CHAN_PANEL_W, log_h + 2);
+	dc->color = de_theme.accent_dim;
+	if (yh.cur_srv == YH_SRV_DM)
+	{
+		GrPrint(dc, 14, log_y + 6, "DMs");
+		yh.dmnew_y = log_y + log_h - 16;
+		dc->color = de_theme.chip_hot;
+		GrPrint(dc, 14, yh.dmnew_y, "+ new dm");
+	}
+	else
+		GrPrint(dc, 14, log_y + 6, "channels");
+	r = 0;
+	for (i = 0; i < yh.num_chans; i++)
+	{//No `continue` in ZealC: filter with a plain if instead.
+		ch = &yh.chans[i];
+		if (ch->server == yh.cur_srv)
+		{
+			y = log_y + 22 + r * (YH_ROW_H + 4);
+			if (y + FONT_HEIGHT > log_y + log_h)
+				break;
+			if (i == yh.cur_chan)
+				dc->color = de_theme.text;
+			else if (ch->unread)
+				dc->color = de_theme.chip_hot;
+			else
+				dc->color = de_theme.text_dim;
+			StrCopy(buf2, ch->name);
+			if (StrLen(buf2) > 17)
+				buf2[17] = 0;
+			if (ch->unread)
+				GrPrint(dc, 14, y, "#%s (%d)", buf2, MinI64(ch->unread, 99));
+			else
+				GrPrint(dc, 14, y, "#%s", buf2);
+			r++;
+		}
+	}
+
+	//Chat log, bottom-up, Discord-style grouping. The Fediverse feed gets
+	//card rendering instead. Everything pixel-clipped to the log band.
+	if (cb && cb->server == YH_SRV_FEED && !StrCompare(cb->name, "~profile"))
+	{//Federated profile view: header block + the author's posts as cards.
+		y = log_y;
+		//Back chip.
+		yh.pv_back_x = log_x + log_w - 62;
+		yh.pv_back_w = 58;
+		dc->color = de_theme.bttn;
+		GrRect(dc, yh.pv_back_x, y, yh.pv_back_w, 14);
+		YhDrawEdge(dc, yh.pv_back_x, y, yh.pv_back_w, 14);
+		dc->color = de_theme.text_dim;
+		GrPrint(dc, yh.pv_back_x + 6, y + 3, "< feed");
+		//Avatar + name @domain.
+		if (yh.pv_av >= 0 && yh.imgs[yh.pv_av].state == 2)
+			GrBlot(dc, log_x, y, yh.imgs[yh.pv_av].dc);
+		else
+		{
+			dc->color = YhNickPen(yh.pv_name);
+			GrRect(dc, log_x, y, 16, 16);
+		}
+		dc->color = YhNickPen(yh.pv_name);
+		GrPrint(dc, log_x + 22, y + 4, "%s", yh.pv_name);
+		dc->color = de_theme.text_dim;
+		GrPrint(dc, log_x + 22 + (StrLen(yh.pv_name) + 1) * FONT_WIDTH, y + 4,
+				" @%s", yh.pv_domain);
+		y += 20;
+		//Bio (one truncated row).
+		if (yh.pv_bio[0])
+		{
+			StrCopy(buf2, yh.pv_bio);
+			if (StrLen(buf2) > cpl - 4)
+				buf2[cpl - 4] = 0;
+			dc->color = de_theme.text_dim;
+			GrPrint(dc, log_x, y, "%s", buf2);
+		}
+		y += 13;
+		//Counts row (followers / following are clickable lists).
+		yh.pv_fl_y = y;
+		dc->color = de_theme.text;
+		GrPrint(dc, log_x, y, "%d posts", yh.pv_posts);
+		dc->color = de_theme.chip_hot;
+		GrPrint(dc, log_x + 14 * FONT_WIDTH, y, "%d followers", yh.pv_followers);
+		GrPrint(dc, log_x + 30 * FONT_WIDTH, y, "%d following", yh.pv_following);
+		y += 14;
+		//Follow / unfollow button.
+		yh.pv_btn_x = log_x;
+		yh.pv_btn_y = y;
+		yh.pv_btn_w = 11 * FONT_WIDTH + 12;
+		if (yh.pv_isfollowing)
+			dc->color = de_theme.bttn;
+		else
+			dc->color = de_theme.bttn_hot;
+		GrRect(dc, yh.pv_btn_x, y, yh.pv_btn_w, 16);
+		YhDrawEdge(dc, yh.pv_btn_x, y, yh.pv_btn_w, 16);
+		dc->color = de_theme.text;
+		if (yh.pv_isfollowing)
+			GrPrint(dc, yh.pv_btn_x + 6, y + 4, "Following x");
+		else
+			GrPrint(dc, yh.pv_btn_x + 6, y + 4, "Follow +");
+		y += 22;
+		dc->color = de_theme.panel_edge;
+		GrRect(dc, log_x, y - 3, log_w, 1);
+		if (cb->lines)
+			YhDrawFeed(task, dc, cb, log_x, y, log_w, log_h - (y - log_y), mx, my);
+	}
+	else if (cb && cb->server == YH_SRV_FEED)
+	{//Timeline: sub-tab strip (Home / Local / All / Marks) above the cards.
+		y = log_y;
+		x = log_x;
+		for (i = 0; i < 4; i++)
+		{
+			if (i == 0)
+				StrCopy(buf2, "Home");
+			else if (i == 1)
+				StrCopy(buf2, "Local");
+			else if (i == 2)
+				StrCopy(buf2, "All");
+			else
+				StrCopy(buf2, "Marks");
+			w = StrLen(buf2) * FONT_WIDTH + 14;
+			yh.fm_x[i] = x;
+			yh.fm_w[i] = w;
+			if (i == yh.feed_mode)
+				dc->color = de_theme.accent_dim;
+			else
+				dc->color = de_theme.bttn;
+			GrRect(dc, x, y, w, 16);
+			YhDrawEdge(dc, x, y, w, 16);
+			if (i == yh.feed_mode)
+				dc->color = de_theme.text;
+			else
+				dc->color = de_theme.text_dim;
+			GrPrint(dc, x + 7, y + 4, "%s", buf2);
+			x += w + 5;
+		}
+		if (cb->lines)
+			YhDrawFeed(task, dc, cb, log_x, log_y + 20, log_w, log_h - 20, mx, my);
+		else
+		{
+			dc->color = de_theme.text_dim;
+			GrPrint(dc, log_x, log_y + 26, "(loading...)");
+		}
+	}
+	else if (cb && cb->lines)
+	{
+		y1c = log_y + log_h;
+		y = y1c - 4 + yh.scroll * YH_ROW_H;	//Scroll pushes content down.
+		first = MaxI64(0, cb->count - YH_MAX_LINES);
+		i = cb->count - 1;
+		while (i >= first && y > log_y)
+		{
+			ln = &cb->lines[i % YH_MAX_LINES];
+			if (ln->kind == YH_LK_IMG)
+			{//Inline image block.
+				if (ln->img >= 0 && yh.imgs[ln->img].state == 2)
+				{
+					y -= yh.imgs[ln->img].dc->height + 4;
+					if (y >= log_y &&
+						y + yh.imgs[ln->img].dc->height <= y1c)
+					{
+						GrBlot(dc, log_x + YH_IND, y, yh.imgs[ln->img].dc);
+						//nx0 = -1 marks an image (click -> lightbox).
+						YhHitPush(y, y + yh.imgs[ln->img].dc->height,
+								  0, 0, yh.cur_chan, i, 5);
+					}
+				}
+				else
+				{
+					y -= YH_ROW_H;
+					if (y >= log_y && y + FONT_HEIGHT <= y1c)
+					{
+						dc->color = de_theme.text_dim;
+						if (ln->img >= 0 && yh.imgs[ln->img].state != 3)
+							GrPrint(dc, log_x + YH_IND, y, "[image loading...]");
+						else
+							GrPrint(dc, log_x + YH_IND, y, "[image]");
+					}
+				}
+			}
+			else if (ln->kind == YH_LK_MSG || ln->kind == YH_LK_SELF)
+			{//Message: optional pill row, wrapped text, optional group header.
+				if (ln->react[0])
+				{
+					y -= YH_PILL_H;
+					if (y >= log_y && y + 12 <= y1c)
+						YhDrawPills(dc, log_x + YH_IND, y, ln->react,
+									log_x + log_w, mx, my);
+				}
+				avail = MaxI64(8, cpl - 3);	//3 chars = the avatar indent.
+				blen = StrLen(ln->text);
+				rows = MaxI64(1, (blen + avail - 1) / avail);
+				y -= rows * YH_ROW_H;
+				hov = log_x <= mx < log_x + log_w &&
+					  y <= my < y + rows * YH_ROW_H;
+				if (hov)
+				{
+					dc->color = de_theme.panel;
+					YhCRect(dc, log_x - 2, y - 1, log_w + 2,
+							rows * YH_ROW_H + 1, log_y, y1c);
+				}
+				dc->color = de_theme.text;
+				for (r = 0; r < rows; r++)
+				{
+					if (y + r * YH_ROW_H >= log_y &&
+						y + r * YH_ROW_H + FONT_HEIGHT <= y1c)
+					{
+						seg = MinI64(avail, blen - r * avail);
+						if (seg < 0)
+							seg = 0;
+						MemCopy(seg_buf, &ln->text[r * avail], seg);
+						seg_buf[seg] = 0;
+						YhDrawTextRun(dc, log_x + YH_IND, y + r * YH_ROW_H,
+									  seg_buf, de_theme.text);
+					}
+				}
+				YhHitPush(y, y + rows * YH_ROW_H, 0, 0, yh.cur_chan, i);
+				if (YhIsGroupHead(cb, i, first))
+				{//Header row: 16x16 avatar, colored name, dim time.
+					y -= YH_HDR_H;
+					hov = log_x <= mx < log_x + log_w &&
+						  y <= my < y + YH_HDR_H;
+					if (y >= log_y && y + 16 <= y1c)
+					{
+						if (hov)
+						{
+							dc->color = de_theme.panel;
+							GrRect(dc, log_x - 2, y, log_w + 2, YH_HDR_H);
+						}
+						if (ln->av >= 0 && yh.imgs[ln->av].state == 2)
+							GrBlot(dc, log_x, y, yh.imgs[ln->av].dc);
+						else
+						{//Colored initial chip (webp / still loading).
+							dc->color = YhNickPen(ln->nick);
+							GrRect(dc, log_x, y, 16, 16);
+							dc->color = de_theme.win_bg;
+							GrPrint(dc, log_x + 4, y + 4, "%c", ln->nick[0]);
+						}
+						dc->color = YhNickPen(ln->nick);
+						GrPrint(dc, log_x + YH_IND, y + 4, "%s", ln->nick);
+						dc->color = de_theme.text_dim;
+						GrPrint(dc, log_x + YH_IND +
+								(StrLen(ln->nick) + 1) * FONT_WIDTH, y + 4,
+								" %02d:%02d", ln->hh, ln->mm);
+					}
+					YhHitPush(y, y + YH_HDR_H, log_x,
+							  log_x + YH_IND + StrLen(ln->nick) * FONT_WIDTH,
+							  yh.cur_chan, i);
+					y -= YH_GAP;
+				}
+			}
+			else
+			{//Status / error / reply / system rows.
+				YhLineHead(ln, head, &head_pen, &body_pen);
+				hlen = StrLen(head);
+				avail = MaxI64(8, cpl - hlen - 3);
+				blen = StrLen(ln->text);
+				rows = MaxI64(1, (blen + avail - 1) / avail);
+				y -= rows * YH_ROW_H;
+				for (r = 0; r < rows; r++)
+				{
+					if (y + r * YH_ROW_H >= log_y &&
+						y + r * YH_ROW_H + FONT_HEIGHT <= y1c)
+					{
+						seg = MinI64(avail, blen - r * avail);
+						if (seg < 0)
+							seg = 0;
+						MemCopy(seg_buf, &ln->text[r * avail], seg);
+						seg_buf[seg] = 0;
+						if (r == 0)
+						{
+							if (ln->kind == YH_LK_REPLY)
+							{//Accent quote bar, webapp-style.
+								dc->color = de_theme.accent_dim;
+								GrRect(dc, log_x + YH_IND, y, 2, YH_ROW_H);
+							}
+							dc->color = head_pen;
+							GrPrint(dc, log_x + YH_IND + 6, y, "%s", head);
+						}
+						dc->color = body_pen;
+						GrPrint(dc, log_x + YH_IND + 6 + hlen * FONT_WIDTH,
+								y + r * YH_ROW_H, "%s", seg_buf);
+					}
+				}
+			}
+			i--;
+		}
+		if (yh.scroll)
+		{
+			dc->color = de_theme.chip_hot;
+			GrPrint(dc, log_x + log_w - 10 * FONT_WIDTH, log_y, "(scrolled)");
+		}
+	}
+	else
+	{
+		dc->color = de_theme.text_dim;
+		GrPrint(dc, log_x, log_y + 4, "(no channel)");
+	}
+
+	//Input bar. A ":)" emoji button + (on the feed) a visibility chip sit at
+	//the right edge; the text field fills the space between.
+	dc->color = de_theme.panel;
+	GrRect(dc, 4, in_y, task->pix_width - 8, in_h);
+	YhDrawEdge(dc, 4, in_y, task->pix_width - 8, in_h);
+	yh.emoji_btn_x = task->pix_width - 8 - 22;
+	dc->color = de_theme.bttn_hot;
+	GrRect(dc, yh.emoji_btn_x, in_y + 3, 20, in_h - 6);
+	YhDrawEdge(dc, yh.emoji_btn_x, in_y + 3, 20, in_h - 6);
+	dc->color = de_theme.text;
+	GrPrint(dc, yh.emoji_btn_x + 3, in_y + (in_h - FONT_HEIGHT) / 2, ":)");
+	yh.vis_btn_x = 0;
+	if (cb && cb->server == YH_SRV_FEED && StrCompare(cb->name, "~profile"))
+	{//Post-visibility chip (cycles public/unlisted/followers/direct).
+		w = 4 * FONT_WIDTH + 8;
+		yh.vis_btn_x = yh.emoji_btn_x - w - 4;
+		yh.vis_btn_w = w;
+		dc->color = de_theme.bttn;
+		GrRect(dc, yh.vis_btn_x, in_y + 3, w, in_h - 6);
+		YhDrawEdge(dc, yh.vis_btn_x, in_y + 3, w, in_h - 6);
+		dc->color = de_theme.accent;
+		if (yh.post_vis == 0)
+			StrCopy(buf2, "pub");
+		else if (yh.post_vis == 1)
+			StrCopy(buf2, "unl");
+		else if (yh.post_vis == 2)
+			StrCopy(buf2, "fol");
+		else
+			StrCopy(buf2, "dm");
+		GrPrint(dc, yh.vis_btn_x + 4, in_y + (in_h - FONT_HEIGHT) / 2, "%s", buf2);
+	}
+	//"+" attach button at the left edge.
+	yh.plus_btn_x = 8;
+	dc->color = de_theme.bttn_hot;
+	GrRect(dc, yh.plus_btn_x, in_y + 3, 16, in_h - 6);
+	YhDrawEdge(dc, yh.plus_btn_x, in_y + 3, 16, in_h - 6);
+	dc->color = de_theme.text;
+	GrPrint(dc, yh.plus_btn_x + 4, in_y + (in_h - FONT_HEIGHT) / 2, "+");
+	if (cb && yh.reply_to[0])
+		StrPrint(buf2, "[#%s > @%s] ", cb->name, yh.reply_nick);
+	else if (cb)
+		StrPrint(buf2, "[#%s] ", cb->name);
+	else
+		StrCopy(buf2, "[-] ");
+	dc->color = de_theme.accent;
+	GrPrint(dc, 28, in_y + (in_h - FONT_HEIGHT) / 2, "%s", buf2);
+	x = 28 + StrLen(buf2) * FONT_WIDTH;
+
+	//Staged-attachment helper strip just above the composer (webapp-style).
+	if (yh.att_on)
+	{
+		dc->color = de_theme.panel;
+		GrRect(dc, 4, in_y - 16, task->pix_width - 8, 14);
+		YhDrawEdge(dc, 4, in_y - 16, task->pix_width - 8, 14);
+		dc->color = de_theme.text_dim;
+		GrPrint(dc, 10, in_y - 13, "attach: %s", yh.att_file);
+		yh.att_x_x = task->pix_width - 26;
+		dc->color = yh.c_red;
+		GrPrint(dc, yh.att_x_x, in_y - 13, "[x]");
+	}
+	//Text field ends before whichever right-edge chip is nearest.
+	if (yh.vis_btn_x)
+		w = (yh.vis_btn_x - 6 - x) / FONT_WIDTH - 1;
+	else
+		w = (yh.emoji_btn_x - 6 - x) / FONT_WIDTH - 1;
+	i = 0;
+	if (yh.input_len > w)
+		i = yh.input_len - w;
+	if (Blink)
+		StrPrint(buf2, "%s_", &yh.input[i]);
+	else
+		StrPrint(buf2, "%s", &yh.input[i]);
+	dc->color = de_theme.text;
+	GrPrint(dc, x, in_y + (in_h - FONT_HEIGHT) / 2, "%s", buf2);
+
+	//Pill hover tooltip (webapp-style: emoji name near the cursor).
+	if (yh.tip[0] && !yh.menu_on)
+	{
+		w = StrLen(yh.tip) * FONT_WIDTH + 10;
+		x = ClampI64(yh.tip_x, 0, task->pix_width - w - 2);
+		y = ClampI64(yh.tip_y, 0, task->pix_height - 16);
+		dc->color = de_theme.win_bg;
+		GrRect(dc, x, y, w, 14);
+		YhDrawEdge(dc, x, y, w, 14);
+		dc->color = de_theme.text;
+		GrPrint(dc, x + 5, y + 3, "%s", yh.tip);
+	}
+
+	//In-window context menu, anchored at the click position.
+	if (yh.menu_on)
+	{
+		w = 12;
+		for (i = 0; i < yh.menu_n; i++)
+			w = MaxI64(w, StrLen(yh.menu_items[i]) * FONT_WIDTH + 26);
+		x = ClampI64(yh.menu_x, 0, task->pix_width - w - 2);
+		y = ClampI64(yh.menu_y, 0, task->pix_height - yh.menu_n * 14 - 8);
+		dc->color = de_theme.panel;
+		GrRect(dc, x, y, w, yh.menu_n * 14 + 6);
+		YhDrawEdge(dc, x, y, w, yh.menu_n * 14 + 6);
+		for (i = 0; i < yh.menu_n; i++)
+		{
+			r = y + 3 + i * 14;
+			if (x <= mx < x + w && r <= my < r + 14)
+			{
+				dc->color = de_theme.accent_dim;
+				GrRect(dc, x + 1, r, w - 2, 14);
+				dc->color = de_theme.text;
+			}
+			else
+				dc->color = de_theme.text_dim;
+			if ((yh.menu_mode == 1 || yh.menu_mode == 3) && i < yh.em_n &&
+				yh.em_img[i] >= 0 && yh.imgs[yh.em_img[i]].state == 2)
+				GrBlot(dc, x + 4, r + 1, yh.imgs[yh.em_img[i]].dc);
+			GrPrint(dc, x + 18, r + 3, "%s", yh.menu_items[i]);
+		}
+		//Remember the drawn geometry for the click handler.
+		yh.menu_x = x;
+		yh.menu_y = y;
+	}
+
+	//Image lightbox: darken + center the full-size image. Click/<ESC> closes.
+	if (yh.light_on)
+	{
+		dc->color = de_theme.win_bg;
+		GrRect(dc, 0, 0, task->pix_width, task->pix_height);
+		if (yh.light_img >= 0 && yh.imgs[yh.light_img].state == 2)
+		{
+			x = MaxI64(0, (task->pix_width - yh.imgs[yh.light_img].dc->width) / 2);
+			y = MaxI64(0, (task->pix_height - yh.imgs[yh.light_img].dc->height) / 2);
+			GrBlot(dc, x, y, yh.imgs[yh.light_img].dc);
+		}
+		else if (yh.light_img >= 0 && yh.imgs[yh.light_img].state == 3)
+		{
+			dc->color = yh.c_red;
+			GrPrint(dc, task->pix_width / 2 - 8 * FONT_WIDTH,
+					task->pix_height / 2, "(image failed to load)");
+		}
+		else
+		{
+			dc->color = de_theme.text_dim;
+			GrPrint(dc, task->pix_width / 2 - 6 * FONT_WIDTH,
+					task->pix_height / 2, "(loading...)");
+		}
+		dc->color = de_theme.text_dim;
+		GrPrint(dc, 8, 4, "click or <ESC> to close");
+	}
+}
+
+U0 YhDrawIt(CTask *task, CDC *dc)
+{
+	dc->color = de_theme.win_bg;
+	GrRect(dc, 0, 0, task->pix_width, task->pix_height);
+	if (yh.state == YH_ST_FORM)
+		YhDrawForm(task, dc);
+	else
+		YhDrawChat(task, dc);
+}
+
+/***** login flow *****/
+
+U0 YhLogin()
+{
+	StrCopy(yh.f_status, "Logging in...");
+	if (!YhAuth)
+	{//Cached url/anon may be stale (instance redeployed with a new JWT
+	 //secret): rediscover once and retry before giving up.
+		if (!yh.f_host[0])
+			return;
+		yh.f_url[0] = 0;
+		yh.f_anon[0] = 0;
+		if (!YhDiscover)
+			return;
+		StrCopy(yh.f_status, "Retrying login...");
+		if (!YhAuth)
+			return;
+	}
+	YhConfigSave;
+	yh.state = YH_ST_CHAT;
+	StrPrint(Fs->task_title, "yHarmony - %s", yh.username);
+	if (!yh.img_task)
+		yh.img_task = Spawn(&YhImgLoaderTask, NULL, "yHarmonyImg",, Fs);
+	YhFetchServers;
+	YhFeedChan;	//Create the fediverse feed pseudo-channel.
+	YhFetchDMs;	//DM conversations as pseudo-channels.
+	if (yh.num_servers)
+		YhSwitchServer(0);
+	YhWsConnect;
+	yh.poll_deadline = counts.jiffies + 3 * JIFFY_FREQ;
+}
+
+/***** settings *****/
+
+U0 YhConfigMenu()
+{//Blocking pop-up settings. Loops so toggles apply without reopening.
+	I64	 sel;
+	U8	 list[320], *w, *onoff, *rt;
+
+	while (TRUE)
+	{
+		if (yh.f_autoconn)
+			onoff = "ON";
+		else
+			onoff = "OFF";
+		if (yh.ws_ok)
+			rt = "live";
+		else
+			rt = "polling";
+		w = list;
+		w = YhListAdd(w, "Edit profile (name/bio/avatar)...");
+		w = YhListAdd(w, "Browse public servers...");
+		w = YhListAdd(w, "Auto-connect on launch: %s", onoff);
+		w = YhListAdd(w, "Reconnect realtime (now: %s)", rt);
+		w = YhListAdd(w, "Refresh servers + DMs");
+		w = YhListAdd(w, "Forget cached instance keys");
+		w = YhListAdd(w, "Close");
+		*w = 0;	//Double-NUL terminates the list.
+		sel = PopUpPickList(list);
+		switch (sel)
+		{
+			case 0:
+				YhProfileEditSelf;
+				return;
+			case 1:
+				sel = YhServerBrowse;
+				if (!sel)
+				{
+					YhStatus("No public servers found.");
+					return;
+				}
+				yh.menu_mode = 5;
+				yh.menu_n = sel;
+				yh.menu_x = 200;
+				yh.menu_y = 60;
+				yh.menu_on = TRUE;
+				return;
+			case 2:
+				yh.f_autoconn = !yh.f_autoconn;
+				YhConfigSave;
+				break;
+			case 3:
+				YhWsShutdown;
+				YhWsConnect;
+				break;
+			case 4:
+				YhResetData;		//Clean rebuild - no duplicate rows.
+				YhFetchServers;
+				YhFeedChan;
+				YhFetchDMs;
+				if (yh.num_servers)
+					YhSwitchServer(0);
+				return;
+			case 5:
+				yh.f_url[0] = 0;
+				yh.f_anon[0] = 0;
+				YhConfigSave;
+				YhStatus("Keys cleared; rediscovered on the next login.");
+				return;
+			default:	//Close or cancel.
+				return;
+		}
+	}
+}
+
+/***** input *****/
+
+U0 YhSubmit()
+{
+	U8 *slot;
+
+	if (!yh.input_len)
+	{//Attachment-only send is fine; empty otherwise = no-op.
+		if (yh.att_on && yh.cur_chan >= 0)
+		{
+			if (yh.chans[yh.cur_chan].server == YH_SRV_FEED)
+				YhSendPost("");
+			else
+				YhSendMessage("");
+		}
+		return;
+	}
+	if (yh.hist_count == YH_HIST_MAX)
+	{
+		MemCopy(yh.hist, yh.hist + YH_IN_MAX, (YH_HIST_MAX - 1) * YH_IN_MAX);
+		yh.hist_count--;
+	}
+	slot = yh.hist + yh.hist_count * YH_IN_MAX;
+	MemCopy(slot, yh.input, yh.input_len + 1);
+	yh.hist_count++;
+	yh.hist_pos = yh.hist_count;
+
+	if (yh.input[0] == '/')
+	{
+		if (!StrICompare(yh.input, "/quit"))
+			yh.quit = TRUE;
+		else if (!StrICompare(yh.input, "/reconnect"))
+		{
+			YhWsShutdown;
+			YhWsConnect;
+		}
+		else if (!StrICompare(yh.input, "/config"))
+			YhConfigMenu;
+		else if (!StrICompare(yh.input, "/upload"))
+		{
+			yh.input_len = 0;	//Clear before the blocking file picker.
+			yh.input[0] = 0;
+			YhAttachPick;	//Stages; sent with the next message.
+			return;
+		}
+		else
+		{
+			YhStatus("Commands: /quit /reconnect /config /upload");
+			YhStatus("TAB completes @names and :emojis: (else cycles channels)");
+			YhStatus("Feed: pick visibility chip; post cw with 'cw:warn|body'");
+		}
+	}
+	else if (yh.cur_chan >= 0 && yh.chans[yh.cur_chan].server == YH_SRV_FEED)
+		YhSendPost(yh.input);
+	else
+		YhSendMessage(yh.input);
+	yh.input_len = 0;
+	yh.input[0] = 0;
+	yh.scroll = 0;
+}
+
+U0 YhHistNav(I64 dir)
+{
+	U8 *slot;
+
+	yh.hist_pos = ClampI64(yh.hist_pos + dir, 0, yh.hist_count);
+	if (yh.hist_pos == yh.hist_count)
+	{
+		yh.input_len = 0;
+		yh.input[0] = 0;
+	}
+	else
+	{
+		slot = yh.hist + yh.hist_pos * YH_IN_MAX;
+		StrCopy(yh.input, slot);
+		yh.input_len = StrLen(yh.input);
+	}
+}
+
+U0 YhFormKey(I64 ch, I64 sc)
+{
+	U8	*vals[YH_NUM_F];
+	I64	 max[YH_NUM_F], len;
+	U8	*f;
+
+	vals[0] = yh.f_host;	max[0] = 126;
+	vals[1] = yh.f_email;	max[1] = 78;
+	vals[2] = yh.f_pass;	max[2] = 78;
+
+	if (ch == '\t')
+		yh.f_focus = (yh.f_focus + 1) % (YH_NUM_F + 1);
+	else if (ch == '\n')
+	{
+		if (yh.f_focus < YH_NUM_F)
+			yh.f_focus++;
+		if (yh.f_focus >= YH_NUM_F)
+			YhLogin;
+	}
+	else if (ch == CH_ESC || ch == CH_SHIFT_ESC)
+		yh.quit = TRUE;
+	else if (ch == CH_BACKSPACE && yh.f_focus < YH_NUM_F)
+	{
+		f = vals[yh.f_focus];
+		len = StrLen(f);
+		if (len)
+			f[len - 1] = 0;
+	}
+	else if (' ' <= ch < 0x7F && yh.f_focus < YH_NUM_F)
+	{
+		f = vals[yh.f_focus];
+		len = StrLen(f);
+		if (len < max[yh.f_focus])
+		{
+			f[len] = ch;
+			f[len + 1] = 0;
+		}
+	}
+	else if (!ch)
+	{
+		if (sc == SC_CURSOR_DOWN)
+			yh.f_focus = (yh.f_focus + 1) % (YH_NUM_F + 1);
+		else if (sc == SC_CURSOR_UP)
+			yh.f_focus = (yh.f_focus + YH_NUM_F) % (YH_NUM_F + 1);
+	}
+}
+
+U0 YhFormClick(I64 mx, I64 my)
+{
+	I64 fx = (Fs->pix_width - YH_FORM_W) / 2;
+	I64 fy = (Fs->pix_height - YH_FORM_H) / 2;
+	I64 i, y;
+
+	for (i = 0; i < YH_NUM_F; i++)
+	{
+		y = fy + 40 + i * 32;
+		if (fx + 96 <= mx < fx + YH_FORM_W - 16 && y <= my < y + 20)
+		{
+			yh.f_focus = i;
+			return;
+		}
+	}
+	y = fy + YH_CB_DY;
+	if (fx + 16 <= mx < fx + 300 && y - 2 <= my < y + YH_CB_SZ + 2)
+	{
+		yh.f_autoconn = !yh.f_autoconn;
+		YhConfigSave;
+		return;
+	}
+	y = fy + YH_BTN_DY;
+	if (fx + 96 <= mx < fx + 216 && y <= my < y + 24)
+		YhLogin;
+	else if (fx + 232 <= mx < fx + 352 && y <= my < y + 24)
+		yh.quit = TRUE;
+}
+
+U0 YhClipSet(U8 *s)
+{//Copy text to the OS clipboard. The dollar byte (0x24) is doubled because
+//DocPrint treats it as a live DolDoc command. NOTE: 0x24 is used instead of
+//a char literal on purpose - a raw dollar in ZealC SOURCE also opens a
+//DolDoc command in the compiler's lexer and swallows the next lines.
+	U8	*esc = MAlloc(StrLen(s) * 2 + 1);
+	U8	*d = esc;
+
+	while (*s)
+	{
+		if (*s == 0x24)
+			*d++ = 0x24;
+		*d++ = *s++;
+	}
+	*d = 0;
+	ClipDel;
+	DocPrint(sys_clip_doc, "%s", esc);
+	Free(esc);
+}
+
+CYhLine *YhMenuLine()
+{
+	if (yh.menu_ci < 0 || yh.menu_ci >= yh.num_chans)
+		return NULL;
+	if (!yh.chans[yh.menu_ci].lines)
+		return NULL;
+	return &yh.chans[yh.menu_ci].lines[yh.menu_ring % YH_MAX_LINES];
+}
+
+U0 YhChatRClick(I64 mx, I64 my)
+{//Right-click a message: open the cursor-anchored context menu.
+//Anywhere else: settings popup.
+	I64	 i, hit = -1;
+
+	yh.menu_on = FALSE;
+	for (i = 0; i < yh.hit_count && hit < 0; i++)
+		if (yh.hits[i].y0 <= my < yh.hits[i].y1)
+			hit = i;
+	if (hit < 0)
+	{
+		YhConfigMenu;
+		return;
+	}
+	yh.menu_ci = yh.hits[hit].ci;
+	yh.menu_ring = yh.hits[hit].ring;
+	yh.menu_mode = 0;
+	yh.menu_n = 0;
+	if (yh.chans[yh.menu_ci].server == YH_SRV_FEED)
+	{//Fediverse post menu.
+		StrCopy(yh.menu_items[yh.menu_n++], "View profile");
+		StrCopy(yh.menu_items[yh.menu_n++], "Favorite *");
+		StrCopy(yh.menu_items[yh.menu_n++], "Bookmark");
+		StrCopy(yh.menu_items[yh.menu_n++], "Copy text");
+	}
+	else
+	{
+		StrCopy(yh.menu_items[yh.menu_n++], "React...");
+		StrCopy(yh.menu_items[yh.menu_n++], "Reply");
+		StrCopy(yh.menu_items[yh.menu_n++], "Mention");
+		StrCopy(yh.menu_items[yh.menu_n++], "View profile");
+		StrCopy(yh.menu_items[yh.menu_n++], "Copy text");
+		if (yh.reply_to[0])
+			StrCopy(yh.menu_items[yh.menu_n++], "Cancel reply");
+	}
+	yh.menu_x = mx;
+	yh.menu_y = my;
+	yh.menu_on = TRUE;
+}
+
+U0 YhMenuAct(I64 sel)
+{//Execute a context-menu selection; may morph into the react submenu.
+	CYhLine	*ln;
+	I64		 i;
+
+	if (yh.menu_mode == 2)
+	{//Follower/following list: open that profile.
+		yh.menu_on = FALSE;
+		if (sel < 14 && yh.fl_ids[sel][0])
+			YhProfileOpen(yh.fl_ids[sel]);
+		return;
+	}
+	if (yh.menu_mode == 4)
+	{//New-DM user pick.
+		yh.menu_on = FALSE;
+		if (sel < 14 && yh.fl_ids[sel][0])
+			YhDmCreate(yh.fl_ids[sel]);
+		return;
+	}
+	if (yh.menu_mode == 5)
+	{//Public-server join pick.
+		yh.menu_on = FALSE;
+		if (sel < 14 && yh.fl_ids[sel][0])
+			YhServerJoin(yh.fl_ids[sel]);
+		return;
+	}
+	if (yh.menu_mode == 3)
+	{//Emoji picker for the input bar: insert :name:.
+		yh.menu_on = FALSE;
+		if (sel < yh.em_n &&
+			yh.input_len + StrLen(yh.em_names[sel]) + 3 < YH_IN_MAX - 2)
+		{
+			CatPrint(yh.input, ":%s: ", yh.em_names[sel]);
+			yh.input_len = StrLen(yh.input);
+		}
+		return;
+	}
+	ln = YhMenuLine;
+	if (!ln)
+	{
+		yh.menu_on = FALSE;
+		return;
+	}
+	if (yh.menu_mode == 1)
+	{//React submenu: sel = cached emoji index.
+		yh.menu_on = FALSE;
+		if (sel < yh.em_n)
+			YhReactPost(ln, sel);
+		return;
+	}
+	yh.menu_on = FALSE;
+	if (yh.menu_ci >= 0 && yh.chans[yh.menu_ci].server == YH_SRV_FEED)
+	{//Fediverse post actions.
+		switch (sel)
+		{
+			case 0:
+				if (ln->auid[0])
+					YhProfileOpen(ln->auid);
+				break;
+			case 1:
+				YhPostInteract(ln->id, "favorite");
+				break;
+			case 2:
+				YhPostInteract(ln->id, "bookmark");
+				break;
+			case 3:
+				YhClipSet(ln->text);
+				YhStatus("Copied.");
+				break;
+		}
+		return;
+	}
+	switch (sel)
+	{
+		case 0:	//React... -> emoji submenu at the same anchor.
+			YhEmojiLoad;
+			if (!yh.em_n)
+			{
+				YhStatus("No custom emojis on this server.");
+				return;
+			}
+			yh.menu_mode = 1;
+			yh.menu_n = MinI64(yh.em_n, 14);
+			for (i = 0; i < yh.menu_n; i++)
+			{
+				StrPrint(yh.menu_items[i], ":%s:", yh.em_names[i]);
+				yh.menu_items[i][35] = 0;
+			}
+			yh.menu_on = TRUE;
+			break;
+		case 1:
+			if (ln->id[0])
+			{
+				StrCopy(yh.reply_to, ln->id);
+				StrCopy(yh.reply_nick, ln->nick);
+			}
+			break;
+		case 2:
+			if (ln->nick[0] &&
+				yh.input_len + StrLen(ln->nick) + 2 < YH_IN_MAX - 2)
+			{
+				CatPrint(yh.input, "@%s ", ln->nick);
+				yh.input_len = StrLen(yh.input);
+			}
+			break;
+		case 3:
+			if (ln->auid[0])
+				YhProfileOpen(ln->auid);
+			break;
+		case 4:
+			YhClipSet(ln->text);
+			YhStatus("Copied.");
+			break;
+		case 5:
+			yh.reply_to[0] = 0;
+			yh.reply_nick[0] = 0;
+			break;
+	}
+}
+
+Bool YhMenuClick(I64 mx, I64 my)
+{//Route a left click when the menu is open. TRUE = consumed.
+	I64 i, w = 12;
+
+	if (!yh.menu_on)
+		return FALSE;
+	for (i = 0; i < yh.menu_n; i++)
+		w = MaxI64(w, StrLen(yh.menu_items[i]) * FONT_WIDTH + 26);
+	if (yh.menu_x <= mx < yh.menu_x + w)
+		for (i = 0; i < yh.menu_n; i++)
+			if (yh.menu_y + 3 + i * 14 <= my < yh.menu_y + 3 + (i + 1) * 14)
+			{
+				YhMenuAct(i);
+				return TRUE;
+			}
+	yh.menu_on = FALSE;	//Clicked outside: dismiss (click not forwarded).
+	return TRUE;
+}
+
+I64 YhClipGet(U8 *out, I64 max)
+{//Plain text from the OS clipboard (DOCT_TEXT entries, dollar-undoubling).
+	CDocEntry	*e;
+	U8			*p;
+	I64			 n = 0;
+	Bool		 unlock = DocLock(sys_clip_doc);
+
+	e = sys_clip_doc->head.next;
+	while (e != sys_clip_doc && n < max - 1)
+	{
+		if (e->type_u8 == DOCT_TEXT && e->tag)
+		{
+			p = e->tag;
+			while (*p && n < max - 1)
+			{
+				if (*p == 0x24 && p[1] == 0x24)
+					p++;	//Doubled dollar -> one.
+				if (*p >= 32)
+					out[n++] = *p;
+				p++;
+			}
+		}
+		e = e->next;
+	}
+	out[n] = 0;
+	if (unlock)
+		DocUnlock(sys_clip_doc);
+	return n;
+}
+
+U0 YhNextChan(I64 dir)
+{//Cycle channels within the current server.
+	I64 i, n = yh.num_chans;
+
+	if (yh.cur_chan < 0)
+		return;
+	i = yh.cur_chan;
+	while (n--)
+	{
+		i = (i + dir + yh.num_chans) % yh.num_chans;
+		if (yh.chans[i].server == yh.cur_srv)
+		{
+			YhSwitchChan(i);
+			return;
+		}
+	}
+}
+
+U0 YhTabComplete()
+{//TAB in the input: complete @mentions from the profile cache and :emoji:
+//from the server emoji cache. Repeat TAB cycles the matches. When the last
+//token isn't @/:-shaped, TAB keeps its old job (cycle channels).
+	I64	 start, i, n, len, k;
+	U8	 pre[40];
+	U8	*cand;
+
+	//Last token start.
+	start = yh.input_len;
+	while (start > 0 && yh.input[start - 1] != ' ')
+		start--;
+	if (yh.input[start] != '@' && yh.input[start] != ':')
+	{
+		YhNextChan(1);
+		return;
+	}
+	//New prefix resets the cycle; same prefix advances it.
+	len = MinI64(yh.input_len - start, 38);
+	MemCopy(pre, &yh.input[start], len);
+	pre[len] = 0;
+	if (yh.ac_start != start || StrNICompare(pre, yh.ac_prefix, StrLen(yh.ac_prefix)))
+	{
+		StrCopy(yh.ac_prefix, pre);
+		yh.ac_start = start;
+		yh.ac_idx = 0;
+	}
+	else
+		yh.ac_idx++;
+
+	if (yh.ac_prefix[0] == ':')
+		YhEmojiLoad;
+
+	n = 0;
+	k = yh.ac_idx;
+	while (n < 2)
+	{//Two passes so the cycle wraps.
+		if (yh.ac_prefix[0] == '@')
+		{
+			for (i = 0; i < yh.num_profiles; i++)
+			{
+				cand = yh.profiles[i].name;
+				if (cand[0] &&
+					!StrNICompare(cand, yh.ac_prefix + 1, StrLen(yh.ac_prefix) - 1))
+				{
+					if (k == 0)
+					{
+						StrPrint(&yh.input[yh.ac_start], "@%s ", cand);
+						yh.input_len = StrLen(yh.input);
+						return;
+					}
+					k--;
+				}
+			}
+		}
+		else
+		{
+			for (i = 0; i < yh.em_n; i++)
+			{
+				cand = yh.em_names[i];
+				if (cand[0] &&
+					!StrNICompare(cand, yh.ac_prefix + 1, StrLen(yh.ac_prefix) - 1))
+				{
+					if (k == 0)
+					{
+						StrPrint(&yh.input[yh.ac_start], ":%s: ", cand);
+						yh.input_len = StrLen(yh.input);
+						return;
+					}
+					k--;
+				}
+			}
+		}
+		yh.ac_idx = 0;	//Wrap.
+		k = 0;
+		n++;
+	}
+}
+
+U0 YhChatKey(I64 ch, I64 sc)
+{
+	U8	paste[YH_IN_MAX];
+	I64	n;
+
+	if (ch == CH_ESC || ch == CH_SHIFT_ESC)
+	{
+		if (yh.light_on)
+			yh.light_on = FALSE;	//ESC closes overlays before quitting.
+		else if (yh.menu_on)
+			yh.menu_on = FALSE;
+		else
+			yh.quit = TRUE;
+	}
+	else if (ch == 1)
+		yh.selall = TRUE;			//Ctrl+A: next edit replaces everything.
+	else if (ch == 3)
+	{//Ctrl+C: copy the input line.
+		if (yh.input_len)
+		{
+			YhClipSet(yh.input);
+			YhStatus("Input copied.");
+		}
+	}
+	else if (ch == 24)
+	{//Ctrl+X: cut.
+		if (yh.input_len)
+		{
+			YhClipSet(yh.input);
+			yh.input_len = 0;
+			yh.input[0] = 0;
+		}
+		yh.selall = FALSE;
+	}
+	else if (ch == 22)
+	{//Ctrl+V: paste (append, or replace after Ctrl+A).
+		n = YhClipGet(paste, sizeof(paste));
+		if (n)
+		{
+			if (yh.selall)
+			{
+				yh.input_len = 0;
+				yh.input[0] = 0;
+			}
+			if (yh.input_len + n < YH_IN_MAX - 2)
+			{
+				CatPrint(yh.input, "%s", paste);
+				yh.input_len = StrLen(yh.input);
+			}
+		}
+		yh.selall = FALSE;
+	}
+	else if (ch == '\n')
+	{
+		yh.selall = FALSE;
+		YhSubmit;
+	}
+	else if (ch == '\t')
+		YhTabComplete;
+	else if (ch == CH_BACKSPACE)
+	{
+		if (yh.selall)
+		{
+			yh.input_len = 0;
+			yh.input[0] = 0;
+			yh.selall = FALSE;
+		}
+		else if (yh.input_len)
+			yh.input[--yh.input_len] = 0;
+		else if (yh.reply_to[0])
+		{//Empty input + backspace exits reply mode.
+			yh.reply_to[0] = 0;
+			yh.reply_nick[0] = 0;
+		}
+	}
+	else if (' ' <= ch < 0x7F)
+	{
+		if (yh.selall)
+		{
+			yh.input_len = 0;
+			yh.input[0] = 0;
+			yh.selall = FALSE;
+		}
+		if (yh.input_len < YH_IN_MAX - 2)
+		{
+			yh.input[yh.input_len++] = ch;
+			yh.input[yh.input_len] = 0;
+		}
+	}
+	else if (!ch)
+	{
+		switch (sc)
+		{
+			case SC_CURSOR_UP:
+				YhHistNav(-1);
+				break;
+			case SC_CURSOR_DOWN:
+				YhHistNav(1);
+				break;
+			case SC_PAGE_UP:
+				yh.scroll += 10;
+				break;
+			case SC_PAGE_DOWN:
+				yh.scroll = MaxI64(0, yh.scroll - 10);
+				break;
+			case SC_END:
+				yh.scroll = 0;
+				break;
+		}
+	}
+	yh.scroll = ClampI64(yh.scroll, 0, YH_MAX_LINES * 4);
+}
+
+I64 YhNewDmPrompt(I64 mx, I64 my)
+{//Prompt a username, search, open the pick menu (mode 4) at the cursor.
+	U8	*q, *p;
+	I64	 n;
+
+	q = PopUpGetStr("Find user (name or part of it):");
+	if (!q)
+		return 0;
+	p = q;
+	while (*p == ' ')
+		p++;
+	if (StrLen(p) && p[StrLen(p) - 1] == '\n')
+		p[StrLen(p) - 1] = 0;
+	if (!*p)
+	{
+		Free(q);
+		return 0;
+	}
+	n = YhUserSearch(p);
+	Free(q);
+	if (!n)
+	{
+		YhStatus("No matching users.");
+		return 0;
+	}
+	yh.menu_mode = 4;
+	yh.menu_n = n;
+	yh.menu_x = mx;
+	yh.menu_y = MaxI64(30, my - n * 14 - 6);
+	yh.menu_on = TRUE;
+	return n;
+}
+
+U0 YhChatClick(I64 mx, I64 my)
+{
+	I64		 i, y, r, log_y = 4 + 20 + 12;
+	I64		 log_h = Fs->pix_height - 22 - 4 - 6 - log_y;
+	CYhLine	*ln;
+	U8		 bigurl[YH_IMG_URL_LEN + 8];
+
+	if (yh.light_on)
+	{//Lightbox open: any click closes it.
+		yh.light_on = FALSE;
+		return;
+	}
+	if (YhMenuClick(mx, my))
+		return;	//Context menu open: it consumed the click.
+
+	//Staged-attachment cancel [x].
+	if (yh.att_on && my >= Fs->pix_height - 42 && my < Fs->pix_height - 28 &&
+		mx >= yh.att_x_x)
+	{
+		yh.att_on = FALSE;
+		yh.att_file[0] = 0;
+		return;
+	}
+
+	//Input-bar buttons (emoji picker + post-visibility cycle).
+	if (my >= Fs->pix_height - 26)
+	{
+		if (yh.plus_btn_x <= mx < yh.plus_btn_x + 16)
+		{
+			YhAttachPick;
+			return;
+		}
+		if (yh.emoji_btn_x && yh.emoji_btn_x <= mx < yh.emoji_btn_x + 20)
+		{
+			YhEmojiLoad;
+			if (!yh.em_n)
+			{
+				YhStatus("No custom emojis on this server.");
+				return;
+			}
+			yh.menu_mode = 3;	//Insert :name: into the input.
+			yh.menu_n = MinI64(yh.em_n, 14);
+			for (i = 0; i < yh.menu_n; i++)
+			{
+				StrPrint(yh.menu_items[i], ":%s:", yh.em_names[i]);
+				yh.menu_items[i][35] = 0;
+			}
+			yh.menu_x = mx - 60;
+			yh.menu_y = my - yh.menu_n * 14 - 10;
+			yh.menu_on = TRUE;
+			return;
+		}
+		if (yh.vis_btn_x && yh.vis_btn_x <= mx < yh.vis_btn_x + yh.vis_btn_w)
+		{
+			yh.post_vis = (yh.post_vis + 1) & 3;
+			return;
+		}
+	}
+
+	//Tab strip: scroll arrows, server tabs, pinned Fediverse/DMs tabs.
+	if (4 <= my < 24)
+	{
+		if (yh.tl_w && yh.tl_x <= mx < yh.tl_x + yh.tl_w)
+		{
+			yh.tab_scroll = MaxI64(0, yh.tab_scroll - 1);
+			return;
+		}
+		if (yh.tr_w && yh.tr_x <= mx < yh.tr_x + yh.tr_w)
+		{
+			yh.tab_scroll = ClampI64(yh.tab_scroll + 1, 0,
+									 MaxI64(0, yh.num_servers - 1));
+			return;
+		}
+		for (i = 0; i < yh.num_servers; i++)
+			if (yh.servers[i].tab_w &&
+				yh.servers[i].tab_x <= mx < yh.servers[i].tab_x + yh.servers[i].tab_w)
+			{
+				YhSwitchServer(i);
+				return;
+			}
+		if (yh.feed_tab_w &&
+			yh.feed_tab_x <= mx < yh.feed_tab_x + yh.feed_tab_w)
+		{
+			i = YhFeedChan;
+			if (i >= 0)
+				YhSwitchChan(i);	//Initial load happens in YhNetPump.
+			return;
+		}
+		if (yh.dm_tab_w &&
+			yh.dm_tab_x <= mx < yh.dm_tab_x + yh.dm_tab_w)
+		{//First DM conversation, if any.
+			for (i = 0; i < yh.num_chans; i++)
+				if (yh.chans[i].server == YH_SRV_DM)
+				{
+					YhSwitchChan(i);
+					return;
+				}
+			YhStatus("No DM conversations. Start one from the webapp.");
+		}
+		return;
+	}
+	//Channel panel.
+	if (8 <= mx < 8 + YH_CHAN_PANEL_W)
+	{
+		if (yh.cur_srv == YH_SRV_DM && yh.dmnew_y &&
+			yh.dmnew_y <= my < yh.dmnew_y + 12)
+		{//New DM: prompt a name, search, pick from the cursor menu.
+			ln = NULL;	//(reuse slot; popup blocks.)
+			r = YhNewDmPrompt(mx, my);
+			return;
+		}
+		r = 0;
+		for (i = 0; i < yh.num_chans; i++)
+		{//No `continue` in ZealC.
+			if (yh.chans[i].server == yh.cur_srv)
+			{
+				y = log_y + 22 + r * (YH_ROW_H + 4);	//Matches the draw pass.
+				if (y + FONT_HEIGHT > log_y + log_h)
+					break;
+				if (y <= my < y + YH_ROW_H + 4)
+				{
+					YhSwitchChan(i);
+					return;
+				}
+				r++;
+			}
+		}
+		return;
+	}
+	//Fediverse extras: sub-tab strip / profile header controls.
+	if (yh.cur_chan >= 0 && yh.chans[yh.cur_chan].server == YH_SRV_FEED)
+	{
+		if (StrCompare(yh.chans[yh.cur_chan].name, "~profile"))
+		{//Timeline: Home/Local/All/Marks chips at log top.
+			if (log_y <= my < log_y + 16)
+			{
+				for (i = 0; i < 4; i++)
+					if (yh.fm_w[i] && yh.fm_x[i] <= mx < yh.fm_x[i] + yh.fm_w[i])
+					{
+						YhFeedSetMode(i);
+						return;
+					}
+				return;
+			}
+		}
+		else
+		{//Profile header.
+			if (log_y <= my < log_y + 14 &&
+				yh.pv_back_x <= mx < yh.pv_back_x + yh.pv_back_w)
+			{
+				i = YhFeedChan;
+				if (i >= 0)
+					YhSwitchChan(i);
+				return;
+			}
+			if (yh.pv_btn_y <= my < yh.pv_btn_y + 16 &&
+				yh.pv_btn_x <= mx < yh.pv_btn_x + yh.pv_btn_w)
+			{
+				YhFollowToggle;
+				return;
+			}
+			if (yh.pv_fl_y <= my < yh.pv_fl_y + YH_ROW_H)
+			{//Counts row: follower / following lists (own menu, mode 2).
+				i = -1;
+				if (YH_CHAN_PANEL_W + 16 + 14 * FONT_WIDTH <= mx <
+					YH_CHAN_PANEL_W + 16 + 28 * FONT_WIDTH)
+					i = YhFollowList(TRUE);
+				else if (YH_CHAN_PANEL_W + 16 + 30 * FONT_WIDTH <= mx)
+					i = YhFollowList(FALSE);
+				if (i > 0)
+				{
+					yh.menu_mode = 2;
+					yh.menu_n = i;
+					yh.menu_x = mx;
+					yh.menu_y = my;
+					yh.menu_on = TRUE;
+				}
+				return;
+			}
+		}
+	}
+	//Feed card action footer buttons (act 1..4).
+	for (i = 0; i < yh.hit_count; i++)
+		if (1 <= yh.hits[i].act <= 4 &&
+			yh.hits[i].y0 <= my < yh.hits[i].y1 &&
+			yh.hits[i].nx0 <= mx < yh.hits[i].nx1)
+		{
+			ln = &yh.chans[yh.hits[i].ci].lines[yh.hits[i].ring % YH_MAX_LINES];
+			if (!ln->id[0])
+				return;
+			if (yh.hits[i].act == 1)
+			{//Reply: compose an in_reply_to post.
+				StrCopy(yh.reply_to, ln->id);
+				StrCopy(yh.reply_nick, ln->nick);
+			}
+			else if (yh.hits[i].act == 2)
+			{
+				YhPostInteract(ln->id, "reblog");
+				ln->bc++;
+			}
+			else if (yh.hits[i].act == 3)
+			{
+				YhPostInteract(ln->id, "favorite");
+				ln->fc++;
+			}
+			else
+				YhPostInteract(ln->id, "bookmark");
+			return;
+		}
+	//Click an inline image (act 5): open the lightbox at full size.
+	for (i = 0; i < yh.hit_count; i++)
+		if (yh.hits[i].act == 5 && yh.hits[i].y0 <= my < yh.hits[i].y1)
+		{
+			ln = &yh.chans[yh.hits[i].ci].lines[yh.hits[i].ring % YH_MAX_LINES];
+			if (ln->kind == YH_LK_IMG && ln->img >= 0)
+			{//Request a bigger copy, but fall back to the already-decoded
+			 //thumbnail when the cache is full (avoids a stuck "loading").
+				StrPrint(bigurl, "%s#big", ln->text);
+				yh.light_img = YhImgGet(bigurl, Fs->pix_width - 24,
+										Fs->pix_height - 40);
+				if (yh.light_img < 0)
+					yh.light_img = ln->img;
+				yh.light_on = TRUE;
+			}
+			return;
+		}
+	//Click a name (or avatar): open the profile (feed) / insert an @mention.
+	for (i = 0; i < yh.hit_count; i++)
+		if (yh.hits[i].y0 <= my < yh.hits[i].y1 &&
+			yh.hits[i].nx0 <= mx < yh.hits[i].nx1)
+		{
+			ln = &yh.chans[yh.hits[i].ci].lines[yh.hits[i].ring % YH_MAX_LINES];
+			if (yh.chans[yh.hits[i].ci].server == YH_SRV_FEED)
+			{
+				if (ln->auid[0])
+					YhProfileOpen(ln->auid);
+			}
+			else if (ln->nick[0] &&
+					 yh.input_len + StrLen(ln->nick) + 2 < YH_IN_MAX - 2)
+			{
+				CatPrint(yh.input, "@%s ", ln->nick);
+				yh.input_len = StrLen(yh.input);
+			}
+			return;
+		}
+}
+
+
+/***** pump *****/
+
+U0 YhPoll()
+{
+	I64 m, a1, a2, dz;
+
+	while (m = MessageScan(&a1, &a2))
+	{
+		switch (m)
+		{
+			case MESSAGE_KEY_DOWN:
+				if (yh.state == YH_ST_FORM)
+					YhFormKey(a1, a2.u8[0]);
+				else
+					YhChatKey(a1, a2.u8[0]);
+				break;
+			case MESSAGE_MS_L_DOWN:
+				if (yh.state == YH_ST_FORM)
+					YhFormClick(a1, a2);
+				else
+					YhChatClick(a1, a2);
+				break;
+			case MESSAGE_MS_R_DOWN:
+				if (yh.state == YH_ST_CHAT)
+					YhChatRClick(a1, a2);
+				break;
+		}
+	}
+
+	dz = mouse.pos.z - yh.last_z;
+	yh.last_z = mouse.pos.z;
+	if (dz && yh.state == YH_ST_CHAT && Fs == sys_focus_task)
+	{//Feed is newest-at-top, so its wheel direction is inverted vs the chat.
+		if (yh.cur_chan >= 0 && yh.chans[yh.cur_chan].server == YH_SRV_FEED)
+			yh.scroll = ClampI64(yh.scroll + dz * 3, 0, YH_MAX_LINES * 4);
+		else
+			yh.scroll = ClampI64(yh.scroll - dz * 3, 0, YH_MAX_LINES * 4);
+	}
+}
+
+U0 YhNetPump()
+{//Realtime ring drain, poll fallback, token upkeep. UI task only.
+	while (yh.rt_rd < yh.rt_wr)
+	{
+		YhRtHandle(yh.rt_ring[yh.rt_rd & (YH_RT_RING - 1)]);
+		Free(yh.rt_ring[yh.rt_rd & (YH_RT_RING - 1)]);
+		yh.rt_rd++;
+	}
+
+	if (yh.cur_chan >= 0 && yh.chans[yh.cur_chan].server == YH_SRV_FEED &&
+		!yh.chans[yh.cur_chan].loaded)
+		YhFetchFeed(TRUE);	//Deferred initial feed load (see YhSwitchChan).
+
+	if (yh.cur_chan >= 0 && counts.jiffies > yh.poll_deadline)
+	{//Fast poll when the socket is down; slow safety-net poll when it's up
+	 //(covers instances where realtime delivers nothing, e.g. WALRUS off).
+	 //The created_at watermark dedupes against realtime rows.
+		if (yh.chans[yh.cur_chan].server == YH_SRV_FEED)
+			YhFetchFeed(FALSE);
+		else
+			YhFetchMessages(yh.cur_chan, FALSE);
+		//Even when realtime is "live" we poll every 5s: the instance's
+		//postgres_changes publication may not include messages (replies then
+		//never arrive over WS). Watermark dedupes against any WS rows.
+		if (yh.ws_ok)
+			yh.poll_deadline = counts.jiffies + 5 * JIFFY_FREQ;
+		else
+			yh.poll_deadline = counts.jiffies + 25 * JIFFY_FREQ / 10;	//2.5s.
+	}
+
+	if (!yh.ws_ok)
+	{
+		if (yh.ws && counts.jiffies > yh.reconnect_deadline)
+		{//The socket died at some point: clean it up, then retry once a minute.
+			YhWsShutdown;
+			YhWsConnect;
+			yh.reconnect_deadline = counts.jiffies + 60 * JIFFY_FREQ;
+		}
+		else if (!yh.ws && counts.jiffies > yh.reconnect_deadline)
+		{
+			YhWsConnect;
+			yh.reconnect_deadline = counts.jiffies + 60 * JIFFY_FREQ;
+		}
+	}
+
+	if (yh.jwt[0] && counts.jiffies > yh.tok_deadline)
+		YhTokenRefresh;
+}
+

@@ -107,19 +107,21 @@ class CSocket
 	U16 domain;
 };
 
-U0 AddressInfoCopy(CAddressInfo *out, CAddressInfo *in)
-{ // assumes *out already exists
+U0 AddressInfoCopy(CAddressInfo *out, CAddressInfo *in, CTask *mem_task=NULL)
+{ // assumes *out already exists. mem_task pins the copied buffers to a heap that
+  // outlives the caller - pass sys_task when *out lives in a persistent cache
+  // (else a killable fetch task's heap dies and leaves a dangling cache node).
 	MemCopy(out, in, sizeof(CAddressInfo));
 
 	if (in->address)
 	{
-		out->address = CAlloc(in->address_length);
+		out->address = CAlloc(in->address_length, mem_task);
 		MemCopy(out->address, in->address, in->address_length);
 	}
 
 	if (in->canonical_name)
 	{
-		out->canonical_name = StrNew(in->canonical_name);
+		out->canonical_name = StrNew(in->canonical_name, mem_task);
 	}
 }
 

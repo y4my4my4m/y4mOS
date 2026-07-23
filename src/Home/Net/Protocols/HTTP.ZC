@@ -29,6 +29,7 @@ class CHttpResponse
 	U8	*headers;     // raw header block, NUL-terminated
 	U8	*body;        // NUL-terminated for convenience
 	I64	 body_length; // actual byte count (body may contain NULs)
+	U8	*final_url;   // URL after redirects (HttpNav sets it); NULL if none
 };
 
 U0 HttpResponseFree(CHttpResponse *response)
@@ -38,6 +39,7 @@ U0 HttpResponseFree(CHttpResponse *response)
 
 	Free(response->headers);
 	Free(response->body);
+	Free(response->final_url);
 	Free(response);
 }
 
@@ -325,6 +327,52 @@ http_ck_next:;
 	if (!buf[0])
 		return StrNew("");
 	return MStrPrint("Cookie: %s\r\n", buf);
+}
+
+public U8 *HttpDocCookieGet(CHttpUrl *url)
+{ // bare "a=b; c=d" for document.cookie reads (no header prefix). MAlloc'ed.
+	U8	buf[2048];
+	I64 i;
+
+	buf[0] = 0;
+	HttpCookieLock;
+	for (i = 0; i < http_cookie_count; i++)
+	{
+		if (!HttpCookieDomainMatch(http_cookies[i].domain, url->host))
+			goto hdc_next;
+		if (StrNCompare(url->path, http_cookies[i].path,
+						StrLen(http_cookies[i].path)))
+			goto hdc_next;
+		if (StrLen(buf) > 1900)
+			goto hdc_next;
+		if (buf[0])
+			CatPrint(buf, "; ");
+		CatPrint(buf, "%s=%s", http_cookies[i].name, http_cookies[i].value);
+hdc_next:;
+	}
+	HttpCookieUnlock;
+
+	return StrNew(buf);
+}
+
+public U0 HttpDocCookieSet(CHttpUrl *url, U8 *s)
+{ // document.cookie = "name=value; path=/; ..." -> store name=value for the host
+	U8	name[128], value[512];
+	I64 i = 0, j = 0;
+
+	while (s[i] == ' ')
+		i++;
+	while (s[i] && s[i] != '=' && s[i] != ';' && j < 126)
+		name[j++] = s[i++];
+	name[j] = 0;
+	if (s[i] != '=' || !j)
+		return;
+	i++;
+	j = 0;
+	while (s[i] && s[i] != ';' && j < 510)
+		value[j++] = s[i++];
+	value[j] = 0;
+	HttpCookieStore(url->host, "/", name, value, FALSE);
 }
 
 public U0 HttpCookiesClear()
@@ -721,9 +769,11 @@ I64 HttpChunkedComplete(U8 *body, I64 len)
 }
 
 CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
-							  U8 *content_type=NULL, U8 *body=NULL, I64 body_len=0)
+							  U8 *content_type=NULL, U8 *body=NULL, I64 body_len=0,
+							  U8 *extra_hdrs=NULL)
 { // One request/response round trip; no redirect handling here.
   // Sends the cookie jar, accepts gzip, parses Set-Cookie, inflates the body.
+  // extra_hdrs: raw header lines ("Name: v\r\n" each), for API auth headers.
 	CTCPSocket	  *sock;
 	CTLS		  *tls = NULL;
 	CHttpResponse *response;
@@ -784,6 +834,8 @@ http_fresh:
 	}
 
 	cookie_hdr = HttpCookieHeaderBuild(url); // "" or "Cookie: ...\r\n"
+	if (!extra_hdrs)
+		extra_hdrs = "";
 	if (poolable)
 		conn_val = "keep-alive"; // this task reuses the socket for the next req
 	else
@@ -794,27 +846,48 @@ http_fresh:
 			content_type = "application/x-www-form-urlencoded";
 		request = MStrPrint("%s %s HTTP/1.1\r\n"
 							"Host: %s\r\n"
-							"User-Agent: ZealOS-Zinc/1.0\r\n"
-							"Accept: text/html, text/plain, */*\r\n"
+							"User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+							"(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n"
+							"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+							"Accept-Language: en-US,en;q=0.9\r\n"
 							"Accept-Encoding: gzip\r\n"
-							"%s"
+							"Sec-CH-UA: \"Chromium\";v=\"126\", \"Not.A/Brand\";v=\"24\", \"Google Chrome\";v=\"126\"\r\n"
+							"Sec-CH-UA-Mobile: ?0\r\n"
+							"Sec-CH-UA-Platform: \"Linux\"\r\n"
+							"Sec-Fetch-Site: none\r\n"
+							"Sec-Fetch-Mode: navigate\r\n"
+							"Sec-Fetch-User: ?1\r\n"
+							"Sec-Fetch-Dest: document\r\n"
+							"Upgrade-Insecure-Requests: 1\r\n"
+							"%s%s"
 							"Content-Type: %s\r\n"
 							"Content-Length: %d\r\n"
 							"Connection: %s\r\n"
 							"\r\n",
-							method, url->path, url->host, cookie_hdr,
+							method, url->path, url->host, cookie_hdr, extra_hdrs,
 							content_type, body_len, conn_val);
 	}
 	else
 		request = MStrPrint("%s %s HTTP/1.1\r\n"
 							"Host: %s\r\n"
-							"User-Agent: ZealOS-Zinc/1.0\r\n"
-							"Accept: text/html, text/plain, */*\r\n"
+							"User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+							"(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n"
+							"Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+							"Accept-Language: en-US,en;q=0.9\r\n"
 							"Accept-Encoding: gzip\r\n"
-							"%s"
+							"Sec-CH-UA: \"Chromium\";v=\"126\", \"Not.A/Brand\";v=\"24\", \"Google Chrome\";v=\"126\"\r\n"
+							"Sec-CH-UA-Mobile: ?0\r\n"
+							"Sec-CH-UA-Platform: \"Linux\"\r\n"
+							"Sec-Fetch-Site: none\r\n"
+							"Sec-Fetch-Mode: navigate\r\n"
+							"Sec-Fetch-User: ?1\r\n"
+							"Sec-Fetch-Dest: document\r\n"
+							"Upgrade-Insecure-Requests: 1\r\n"
+							"%s%s"
 							"Connection: %s\r\n"
 							"\r\n",
-							method, url->path, url->host, cookie_hdr, conn_val);
+							method, url->path, url->host, cookie_hdr, extra_hdrs,
+							conn_val);
 	Free(cookie_hdr);
 	if (tls)
 	{
@@ -1056,7 +1129,8 @@ CHttpResponse *HttpGetRaw(CHttpUrl *url)
 	return HttpRequestRaw(url, "GET");
 }
 
-CHttpResponse *HttpNav(U8 *url, U8 *method, U8 *content_type, U8 *body, I64 body_len)
+CHttpResponse *HttpNav(U8 *url, U8 *method, U8 *content_type, U8 *body, I64 body_len,
+					   U8 *extra_hdrs=NULL)
 { // request with redirect following. Browser rules: 303 (and 301/302 after a
   // POST) turn into a GET without a body; 307/308 repeat the method + body.
 	CHttpUrl	   parsed;
@@ -1072,7 +1146,8 @@ CHttpResponse *HttpNav(U8 *url, U8 *method, U8 *content_type, U8 *body, I64 body
 			done = TRUE;
 		else
 		{
-			response = HttpRequestRaw(&parsed, method, content_type, body, body_len);
+			response = HttpRequestRaw(&parsed, method, content_type, body, body_len,
+									  extra_hdrs);
 
 			if (response &&
 				(response->status == 301 || response->status == 302 ||
@@ -1116,6 +1191,8 @@ CHttpResponse *HttpNav(U8 *url, U8 *method, U8 *content_type, U8 *body, I64 body
 		}
 	}
 
+	if (response)
+		response->final_url = StrNew(current); // the URL that actually served it
 	Free(current);
 	return response;
 }
@@ -1129,6 +1206,17 @@ CHttpResponse *HttpPost(U8 *url, U8 *body,
 						U8 *content_type="application/x-www-form-urlencoded")
 { // POST with browser-style redirect handling. Caller keeps ownership of body.
 	return HttpNav(url, "POST", content_type, body, StrLen(body));
+}
+
+CHttpResponse *HttpReq(U8 *url, U8 *method="GET", U8 *body=NULL,
+					   U8 *content_type="application/json", U8 *extra_hdrs=NULL)
+{ // API-style request: any method, JSON default, custom header lines
+  // ("Name: value\r\n" each). Caller frees with HttpResponseFree.
+	I64 body_len = 0;
+
+	if (body)
+		body_len = StrLen(body);
+	return HttpNav(url, method, content_type, body, body_len, extra_hdrs);
 }
 
 public U0 HttpTest(U8 *url="https://example.com")

@@ -1258,7 +1258,8 @@ I64 TCPSocketReceive(CTCPSocket *tcp_socket, U8 *buffer, I64 length)
 	if (counts.jiffies > timeout)
 	{
 		if (tcp_socket->timeout != 0) // Don't flood NetLog on non-blocking receives.
-			NetErr("TCP SOCKET RECEIVE: Timed out.");
+			NetLog("TCP SOCKET RECEIVE: Timed out."); // Informational: pollers
+									// hit this constantly; NetLogV(1) hides it.
 
 		return -1;
 	}

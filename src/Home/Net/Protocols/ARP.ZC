@@ -120,6 +120,7 @@ CARPHash *ARPCacheFind(U32 ip_address)
 CARPHash *ARPCachePut(U32 ip_address, U8 *mac_address)
 {
 	CARPHash *entry;
+	U8		 *ip_string;
 
 	NetLog("ARP CACHE PUT: Attempting to look for entry in ARP Cache.");
 
@@ -127,13 +128,18 @@ CARPHash *ARPCachePut(U32 ip_address, U8 *mac_address)
 
 	if (!entry)
 	{
-		entry = CAlloc(sizeof(CARPHash));
+		// Shared, persistent arp_cache reached from killable fetch tasks (and the
+		// RX interrupt) - pin the node + its key string to sys_task so a dying
+		// task's heap can't free a still-linked node (UAF -> GP in HashFind).
+		entry = CAlloc(sizeof(CARPHash), sys_task);
 
 		NetLog("ARP CACHE PUT: Attempting add to cache: addr, mac:");
 		NetLog("               0x%0X, 0x%0X 0x%0X 0x%0X 0x%0X 0x%0X 0x%0X",
 				ip_address, mac_address[0], mac_address[1], mac_address[2], mac_address[3], mac_address[4], mac_address[5]);
 
-		entry->str	= MStrPrint("%X", ip_address);
+		ip_string	= MStrPrint("%X", ip_address);
+		entry->str	= StrNew(ip_string, sys_task);
+		Free(ip_string);
 		entry->type = HTT_ARP;
 		MemCopy(entry->mac_address, mac_address, 6);
 

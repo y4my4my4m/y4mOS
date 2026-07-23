@@ -95,8 +95,20 @@ then the bridge:
 
 ### 4.2 Clone
 
+`GitCloneSSH` does **not** take a `git@host:repo` URL string — split it into
+`(host, port, user, repo)`:
+
 ```
-SSHKeyLoad;                                            // load your key (once per boot)
+# normal git:  git clone git@github.com:username/repository.git
+#              └user┘ └────host────┘ └───────repo────────┘
+SSHKeyLoad;   // load your key (once per boot)
+GitCloneSSH("github.com", 22, "git", "username/repository.git");
+```
+
+Same idea for a LAN box / self-hosted forge:
+
+```
+# git clone git@192.168.1.10:user/repo.git
 GitCloneSSH("192.168.1.10", 22, "git", "user/repo.git");
 ```
 
@@ -106,10 +118,18 @@ Arguments:
 GitCloneSSH(host, port, user, repo, dir=NULL, password=NULL)
 ```
 
-- `user` — the SSH login (often `git`, or `root`, etc.).
-- `repo` — the **server-side path** to the bare repository, e.g.
-  `/srv/git/project.git` or `user/project.git` relative to the login's home.
-  This is a filesystem path on the server, **not** a URL.
+| URL piece | Arg | Example |
+|-----------|-----|---------|
+| after `@`, before `:` | `host` | `github.com` |
+| (always 22 unless custom) | `port` | `22` |
+| before `@` | `user` | `git` |
+| after `:` | `repo` | `y4my4my4m/procpixel.git` |
+
+- `user` — the SSH login (almost always `git` on GitHub/gitea; sometimes
+  `root` on a homemade server).
+- `repo` — the **server-side path** to the bare repository: GitHub-style
+  `owner/name.git`, or an absolute path like `/srv/git/project.git`. Not a
+  full URL.
 - `dir` — target directory (default `<cwd>/<repo-name>`).
 - `password` — optional; only needed if you have **no** key on the server.
 
@@ -192,8 +212,9 @@ SSHKeyGen;      // paste the printed line into the server's authorized_keys
 #include "C:/Home/Net/Programs/Git/Git"
 #include "C:/Home/Net/Programs/Git/GitSSH"
 Cd("::/Home");;
-GitCloneSSH("192.168.1.10", 22, "git", "myproject.git");
-Dir("::/Home/myproject");
+// like: git clone git@github.com:y4my4my4m/procpixel.git
+GitCloneSSH("github.com", 22, "git", "y4my4my4m/procpixel.git");
+Dir("::/Home/procpixel");
 
 // or clone a public repo over HTTPS
 GitClone("https://gitea.example.com/user/project");

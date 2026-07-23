@@ -1,0 +1,214 @@
+/***** image pipeline *****/
+
+I64 YhImgGet(U8 *url, I64 maxw, I64 maxh)
+{//Cache index for a URL, enqueueing a background fetch on first sight.
+//-1 when the URL is empty or the cache is full.
+	I64		 i;
+	CYhImg	*im;
+
+	if (!url || !*url)
+		return -1;
+	for (i = 0; i < yh.img_count; i++)
+		if (!StrCompare(yh.imgs[i].url, url))
+		{
+			if (yh.imgs[i].state == 3 &&
+				counts.jiffies > yh.imgs[i].fail_t + 20 * JIFFY_FREQ)
+				yh.imgs[i].state = 1;	//Retry failures every ~20s (DNS flake).
+			return i;
+		}
+	if (yh.img_count >= YH_IMG_MAX)
+		return -1;
+	im = &yh.imgs[yh.img_count];
+	MemCopy(im->url, url, MinI64(StrLen(url), YH_IMG_URL_LEN - 1));
+	im->url[MinI64(StrLen(url), YH_IMG_URL_LEN - 1)] = 0;
+	im->dc = NULL;
+	im->maxw = maxw;
+	im->maxh = maxh;
+	im->state = 1;	//Last write: the loader keys off this.
+	return yh.img_count++;
+}
+
+U0 YhImgAbs(U8 *src, U8 *dst, I64 max, U8 *bucket="avatars")
+{//Turn any stored image reference into a fetchable https URL, or blank dst
+//(= skip) when it can't be fetched. Handles:
+//  http(s)://...            kept (+ imgproxy render/image -> raw object)
+//  /path                    prefixed with the instance host
+//  bucket/path OR uuid/f    a bare Supabase STORAGE OBJECT PATH -> built into
+//                           https://{host}/storage/v1/object/public/{bucket}/..
+//                           (this is the bug that ARP'd a UUID as a hostname:
+//                            avatar_url/media rows can be bare storage paths)
+//  blob:/data:/garbage      NOT fetchable -> dst = "" (loader skips it)
+	U8	*p, *q, *base;
+	I64	 n;
+
+	dst[0] = 0;
+	if (!src || !*src)
+		return;
+
+	if (!StrNICompare(src, "http://", 7) || !StrNICompare(src, "https://", 8))
+		StrPrint(dst, "%s", src);
+	else if (!StrNICompare(src, "blob:", 5) || !StrNICompare(src, "data:", 5))
+		return;	//Client-only / inline: unfetchable, skip.
+	else if (src[0] == '/' && yh.f_host[0])
+		StrPrint(dst, "https://%s%s", yh.f_host, src);
+	else if (yh.f_host[0])
+	{//Bare storage path. Strip a leading "public/" or "{bucket}/" if the row
+	 //already carries one, then build the canonical public object URL.
+		base = src;
+		if (!StrNICompare(base, "public/", 7))
+			base += 7;
+		StrPrint(dst, "https://%s/storage/v1/object/public/%s/%s",
+				 yh.f_host, bucket, base);
+	}
+	dst[max - 1] = 0;
+
+	p = StrFind("/storage/v1/render/image/", dst);
+	if (p)
+	{//".../render/image/<tail>" -> ".../object/<tail>", minus the query.
+		q = MStrPrint("%s", p + 25);	//Tail after "render/image/".
+		StrPrint(p, "/storage/v1/object/%s", q);
+		Free(q);
+		p = StrFirstOcc(dst, "?");
+		if (p)
+			*p = 0;
+		n = StrLen(dst);
+		while (n && dst[n - 1] == '/')
+			dst[--n] = 0;
+	}
+
+	//Final guard: must be scheme://host-with-a-dot, else it's garbage (a UUID,
+	//a hostname-less path). Blank it so we never ARP/DNS a non-host.
+	p = StrFind("://", dst);
+	if (!p)
+		dst[0] = 0;
+	else
+	{
+		q = StrFirstOcc(p + 3, "/");	//End of host.
+		if (!q)
+			q = p + 3 + StrLen(p + 3);
+		//Require a '.' inside the host span.
+		n = 0;
+		for (base = p + 3; base < q; base++)
+			if (*base == '.')
+				n = 1;
+		if (!n)
+			dst[0] = 0;
+	}
+}
+
+U0 YhImgLoaderTask()
+{//Fetch + decode queued images, one at a time. Decoded on this task's heap,
+//then scaled into a DC on the UI task's heap (survives us).
+	I64		 i, w, h, tries, pick;
+	U8		 fetch_url[YH_IMG_URL_LEN];
+	U8		*p;
+	CYhImg	*im;
+	CHttpResponse *resp;
+	CDC		*raw, *fit;
+	Bool	 found;
+
+	while (!yh.quit)
+	{
+		//Priority: process FRESH requests (state 1) before retrying stale
+		//failures. Otherwise a backlog of DNS-flaked old images starves the
+		//avatars/emojis of the view you just switched to ("hit or miss").
+		pick = -1;
+		for (i = 0; i < yh.img_count && pick < 0; i++)
+			if (yh.imgs[i].state == 1)
+				pick = i;
+		if (pick < 0)
+		{//No fresh work: promote ONE stale failure that's aged out.
+			for (i = 0; i < yh.img_count && pick < 0; i++)
+				if (yh.imgs[i].state == 3 &&
+					counts.jiffies > yh.imgs[i].fail_t + 20 * JIFFY_FREQ)
+				{
+					yh.imgs[i].state = 1;
+					pick = i;
+				}
+		}
+		found = FALSE;
+		if (pick >= 0)
+		{
+			i = pick;
+			im = &yh.imgs[i];
+			{
+				found = TRUE;
+				raw = NULL;
+				//Cache keys may carry a "#suffix" (e.g. the lightbox wants
+				//the same URL at full size): strip it before fetching.
+				StrCopy(fetch_url, im->url);
+				p = StrFirstOcc(fetch_url, "#");
+				if (p)
+					*p = 0;
+				//DNS/TLS to media + federated hosts is flaky in the VM; retry
+				//a couple times before giving up (matches HTTP.ZC's connect
+				//retry). Remote hosts (wasabi/CDNs) may still never resolve.
+				resp = HttpGet(fetch_url);
+				for (tries = 0; tries < 2 && (!resp || resp->status != 200); tries++)
+				{
+					if (resp)
+						HttpResponseFree(resp);
+					Sleep(300);
+					resp = HttpGet(fetch_url);
+				}
+				if (resp && resp->status == 200 && resp->body_length > 8)
+				{
+					if (!MemCompare(resp->body + 1, "PNG", 3))
+						raw = PNGReadBuf(resp->body, resp->body_length);
+					else if (resp->body[0] == 0xFF && resp->body[1] == 0xD8)
+						raw = JPGReadBuf(resp->body, resp->body_length);
+					else if (!MemCompare(resp->body, "GIF8", 4))
+						raw = GIFReadBuf(resp->body, resp->body_length);
+					else if (resp->body_length > 12 &&
+							 !MemCompare(resp->body, "RIFF", 4) &&
+							 !MemCompare(resp->body + 8, "WEBP", 4))
+					{
+						raw = WEBPReadBuf(resp->body, resp->body_length);
+						if (!raw)
+							NetLog("yHarmony img: WEBP decode FAILED (%d bytes) %s",
+								   resp->body_length, fetch_url);
+					}
+					else
+						NetLog("yHarmony img: unknown format %s", im->url);
+				}
+				else
+					NetLog("yHarmony img: fetch failed %s", fetch_url);
+				if (resp)
+					HttpResponseFree(resp);
+				if (raw && raw->width > 0 && raw->height > 0)
+				{//Scale to fit, preserving aspect.
+					w = im->maxw;
+					h = raw->height * w / raw->width;
+					if (h > im->maxh)
+					{
+						h = im->maxh;
+						w = raw->width * h / raw->height;
+					}
+					if (w < 1)
+						w = 1;
+					if (h < 1)
+						h = 1;
+					if (raw->width <= im->maxw && raw->height <= im->maxh)
+					{//Small enough already: 1:1 copy keeps it crisp.
+						w = raw->width;
+						h = raw->height;
+					}
+					fit = DEDCScaleNew(raw, w, h, yh.ui_task);
+					DCDel(raw);
+					im->dc = fit;
+					im->state = 2;
+				}
+				else
+				{
+					if (raw)
+						DCDel(raw);
+					im->fail_t = counts.jiffies;
+					im->state = 3;	//Failed; retried by YhImgGet in ~20s.
+				}
+			}
+		}
+		if (!found)
+			Sleep(150);
+	}
+}
+

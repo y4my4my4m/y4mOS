@@ -104,6 +104,40 @@ public I64 AudioSFXPlay(U32 *frames, I64 count)
 	return stream;
 }
 
+//Incremental streaming feed (browser <audio>): open a stream, push frames one at
+//a time (respecting fifo space so a long song does not need a giant buffer),
+//stop when done. AudioStreamPush returns FALSE when the fifo is full - the
+//caller sleeps and retries. Complements AudioSFXPlay (which queues all at once).
+public I64 AudioStreamOpen()
+{//Grab a free output stream, cleared + ready to be fed. -1 if none free.
+	I64 stream = AudioAvailableOutputStreamGet;
+
+	if (stream >= 0)
+	{
+		audio.output_frames[stream] = 0;
+		FifoI64Flush(audio.output[stream].data);
+	}
+
+	return stream;
+}
+
+public Bool AudioStreamPush(I64 stream, U32 frame)
+{//Push one 48kHz L16|R16 frame if there is room. FALSE = fifo full (retry).
+	if (stream < 0 || stream >= AUDIO_MAX_STREAMS)
+		return FALSE;
+	if (FifoI64Count(audio.output[stream].data) >= AUDIO_STREAM_FIFO_FRAMES - 8192)
+		return FALSE;
+	FifoI64Ins(audio.output[stream].data, frame);
+
+	return TRUE;
+}
+
+public U0 AudioStreamStop(I64 stream)
+{//Silence + release a streaming feed.
+	if (0 <= stream < AUDIO_MAX_STREAMS)
+		FifoI64Flush(audio.output[stream].data);
+}
+
 public U0 AC97ToneTest(I64 ms=1500, I64 hz=440)
 {//Queue a square-wave test tone on a free output stream.
 	I64  i, frames = 48000 * ms / 1000, half = 24000 / hz;

@@ -1,6 +1,51 @@
 CTask *net_log_task = NULL;
 Bool net_log_enabled = TRUE;
 
+// Verbosity filter for NetLog/NetDebug. 1 = application only (HTTP/DNS/TLS/ZINC/
+// JS), 2 = + transport (TCP/UDP/IP/ICMP), 3 = everything (ethernet/ARP/PCNet/
+// socket/MAC). Errors + warnings ALWAYS show. Default 3 = old behaviour.
+I64 net_log_v = 3;
+
+// Lines printed since the clickable filter bar was last shown. The bar scrolls
+// off the top under flood, so we reprint it every so often to keep it reachable.
+I64 net_log_since_bar = 0;
+
+I64 NetLogCat(U8 *msg)
+{ // classify a log line by its leading keyword. lower number = higher level.
+	if (!StrNICompare(msg, "HTTP", 4) || !StrNICompare(msg, "ZINC", 4) ||
+		!StrNICompare(msg, "DNS", 3)  || !StrNICompare(msg, "TLS", 3) ||
+		!StrNICompare(msg, "JS", 2)   || StrFind("body bytes", msg) ||
+		StrFind("GET ", msg)          || StrFind("POST ", msg))
+		return 1; // application layer
+	if (!StrNICompare(msg, "TCP", 3)  || !StrNICompare(msg, "UDP", 3) ||
+		!StrNICompare(msg, "IP", 2)   || !StrNICompare(msg, "ICMP", 4) ||
+		!StrNICompare(msg, "DHCP", 4))
+		return 2; // transport
+	return 3; // link layer / everything else (ethernet, ARP, PCNet, socket, MAC)
+}
+
+public U0 NetLogV(I64 level)
+{ // set the network-log verbosity (1 HTTP, 2 +TCP, 3 all)
+	net_log_v = ClampI64(level, 1, 3);
+	if (net_log_task)
+		DocPrint(net_log_task->put_doc,
+				 "$$BG,GREEN$$$$BLACK$$ log level -> %d $$BG$$$$FG$$\n", net_log_v);
+}
+
+U0 NetLogBar()
+{ // clickable verbosity tabs. Reprinted periodically (see NetLog/NetDebug) so
+  // they stay reachable under flood - they otherwise scroll off the top. You can
+  // also type NetLogV(1..3) in any terminal.
+	if (!net_log_task)
+		return;
+	DocPrint(net_log_task->put_doc,
+			 "$$BG,BLUE$$$$WHITE$$ filter: $$FG$$$$BG$$ "
+			 "$$MA,\"[1 HTTP]\",LM=\"NetLogV(1);\"$$ "
+			 "$$MA,\"[2 +TCP]\",LM=\"NetLogV(2);\"$$ "
+			 "$$MA,\"[3 all]\",LM=\"NetLogV(3);\"$$\n");
+	net_log_since_bar = 0;
+}
+
 U0 NetLogSave()
 {
 	StrCopy(net_log_task->put_doc->filename.name, "::/Home/Net/Log.DD");
@@ -23,6 +68,9 @@ U0 NetLogInit()
 	WinFocus(net_log_task);
 
 	DocPrint(net_log_task->put_doc, "$$WW+H,1$$");
+
+	// clickable verbosity filter (or type NetLogV(1..3) in a terminal)
+	NetLogBar;
 
 //	net_log_task->put_doc->max_entries = I64_MAX;
 
@@ -59,9 +107,16 @@ U0 NetLog(U8 *format, ...)
     if (!net_log_enabled) return;
 	U8 *buf = StrPrintJoin(NULL, format, argc, argv);
 
+	if (NetLogCat(buf) > net_log_v)
+	{ // filtered out at the current verbosity
+		Free(buf);
+		return;
+	}
 	NetLogBottom;
 
 	DocPrint(net_log_task->put_doc, "%s\n", buf);
+	if (++net_log_since_bar >= 50)
+		NetLogBar; // keep a clickable filter bar within a screen of the bottom
 
 	Free(buf);
 }
@@ -95,9 +150,16 @@ U0 NetDebug(U8 *format, ...)
     if (!net_log_enabled) return;
 	U8 *buf = StrPrintJoin(NULL, format, argc, argv);
 
+	if (NetLogCat(buf) > net_log_v)
+	{
+		Free(buf);
+		return;
+	}
 	NetLogBottom;
 
 	DocPrint(net_log_task->put_doc, "$$BG,YELLOW$$$$DKGRAY$$%s$$BG$$$$FG$$\n", buf);
+	if (++net_log_since_bar >= 50)
+		NetLogBar; // keep a clickable filter bar within a screen of the bottom
 
 	Free(buf);
 }

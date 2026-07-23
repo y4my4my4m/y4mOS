@@ -30,7 +30,9 @@
 
 #define ZCSS_OFF_UNSET		-9999	// position offset sentinel
 
-#define ZCSS_MAX_RULES		4096	// big framework bundles bring thousands
+#define ZCSS_MAX_RULES		8192	// big framework bundles bring thousands
+									// (Wikipedia's Vector skin alone is >4k rules;
+									// overflowing silently drops late resets/nav CSS)
 
 class CZStyle
 {
@@ -55,9 +57,32 @@ class CZStyle
 	I8	list_none;				// list-style: none
 	I8	flex_col;				// flex-direction: -1 unset, 0 row, 1 column
 	I8	grid_cols;				// grid-template-columns track count; -1 unset
+	I16 grid_idx;				// index into zcss_gtrk_* track table; -1 unset
+	I16 grid_area_idx;			// child grid-area: zcss_carea name index; -1 unset
+	I8	grid_span;				// grid-column: span N (or 1/-1 = full); 0 unset
+	I8	float_side;				// float: 0 none, 1 left, 2 right
+	I8	clear_side;				// clear: 0 none, 1 left, 2 right, 3 both
 	I16 bg_img;					// background-image: zcss_bgimg index; -1 unset
+	I16 grad;					// background linear-gradient: zcss_grad index; -1 unset
+	I32 sh_col;					// box-shadow color 0xRRGGBB; -1 unset
+	I16 sh_dx, sh_dy, sh_blur;	// box-shadow offset x/y + blur radius, px
+	I16 bg_px, bg_py;			// background-position x/y: signed px, or -(2000+pct); ZCSS_OFF_UNSET unset
+	I16 bg_sw, bg_sh;			// background-size w/h: 0 auto, >0 px, -1..-100 pct, -200 cover, -201 contain
+	I8	bg_repeat;				// background-repeat: -1 unset, 0 repeat, 1 no-repeat
 	I16 line_h;					// line-height in px; -1 normal/unset. Inherits.
 	I8	mono;					// font-family is monospace; -1 unset. Inherits.
+	I8	justify;				// justify-content: -1 unset, 0 start, 1 center,
+								// 2 end, 3 space-between, 4 space-around, 5 evenly
+	I16 tf_x, tf_y;				// transform translate x/y; px or percent (see units)
+	I8	tf_xp, tf_yp;			// 1 = tf_x/tf_y is percent of the element's own box
+	I8	tf_set;					// 1 = transform translate present
+	I8	ovf_hide;				// overflow: -1 unset, 1 hidden/clip, 0 visible
+	I16 zidx;					// z-index; 0 = auto/unset, >0 paints late (on top)
+	I16 content_idx;			// content:"str" intern index (::before/::after); -1
+	I8	columns;				// CSS multi-column count; 0 unset. Not inherited.
+	I8	invert;					// filter: invert(1) on images; -1 unset. Inherits.
+	I8	list_num;				// list-style-type: 0 disc, 1 decimal, 2 decimal-
+								// leading-zero; -1 unset. Inherits (like list-style).
 };
 
 class CZCssRule
@@ -70,6 +95,14 @@ class CZCssRule
 	U8		anc_id[32];
 	Bool	has_anc;
 	Bool	anc_child;		// TRUE: '>', ancestor must be the direct parent
+	I8		anc_comb;		// 0 descendant, 1 child '>', 2 adjacent '+', 3 general '~'
+	U8		sel_attr[24];	// [attr] / [attr=val] selector part; "" = none
+	U8		sel_attr_val[32];
+	U8		root_class[32];	// leading body.X / html.X scope; "" = none. Matches
+							// only when the page's <body> carries class X (100r
+							// scopes per-page styles via body.page_projects etc).
+	I8		pseudo;			// 0 none, 1 :first-child, 2 :last-child,
+							// 3 :nth-child(odd), 4 :nth-child(even)
 	I64		spec;
 	CZStyle style;
 };
@@ -98,6 +131,9 @@ U0 ZStyleReset(CZStyle *s)
 	s->pre = -1;
 	s->align = -1;
 	s->list_none = -1;
+	s->columns = 0;
+	s->invert = -1;
+	s->list_num = -1;
 	s->flex_col = -1;
 	s->mr = -1;
 	s->pr = -1;
@@ -110,9 +146,34 @@ U0 ZStyleReset(CZStyle *s)
 	s->grow = -1;
 	s->pos = -1;
 	s->grid_cols = -1;	// was missing: merge reads it, so garbage leaked in
+	s->grid_idx = -1;
+	s->grid_area_idx = -1;
+	s->grid_span = 0;
+	s->float_side = 0;
+	s->clear_side = 0;
 	s->bg_img = -1;
+	s->grad = -1;
+	s->sh_col = -1;
+	s->sh_dx = 0;
+	s->sh_dy = 0;
+	s->sh_blur = 0;
+	s->bg_px = ZCSS_OFF_UNSET;
+	s->bg_py = ZCSS_OFF_UNSET;
+	s->bg_sw = 0;
+	s->bg_sh = 0;
+	s->bg_repeat = -1;
 	s->line_h = -1;
 	s->mono = -1;
+	s->justify = -1;
+	s->tf_x = 0;
+	s->tf_y = 0;
+	s->tf_xp = 0;
+	s->tf_yp = 0;
+	s->tf_set = 0;
+	s->ovf_hide = -1;
+	s->zidx = 0;
+	s->content_idx = -1;
+	s->columns = 0; // multi-column is a box property, not inherited
 }
 
 U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
@@ -136,11 +197,20 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	if (src->pre	   >= 0) dst->pre		= src->pre;
 	if (src->align	   >= 0) dst->align		= src->align;
 	if (src->list_none >= 0) dst->list_none = src->list_none;
+	if (src->columns  >  0) dst->columns  = src->columns;
+	if (src->invert   >= 0) dst->invert   = src->invert;
+	if (src->list_num >= 0) dst->list_num = src->list_num;
 	if (src->flex_col  >= 0) dst->flex_col	= src->flex_col;
 	if (src->grid_cols >= 0) dst->grid_cols = src->grid_cols;
+	if (src->grid_idx  >= 0) dst->grid_idx	= src->grid_idx;
+	if (src->grid_area_idx >= 0) dst->grid_area_idx = src->grid_area_idx;
+	if (src->grid_span >  0) dst->grid_span = src->grid_span;
+	if (src->float_side)	 dst->float_side = src->float_side;
+	if (src->clear_side)	 dst->clear_side = src->clear_side;
 	if (src->mr		   >= 0) dst->mr		= src->mr;
 	if (src->pr		   >= 0) dst->pr		= src->pr;
-	if (src->height	   >  0) dst->height	= src->height;
+	if (src->height > 0 || src->height <= -3000)
+		dst->height = src->height; // px, or the percent sentinel -(3000+pct)
 	if (src->gap	   >= 0) dst->gap		= src->gap;
 	if (src->off_t > ZCSS_OFF_UNSET) dst->off_t = src->off_t;
 	if (src->off_l > ZCSS_OFF_UNSET) dst->off_l = src->off_l;
@@ -149,8 +219,33 @@ U0 ZStyleMerge(CZStyle *dst, CZStyle *src)
 	if (src->grow	   >= 0) dst->grow		= src->grow;
 	if (src->pos	   >= 0) dst->pos		= src->pos;
 	if (src->bg_img   >= 0) dst->bg_img	= src->bg_img;
+	if (src->grad	   >= 0) dst->grad		= src->grad;
+	if (src->sh_col >= 0)
+	{
+		dst->sh_col	 = src->sh_col;
+		dst->sh_dx	 = src->sh_dx;
+		dst->sh_dy	 = src->sh_dy;
+		dst->sh_blur = src->sh_blur;
+	}
+	if (src->bg_px > ZCSS_OFF_UNSET) dst->bg_px = src->bg_px;
+	if (src->bg_py > ZCSS_OFF_UNSET) dst->bg_py = src->bg_py;
+	if (src->bg_sw)			 dst->bg_sw		= src->bg_sw;
+	if (src->bg_sh)			 dst->bg_sh		= src->bg_sh;
+	if (src->bg_repeat >= 0) dst->bg_repeat = src->bg_repeat;
 	if (src->line_h   >= 0) dst->line_h	= src->line_h;
 	if (src->mono	   >= 0) dst->mono		= src->mono;
+	if (src->justify   >= 0) dst->justify	= src->justify;
+	if (src->tf_set)
+	{
+		dst->tf_x	= src->tf_x;
+		dst->tf_y	= src->tf_y;
+		dst->tf_xp	= src->tf_xp;
+		dst->tf_yp	= src->tf_yp;
+		dst->tf_set = 1;
+	}
+	if (src->ovf_hide >= 0) dst->ovf_hide = src->ovf_hide;
+	if (src->zidx)			 dst->zidx	   = src->zidx;
+	if (src->content_idx >= 0) dst->content_idx = src->content_idx;
 }
 
 U0 ZStyleStripBox(CZStyle *s)
@@ -177,7 +272,32 @@ U0 ZStyleStripBox(CZStyle *s)
 	s->grow = -1;
 	s->pos = -1;
 	s->grid_cols = -1;
+	s->grid_idx = -1;
+	s->grid_area_idx = -1;
+	s->grid_span = 0;
+	s->float_side = 0;
+	s->clear_side = 0;
 	s->bg_img = -1;		// a background image never inherits
+	s->grad = -1;		// nor a gradient
+	s->sh_col = -1;		// nor a shadow
+	s->sh_dx = 0;
+	s->sh_dy = 0;
+	s->sh_blur = 0;
+	s->bg_px = ZCSS_OFF_UNSET;
+	s->bg_py = ZCSS_OFF_UNSET;
+	s->bg_sw = 0;
+	s->bg_sh = 0;
+	s->bg_repeat = -1;
+	s->justify = -1;	// box properties: not inherited
+	s->tf_x = 0;
+	s->tf_y = 0;
+	s->tf_xp = 0;
+	s->tf_yp = 0;
+	s->tf_set = 0;
+	s->ovf_hide = -1;
+	s->zidx = 0;
+	s->content_idx = -1;
+	s->columns = 0; // multi-column is a box property, not inherited
 }
 
 /* ---- CSS custom properties (variables) ----
@@ -196,13 +316,73 @@ I64 zcss_var_count = 0; // reset per page; JIT does not zero plain globals
 // html{font-size:62.5%} makes 1rem = 10px so "5.46rem" sizes are decimal-
 // friendly. Set at rule-add time from an html/:root font-size; reset per page.
 public I64 zcss_rem_px = 16;
+// Viewport size for vw/vh/vmin/vmax units. The GX renderer sets these from the
+// window size before each layout; the defaults just keep standalone parses sane.
+public I64 zcss_view_w = 1024;
+public I64 zcss_view_h = 700;
 
 /* ---- background-image URL interning ----
    CZStyle is a fixed-size struct that gets snapshot-copied everywhere, so it
    stores an index into this per-page table instead of a string. */
 #define ZCSS_BGIMG_MAX	128
 public U8	zcss_bgimg[ZCSS_BGIMG_MAX][192];
+
+/* ---- ::before/::after generated content (plain strings only) ---- */
+#define ZCSS_CONTENT_MAX 64
+public U8  zcss_content[ZCSS_CONTENT_MAX][48];
+public I64 zcss_content_count = 0; // reset per page
+public Bool zcss_has_gen = FALSE;  // any ::before/::after rule present
+// System theme, detected from the ZealOS palette (dark desktop -> dark).
+// Drives prefers-color-scheme exactly like a real browser: a dark system
+// applies the site's dark blocks and skips its light overrides, and v.v.
+public Bool zcss_pref_dark = TRUE;
+// The current page's <body> class list (space-separated). Set by GxLayout each
+// relayout so body.page_X-scoped rules can check it. "" = none.
+public U8 zcss_body_class[256];
 I64			zcss_bgimg_count = 0; // reset per page; JIT zeroes nothing
+
+/* ---- linear-gradient backgrounds (storage) ----
+   Interned per-page table; CZStyle stores an index. Declared HERE (before
+   ZCssReset) so the reset can zero the count - single-pass compiler. The parser
+   ZCssParseGradient lives below, after ZCssColor/ZCssPct. */
+#define ZCSS_GRAD_MAX	64
+#define ZCSS_GRAD_STOPS	6
+
+public class CZGrad
+{
+	I16	angle;					// deg, CSS convention: 0=to top, 90=right, 180=bottom
+	I16	nstops;
+	I32	col[ZCSS_GRAD_STOPS];	// 0xRRGGBB
+	I16	pos[ZCSS_GRAD_STOPS];	// 0..100 along the line; -1 = auto-distribute
+};
+
+public CZGrad	zcss_grad[ZCSS_GRAD_MAX];
+public I64		zcss_grad_count = 0; // reset per page; JIT zeroes nothing
+
+/* Grid column tracks: parsed grid-template-columns / grid-template. Each track
+   is either a fixed pixel width (zcss_gtrk_px[g][i] > 0) OR a flexible fr track
+   (zcss_gtrk_fr[g][i] > 0 = its fr weight). A CZStyle.grid_idx points at a row.
+   Fixed tracks keep their px; fr tracks share the leftover space by weight -
+   real 12.25rem-sidebar + 1fr-content sizing, not equal columns. */
+#define ZCSS_GRID_MAX	96
+#define ZCSS_GRID_TRK	12
+public I64	zcss_gtrk_px[ZCSS_GRID_MAX][ZCSS_GRID_TRK];
+public I64	zcss_gtrk_fr[ZCSS_GRID_MAX][ZCSS_GRID_TRK];
+public I64	zcss_gtrk_n[ZCSS_GRID_MAX];
+public I64	zcss_grid_count = 0; // reset per page
+
+/* grid-template-areas: per grid, each named area's column start + span (rows
+   flow naturally, so only column placement is tracked). A child's grid-area
+   name is interned in zcss_carea; its CZStyle.grid_area_idx points at it and
+   layout matches the name against the container grid's area table. */
+#define ZCSS_GAREA_MAX	10		// distinct named areas per grid
+#define ZCSS_CAREA_MAX	128		// interned child grid-area names, page-wide
+public U8	zcss_ganame[ZCSS_GRID_MAX][ZCSS_GAREA_MAX][24];
+public I64	zcss_gacol[ZCSS_GRID_MAX][ZCSS_GAREA_MAX];  // start column
+public I64	zcss_gaspan[ZCSS_GRID_MAX][ZCSS_GAREA_MAX]; // column span
+public I64	zcss_gacount[ZCSS_GRID_MAX];                // areas in this grid
+public U8	zcss_carea[ZCSS_CAREA_MAX][24];             // child grid-area names
+public I64	zcss_carea_count = 0;
 
 I64 ZCssBgImgAdd(U8 *url)
 { // intern a background-image URL; -1 if full/unusable
@@ -371,6 +551,15 @@ U0 ZCssReset()
 	zcss_rule_count = 0;
 	zcss_var_count = 0;
 	zcss_bgimg_count = 0;
+	zcss_grad_count = 0;
+	zcss_content_count = 0;
+	zcss_has_gen = FALSE;
+	zcss_grid_count = 0;
+	zcss_carea_count = 0;
+	// system theme from the desktop background luminance (dark palette -> dark).
+	zcss_pref_dark = (((de_theme.win_bg >> 16 & 0xFF) * 3 +
+					   (de_theme.win_bg >> 8 & 0xFF) * 6 +
+					   (de_theme.win_bg & 0xFF)) / 10) < 110;
 	zcss_rem_px = 16; // page may rebase via html{font-size:%}
 	zh_dom_gen++; // stylesheet set changed: invalidate memoized styles
 }
@@ -438,966 +627,8 @@ U32 zcss_vga_rgb[16] = {
 	0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF
 };
 
-I64 ZCssNearestVga(I64 r, I64 g, I64 b)
-{
-	I64 i, dr, dg, db, dist, best = 0, best_dist = I64_MAX;
-
-	for (i = 0; i < 16; i++)
-	{
-		dr = r - (zcss_vga_rgb[i] >> 16 & 0xFF);
-		dg = g - (zcss_vga_rgb[i] >> 8  & 0xFF);
-		db = b -  (zcss_vga_rgb[i] & 0xFF);
-		dist = (dr * dr) + (dg * dg) + (db * db);
-		if (dist < best_dist)
-		{
-			best_dist = dist;
-			best = i;
-		}
-	}
-
-	return best;
-}
-
-#define ZCSS_NAME_COUNT 84
-
-U8 *zcss_color_names[ZCSS_NAME_COUNT] = {
-	"black", "silver", "gray", "grey", "white", "maroon", "red",
-	"purple", "fuchsia", "magenta", "green", "lime", "olive", "yellow",
-	"navy", "blue", "teal", "aqua", "cyan", "orange", "brown",
-	"pink", "gold", "darkgray", "darkgrey", "lightgray", "lightgrey",
-	"darkred", "darkblue", "darkgreen", "whitesmoke", "gainsboro",
-	"dimgray", "dimgrey", "slategray", "slategrey", "lightslategray",
-	"beige", "ivory", "snow", "linen", "khaki", "lavender", "salmon",
-	"coral", "tomato", "orangered", "crimson", "firebrick", "indianred",
-	"indigo", "violet", "plum", "orchid", "hotpink", "deeppink",
-	"skyblue", "lightskyblue", "lightblue", "powderblue", "steelblue",
-	"royalblue", "midnightblue", "dodgerblue", "deepskyblue",
-	"cornflowerblue", "cadetblue", "mediumblue", "slateblue",
-	"seagreen", "forestgreen", "limegreen", "springgreen", "olivedrab",
-	"darkolivegreen", "palegreen", "lightgreen", "chocolate", "sienna",
-	"tan", "wheat", "turquoise", "aquamarine", "rebeccapurple"
-};
-U32 zcss_color_rgbs[ZCSS_NAME_COUNT] = {
-	0x000000, 0xC0C0C0, 0x808080, 0x808080, 0xFFFFFF, 0x800000, 0xFF0000,
-	0x800080, 0xFF00FF, 0xFF00FF, 0x008000, 0x00FF00, 0x808000, 0xFFFF00,
-	0x000080, 0x0000FF, 0x008080, 0x00FFFF, 0x00FFFF, 0xFFA500, 0xA52A2A,
-	0xFFC0CB, 0xFFD700, 0xA9A9A9, 0xA9A9A9, 0xD3D3D3, 0xD3D3D3,
-	0x8B0000, 0x00008B, 0x006400, 0xF5F5F5, 0xDCDCDC,
-	0x696969, 0x696969, 0x708090, 0x708090, 0x778899,
-	0xF5F5DC, 0xFFFFF0, 0xFFFAFA, 0xFAF0E6, 0xF0E68C, 0xE6E6FA, 0xFA8072,
-	0xFF7F50, 0xFF6347, 0xFF4500, 0xDC143C, 0xB22222, 0xCD5C5C,
-	0x4B0082, 0xEE82EE, 0xDDA0DD, 0xDA70D6, 0xFF69B4, 0xFF1493,
-	0x87CEEB, 0x87CEFA, 0xADD8E6, 0xB0E0E6, 0x4682B4,
-	0x4169E1, 0x191970, 0x1E90FF, 0x00BFFF,
-	0x6495ED, 0x5F9EA0, 0x0000CD, 0x6A5ACD,
-	0x2E8B57, 0x228B22, 0x32CD32, 0x00FF7F, 0x6B8E23,
-	0x556B2F, 0x98FB98, 0x90EE90, 0xD2691E, 0xA0522D,
-	0xD2B48C, 0xF5DEB3, 0x40E0D0, 0x7FFFD4, 0x663399
-};
-
-I64 ZHexNibble(I64 ch)
-{
-	if ('0' <= ch <= '9')
-		return ch - '0';
-	if ('a' <= ch <= 'f')
-		return ch - 'a' + 10;
-	if ('A' <= ch <= 'F')
-		return ch - 'A' + 10;
-	return -1;
-}
-
-F64 ZCssAbsF(F64 v)
-{
-	if (v < 0.0)
-		return -v;
-	return v;
-}
-
-I64 ZCssAlphaAfter(U8 *p)
-{ // scan for a trailing alpha number ("0.4", ".08", "1"); 255 if none.
-  // Returns alpha scaled 0-255; values given as 0-100% handled too.
-	U8	abuf[16];
-	I64 ai;
-	F64 a;
-
-	while (*p && !('0' <= *p <= '9') && *p != '.')
-		p++;
-	if (!*p)
-		return 255;
-	ai = 0;
-	while ((('0' <= *p <= '9') || *p == '.') && ai < 15)
-		abuf[ai++] = *p++;
-	abuf[ai] = 0;
-	a = Str2F64(abuf);
-	if (*p == '%')
-		a = a / 100.0;
-	if (a > 1.0)
-		a = a / 255.0; // e.g. "128" style
-	if (a < 0.0)
-		a = 0.0;
-	if (a > 1.0)
-		a = 1.0;
-	return ToI64(a * 255.0);
-}
-
-I64 ZCssColor(U8 *val)
-{ // parse a CSS color to 0x00RRGGBB; -1 if unparsable/transparent
-	I64 i, n, h[8], num[3], num_count, cur, sector;
-	Bool in_num;
-	U8	*p;
-	U8	 name[24];
-	F64 fnum[4], hf, sf, lf, cc, xx, mm, rr, gg, bb, t;
-	I64 fcount;
-	U8	fbuf[16];
-
-	while (*val == ' ' || *val == '\t')
-		val++;
-
-	if (*val == '#')
-	{
-		n = 0;
-		while (n < 8 && ZHexNibble(val[1 + n]) >= 0)
-		{
-			h[n] = ZHexNibble(val[1 + n]);
-			n++;
-		}
-		if (n >= 8 && !h[6] && !h[7])
-			return -1;	// #RRGGBB00: fully transparent
-		if (n >= 6)		// #RRGGBB / #RRGGBBAA (partial alpha ignored)
-			return h[0] << 20 | h[1] << 16 | h[2] << 12 |
-				   h[3] << 8  | h[4] << 4  | h[5];
-		if (n >= 3)		// #RGB / #RGBA
-			return h[0] * 17 << 16 | h[1] * 17 << 8 | h[2] * 17;
-		return -1;
-	}
-
-	if (!StrNICompare(val, "rgb", 3))
-	{ // rgb(r,g,b) / rgba(r,g,b,a): near-zero alpha counts as transparent
-		p = val;
-		num_count = 0;
-		cur = 0;
-		in_num = FALSE;
-		while (*p && num_count < 3)
-		{
-			if ('0' <= *p <= '9')
-			{
-				cur = cur * 10 + *p - '0';
-				in_num = TRUE;
-			}
-			else if (in_num)
-			{
-				num[num_count++] = cur;
-				cur = 0;
-				in_num = FALSE;
-			}
-			p++;
-		}
-		if (in_num && num_count < 3)
-			num[num_count++] = cur;
-		if (num_count == 3)
-		{
-			if (ZCssAlphaAfter(p) < 12)
-				return -1;
-			return (num[0] & 0xFF) << 16 | (num[1] & 0xFF) << 8 | (num[2] & 0xFF);
-		}
-		return -1;
-	}
-
-	if (!StrNICompare(val, "hsl", 3))
-	{ // hsl(h, s%, l%) / hsla(...) - convert to RGB
-		p = val;
-		fcount = 0;
-		while (*p && fcount < 4)
-		{
-			while (*p && !('0' <= *p <= '9') && *p != '.' && *p != '-')
-				p++;
-			if (!*p)
-				break;
-			i = 0;
-			while ((('0' <= *p <= '9') || *p == '.' || *p == '-') && i < 15)
-				fbuf[i++] = *p++;
-			fbuf[i] = 0;
-			fnum[fcount++] = Str2F64(fbuf);
-			if (*p == '%')
-				p++;
-		}
-		if (fcount < 3)
-			return -1;
-		if (fcount > 3 && fnum[3] < 0.05)
-			return -1; // hsla with ~zero alpha
-		hf = fnum[0];
-		sf = fnum[1] / 100.0;
-		lf = fnum[2] / 100.0;
-		while (hf < 0.0)
-			hf += 360.0;
-		while (hf >= 360.0)
-			hf -= 360.0;
-		if (sf < 0.0) sf = 0.0;
-		if (sf > 1.0) sf = 1.0;
-		if (lf < 0.0) lf = 0.0;
-		if (lf > 1.0) lf = 1.0;
-		cc = (1.0 - ZCssAbsF(2.0 * lf - 1.0)) * sf;
-		t = hf / 60.0;
-		t = t - 2.0 * ToI64(t / 2.0); // fmod(h/60, 2)
-		xx = cc * (1.0 - ZCssAbsF(t - 1.0));
-		mm = lf - cc / 2.0;
-		sector = ToI64(hf / 60.0);
-		rr = 0.0; gg = 0.0; bb = 0.0;
-		if (sector == 0)		{ rr = cc; gg = xx; }
-		else if (sector == 1)	{ rr = xx; gg = cc; }
-		else if (sector == 2)	{ gg = cc; bb = xx; }
-		else if (sector == 3)	{ gg = xx; bb = cc; }
-		else if (sector == 4)	{ rr = xx; bb = cc; }
-		else					{ rr = cc; bb = xx; }
-		return (ToI64((rr + mm) * 255.0) & 0xFF) << 16 |
-			   (ToI64((gg + mm) * 255.0) & 0xFF) << 8 |
-			   (ToI64((bb + mm) * 255.0) & 0xFF);
-	}
-
-	i = 0;
-	while (val[i] && val[i] != ' ' && val[i] != ';' && i < 23)
-	{
-		name[i] = ZChLower(val[i]);
-		i++;
-	}
-	name[i] = 0;
-	for (i = 0; i < ZCSS_NAME_COUNT; i++)
-		if (!StrCompare(name, zcss_color_names[i]))
-			return zcss_color_rgbs[i];
-
-	return -1;
-}
-
-/* ---- lengths ---- */
-
-I64 ZCssPct(U8 *val)
-{ // "60%" -> 60; -1 if not a plain percentage
-	I64	 n = 0;
-	Bool any = FALSE;
-	U8	*p = val;
-
-	while (*p == ' ' || *p == '\t')
-		p++;
-	while ('0' <= *p <= '9')
-	{
-		n = n * 10 + *p - '0';
-		any = TRUE;
-		p++;
-	}
-	if (*p == '.')
-	{ // ignore the fraction: whole percent is plenty for layout
-		p++;
-		while ('0' <= *p <= '9')
-			p++;
-	}
-	if (!any || *p != '%')
-		return -1;
-
-	return n;
-}
-
-I64 ZCssPx(U8 *val)
-{ // CSS length -> px; -1 if unparsable/percent; negatives clamp to 0
-	I64	 ip = 0, frac = 0, fdiv = 1;
-	Bool any = FALSE, neg = FALSE;
-	U8	*p = val;
-
-	while (*p == ' ' || *p == '\t')
-		p++;
-	if (*p == '-')
-	{
-		neg = TRUE;
-		p++;
-	}
-	while ('0' <= *p <= '9')
-	{
-		ip = ip * 10 + *p - '0';
-		any = TRUE;
-		p++;
-	}
-	if (*p == '.')
-	{
-		p++;
-		while ('0' <= *p <= '9')
-		{
-			if (fdiv < 1000)
-			{
-				frac = frac * 10 + *p - '0';
-				fdiv *= 10;
-				any = TRUE;
-			}
-			p++;
-		}
-	}
-	if (!any)
-		return -1;
-	if (neg)
-		return 0;
-	while (*p == ' ')
-		p++;
-	if (*p == '%')
-		return -1;
-	if (!StrNICompare(p, "pt", 2))
-		return ip * 4 / 3;
-	if (!StrNICompare(p, "rem", 3))
-		return ip * zcss_rem_px + frac * zcss_rem_px / fdiv;
-	if (!StrNICompare(p, "em", 2))
-		return ip * 16 + frac * 16 / fdiv;
-	if (!StrNICompare(p, "vh", 2) || !StrNICompare(p, "vw", 2) ||
-		!StrNICompare(p, "vmin", 4) || !StrNICompare(p, "vmax", 4))
-		return -1;	// viewport units: leave the dimension auto. We cannot
-					// vertically center, so a 100vh hero as a real height would
-					// just be a screen of empty space with content at the top.
-	return ip;	// px or a bare number
-}
-
-I64 ZCssBoxVals(U8 *val, I64 *out4)
-{ // split up to 4 whitespace-separated lengths; returns the count
-	I64	count = 0, n;
-	U8 *p = val, tok[32];
-
-	while (*p && count < 4)
-	{
-		while (*p == ' ' || *p == '\t')
-			p++;
-		n = 0;
-		while (*p && *p != ' ' && *p != '\t')
-		{
-			if (n < 31)
-				tok[n++] = *p;
-			p++;
-		}
-		tok[n] = 0;
-		if (!n)
-			break;
-		out4[count++] = ZCssPx(tok);
-	}
-
-	return count;
-}
-
-/* ---- declarations ---- */
-
-#define ZCSS_SPACE_MAX	80	// clamp margins/padding so junk can't blow layout
-
-Bool ZCssHasAuto(U8 *val)
-{ // any whitespace-separated token equal to "auto"?
-	U8 *p = val;
-
-	while (*p)
-	{
-		while (*p == ' ' || *p == '\t')
-			p++;
-		if (!StrNICompare(p, "auto", 4) &&
-			(p[4] == 0 || p[4] == ' ' || p[4] == '\t' || p[4] == ';'))
-			return TRUE;
-		while (*p && *p != ' ' && *p != '\t')
-			p++;
-	}
-
-	return FALSE;
-}
-
-U0 ZCssMarginSet(U8 *val, I16 *t, I16 *r, I16 *b, I16 *l)
-{ // CSS shorthand order: top right bottom left
-	I64 v[4], count = ZCssBoxVals(val, v), vt = -1, vr = -1, vb = -1, vl = -1;
-
-	if (count == 1)
-	{
-		vt = v[0];	vr = v[0];	vb = v[0];	vl = v[0];
-	}
-	else if (count == 2)
-	{
-		vt = v[0];	vb = v[0];	vr = v[1];	vl = v[1];
-	}
-	else if (count == 3)
-	{
-		vt = v[0];	vr = v[1];	vl = v[1];	vb = v[2];
-	}
-	else if (count == 4)
-	{
-		vt = v[0];	vr = v[1];	vb = v[2];	vl = v[3];
-	}
-	if (vt >= 0) *t = MinI64(vt, ZCSS_SPACE_MAX);
-	if (vr >= 0) *r = MinI64(vr, ZCSS_SPACE_MAX);
-	if (vb >= 0) *b = MinI64(vb, ZCSS_SPACE_MAX);
-	if (vl >= 0) *l = MinI64(vl, ZCSS_SPACE_MAX);
-}
-
-U0 ZCssBorderSet(U8 *val, CZStyle *out)
-{ // "1px solid #ccc": presence + color; "none"/zero width leave it unset
-	I64	 n, c;
-	U8	*p = val, tok[40];
-	Bool styled = FALSE;
-
-	while (*p)
-	{
-		while (*p == ' ' || *p == '\t')
-			p++;
-		n = 0;
-		while (*p && *p != ' ' && *p != '\t')
-		{
-			if (n < 39)
-				tok[n++] = *p;
-			p++;
-		}
-		tok[n] = 0;
-		if (!n)
-			break;
-		if (!StrICompare(tok, "none") || !StrICompare(tok, "hidden") ||
-			!StrICompare(tok, "0") || !StrNICompare(tok, "0px", 3))
-			return;
-		if (!StrICompare(tok, "solid") || !StrICompare(tok, "dashed") ||
-			!StrICompare(tok, "dotted") || !StrICompare(tok, "double") ||
-			!StrICompare(tok, "inset") || !StrICompare(tok, "outset") ||
-			!StrICompare(tok, "ridge") || !StrICompare(tok, "groove"))
-			styled = TRUE;
-		c = ZCssColor(tok);
-		if (c >= 0)
-		{
-			out->border = c;
-			return;
-		}
-	}
-	if (styled && out->border < 0)
-		out->border = 0x777777;
-}
-
-U0 ZCssFontSizeSet(U8 *val, CZStyle *out)
-{
-	I64 n;
-	U8 *p = val;
-
-	if (!StrNICompare(val, "xx-large", 8))
-		n = 32;
-	else if (!StrNICompare(val, "x-large", 7))
-		n = 24;
-	else if (!StrNICompare(val, "larger", 6) || !StrNICompare(val, "large", 5))
-		n = 19;
-	else if (!StrNICompare(val, "medium", 6))
-		n = 16;
-	else if (!StrNICompare(val, "xx-small", 8) || !StrNICompare(val, "x-small", 7) ||
-			 !StrNICompare(val, "smaller", 7) || !StrNICompare(val, "small", 5))
-		n = 13;
-	else
-	{
-		while (*p && *p != '%')
-			p++;
-		if (*p == '%')
-			n = Str2I64(val) * 16 / 100;
-		else
-			n = ZCssPx(val);
-	}
-	if (n >= 0)
-		out->fsize = ClampI64(n, 8, 48);
-}
-
-I64 ZCssGridCols(U8 *val)
-{ // count grid-template-columns tracks; repeat(N, ...) contributes N.
-  // "1fr 1fr 1fr" -> 3, "repeat(4,1fr)" -> 4, "200px 1fr" -> 2. Skips the
-  // "repeat(auto-fill/fit,...)" case (returns what it can, capped).
-	U8	*p = val;
-	I64	 count = 0, rep, d;
-
-	while (*p)
-	{
-		while (*p == ' ' || *p == '\t')
-			p++;
-		if (!*p)
-			break;
-		if (!StrNICompare(p, "repeat(", 7))
-		{
-			p += 7;
-			rep = Str2I64(p); // 0 if auto-fill/auto-fit: treat as one track
-			if (rep < 1)
-				rep = 1;
-			if (rep > 12)
-				rep = 12;
-			count += rep;
-			d = 1;
-			while (*p && d)
-			{
-				if (*p == '(')
-					d++;
-				else if (*p == ')')
-					d--;
-				if (d)
-					p++;
-			}
-			if (*p == ')')
-				p++;
-		}
-		else
-		{
-			count++;
-			while (*p && *p != ' ' && *p != '\t')
-				p++;
-		}
-	}
-	if (count > 12)
-		count = 12;
-	return count;
-}
-
-U0 ZCssDeclApply(U8 *name, U8 *val, CZStyle *out)
-{
-	I64	 color, n, depth;
-	U8	*p, tok[64];
-	U8	 vbuf[512], ubuf[192];
-
-	if (name[0] == '-' && name[1] == '-')
-	{ // custom property definition: store, no direct style effect
-		ZCssVarSet(name + 2, val);
-		return;
-	}
-	if (StrFind("var(", val))
-	{ // expand variable references before parsing the value
-		ZCssVarSubst(val, vbuf, 512);
-		val = vbuf;
-	}
-
-	if (!StrICompare(name, "color"))
-	{
-		color = ZCssColor(val);
-		if (color >= 0)
-			out->fg = color;
-	}
-	else if (!StrICompare(name, "background") ||
-			 !StrICompare(name, "background-color"))
-	{
-		color = ZCssColor(val);
-		if (color < 0)
-		{ // shorthand: "url(x) #202124 no-repeat" - first color-like token wins
-			p = val;
-			while (*p && color < 0)
-			{
-				while (*p == ' ' || *p == '\t')
-					p++;
-				n = 0;
-				depth = 0;
-				while (*p && (*p != ' ' || depth) && *p != '\t')
-				{ // token; keep spaces inside rgb(...) together
-					if (*p == '(')
-						depth++;
-					else if (*p == ')' && depth)
-						depth--;
-					if (n < 63)
-						tok[n++] = *p;
-					p++;
-				}
-				tok[n] = 0;
-				if (!n)
-					break;
-				if (tok[0] == '#' || !StrNICompare(tok, "rgb", 3) ||
-					!StrNICompare(tok, "hsl", 3))
-					color = ZCssColor(tok);
-			}
-		}
-		if (color >= 0)
-			out->bg = color;
-		if (!StrICompare(name, "background") && ZCssUrlExtract(val, ubuf, 192))
-		{ // shorthand can also carry the image: background:url(x) #fff ...
-			n = ZCssBgImgAdd(ubuf);
-			if (n >= 0)
-				out->bg_img = n;
-		}
-	}
-	else if (!StrICompare(name, "background-image"))
-	{
-		if (ZCssUrlExtract(val, ubuf, 192))
-		{ // gradients etc have no url() and are ignored (color stays)
-			n = ZCssBgImgAdd(ubuf);
-			if (n >= 0)
-				out->bg_img = n;
-		}
-	}
-	else if (!StrICompare(name, "line-height"))
-	{
-		if (!StrNICompare(val, "normal", 6))
-			out->line_h = -1;
-		else
-		{
-			//Unitless (1.5) multiplies the font size; anything with a unit
-			//goes through the normal length parser.
-			depth = TRUE; // reused as "is unitless" flag
-			p = val;
-			while (*p)
-			{
-				if (!('0' <= *p <= '9') && *p != '.' && *p != ' ')
-					depth = FALSE;
-				p++;
-			}
-			if (depth)
-			{
-				n = 0; // value in tenths: "1.5" -> 15
-				p = val;
-				while (*p == ' ')
-					p++;
-				while ('0' <= *p <= '9')
-				{
-					n = n * 10 + *p - '0';
-					p++;
-				}
-				n *= 10;
-				if (*p == '.' && '0' <= p[1] <= '9')
-					n += p[1] - '0';
-				if (out->fsize > 0)
-					out->line_h = ClampI64(out->fsize * n / 10, 8, 64);
-				else
-					out->line_h = ClampI64(16 * n / 10, 8, 64);
-			}
-			else
-			{
-				n = ZCssPx(val);
-				if (n > 0)
-					out->line_h = ClampI64(n, 8, 64);
-			}
-		}
-	}
-	else if (!StrICompare(name, "font-weight"))
-	{
-		if (!StrNICompare(val, "bold", 4) || Str2I64(val) >= 600)
-			out->bold = 1;
-		else if (!StrICompare(val, "normal"))
-			out->bold = 0;
-	}
-	else if (!StrICompare(name, "font-style"))
-	{
-		if (!StrNICompare(val, "italic", 6) || !StrNICompare(val, "oblique", 7))
-			out->underline = 1;
-		else if (!StrICompare(val, "normal"))
-			out->underline = 0;
-	}
-	else if (!StrICompare(name, "font-size"))
-		ZCssFontSizeSet(val, out);
-	else if (!StrICompare(name, "font-family"))
-	{ // pick the monospace vs proportional family; specific faces ignored
-		if (StrIMatch("mono", val) || StrIMatch("courier", val) ||
-			StrIMatch("consol", val) || StrIMatch("menlo", val) ||
-			StrIMatch("monaco", val) || StrIMatch("fixed", val))
-			out->mono = 1;
-		else
-			out->mono = 0;
-	}
-	else if (!StrICompare(name, "font"))
-	{ // shorthand: pick out a weight and a size; family is ignored
-		p = val;
-		while (*p)
-		{
-			while (*p == ' ' || *p == '\t')
-				p++;
-			n = 0;
-			while (*p && *p != ' ' && *p != '\t' && *p != ',')
-			{
-				if (n < 39)
-					tok[n++] = *p;
-				p++;
-			}
-			tok[n] = 0;
-			if (!n)
-				break;
-			if (!StrICompare(tok, "bold") || Str2I64(tok) >= 600)
-				out->bold = 1;
-			else if ('0' <= tok[0] <= '9' && ZCssPx(tok) > 0)
-				ZCssFontSizeSet(tok, out);
-			if (*p == ',')
-				break;	// family list reached
-		}
-	}
-	else if (!StrICompare(name, "text-decoration") ||
-			 !StrICompare(name, "text-decoration-line"))
-	{
-		if (StrIMatch("underline", val))
-			out->underline = 1;
-		else if (!StrNICompare(val, "none", 4))
-			out->underline = 0;
-	}
-	else if (!StrICompare(name, "text-align"))
-	{
-		if (!StrNICompare(val, "center", 6))
-			out->align = 1;
-		else if (!StrNICompare(val, "right", 5) || !StrNICompare(val, "end", 3))
-			out->align = 2;
-		else
-			out->align = 0;
-	}
-	else if (!StrICompare(name, "margin"))
-	{
-		ZCssMarginSet(val, &out->mt, &out->mr, &out->mb, &out->ml);
-		if (ZCssHasAuto(val))
-			out->ml_auto = 1; // "margin: X auto" centers a sized block
-	}
-	else if (!StrICompare(name, "margin-top"))
-	{
-		n = ZCssPx(val);
-		if (n >= 0)
-			out->mt = MinI64(n, ZCSS_SPACE_MAX);
-	}
-	else if (!StrICompare(name, "margin-bottom"))
-	{
-		n = ZCssPx(val);
-		if (n >= 0)
-			out->mb = MinI64(n, ZCSS_SPACE_MAX);
-	}
-	else if (!StrICompare(name, "margin-left") ||
-			 !StrICompare(name, "margin-right"))
-	{
-		if (ZCssHasAuto(val))
-			out->ml_auto = 1;
-		n = ZCssPx(val);
-		if (n >= 0)
-		{
-			if (name[7] == 'l')
-				out->ml = MinI64(n, ZCSS_SPACE_MAX);
-			else
-				out->mr = MinI64(n, ZCSS_SPACE_MAX);
-		}
-	}
-	else if (!StrICompare(name, "width") || !StrICompare(name, "max-width"))
-	{
-		p = val;
-		while (*p && *p != '%')
-			p++;
-		if (*p == '%')
-		{
-			n = Str2I64(val);
-			if (1 <= n <= 99)
-				out->width = -n;
-		}
-		else
-		{
-			n = ZCssPx(val);
-			if (n > 15)
-			{ // max-width narrows an existing width, plain width replaces it
-				if (name[0] == 'm' || name[0] == 'M')
-				{
-					if (out->width <= 0 || n < out->width)
-						out->width = MinI64(n, 4000);
-				}
-				else
-					out->width = MinI64(n, 4000);
-			}
-		}
-	}
-	else if (!StrICompare(name, "padding"))
-		ZCssMarginSet(val, &out->pt, &out->pr, &out->pb, &out->pl);
-	else if (!StrICompare(name, "padding-right"))
-	{
-		n = ZCssPx(val);
-		if (n >= 0)
-			out->pr = MinI64(n, ZCSS_SPACE_MAX);
-	}
-	else if (!StrICompare(name, "height") || !StrICompare(name, "min-height"))
-	{ // px only (a % height needs a sized ancestor chain we don't track)
-		n = ZCssPx(val);
-		if (15 < n <= 2000 && n > out->height)
-			out->height = n;
-	}
-	else if (!StrICompare(name, "gap") || !StrICompare(name, "column-gap") ||
-			 !StrICompare(name, "grid-gap"))
-	{
-		n = ZCssPx(val);
-		if (0 <= n <= 200)
-			out->gap = n;
-	}
-	else if (!StrICompare(name, "flex-grow"))
-	{
-		n = Str2I64(val);
-		if (0 <= n <= 8)
-			out->grow = n;
-	}
-	else if (!StrICompare(name, "flex"))
-	{ // shorthand: "1", "1 1 auto", "none", "auto" - first number = grow
-		if (!StrNICompare(val, "none", 4))
-			out->grow = 0;
-		else if (!StrNICompare(val, "auto", 4))
-			out->grow = 1;
-		else if ('0' <= val[0] <= '9')
-		{
-			n = Str2I64(val);
-			out->grow = ClampI64(n, 0, 8);
-		}
-	}
-	else if (!StrICompare(name, "flex-basis"))
-	{
-		n = ZCssPx(val);
-		if (n > 15 && !out->width)
-			out->width = MinI64(n, 4000);
-	}
-	else if (!StrICompare(name, "border-radius"))
-	{
-		n = ZCssPx(val);
-		if (0 <= n <= 48)
-			out->radius = n;
-		else if (StrFind("%", val) || n > 48)
-			out->radius = 48; // 50% pills etc: cap, draw clamps to h/2
-	}
-	else if (!StrICompare(name, "position"))
-	{
-		if (!StrNICompare(val, "relative", 8))
-			out->pos = 1;
-		else if (!StrNICompare(val, "absolute", 8))
-			out->pos = 2;
-		else if (!StrNICompare(val, "fixed", 5))
-			out->pos = 3;
-		else
-			out->pos = 0; // static / sticky flow normally
-	}
-	else if (!StrICompare(name, "top"))
-	{//Percent offsets (top:20%) encode as -(2000+p): resolved against the
-	//containing block at layout time (wikipedia rings its globe this way).
-		n = ZCssPx(val);
-		if (0 <= n <= 4000)
-			out->off_t = n;
-		else
-		{
-			n = ZCssPct(val);
-			if (0 <= n <= 100)
-				out->off_t = -(2000 + n);
-		}
-	}
-	else if (!StrICompare(name, "left"))
-	{
-		n = ZCssPx(val);
-		if (0 <= n <= 4000)
-			out->off_l = n;
-		else
-		{
-			n = ZCssPct(val);
-			if (0 <= n <= 100)
-				out->off_l = -(2000 + n);
-		}
-	}
-	else if (!StrICompare(name, "right"))
-	{
-		n = ZCssPx(val);
-		if (0 <= n <= 4000)
-			out->off_r = n;
-		else
-		{
-			n = ZCssPct(val);
-			if (0 <= n <= 100)
-				out->off_r = -(2000 + n);
-		}
-	}
-	else if (!StrICompare(name, "padding-top"))
-	{
-		n = ZCssPx(val);
-		if (n >= 0)
-			out->pt = MinI64(n, ZCSS_SPACE_MAX);
-	}
-	else if (!StrICompare(name, "padding-bottom"))
-	{
-		n = ZCssPx(val);
-		if (n >= 0)
-			out->pb = MinI64(n, ZCSS_SPACE_MAX);
-	}
-	else if (!StrICompare(name, "padding-left"))
-	{
-		n = ZCssPx(val);
-		if (n >= 0)
-			out->pl = MinI64(n, ZCSS_SPACE_MAX);
-	}
-	else if (!StrICompare(name, "border") || !StrICompare(name, "border-top") ||
-			 !StrICompare(name, "border-bottom") ||
-			 !StrICompare(name, "border-left") ||
-			 !StrICompare(name, "border-right") ||
-			 !StrICompare(name, "outline"))
-		ZCssBorderSet(val, out);
-	else if (!StrICompare(name, "border-color"))
-	{
-		color = ZCssColor(val);
-		if (color >= 0)
-			out->border = color;
-	}
-	else if (!StrICompare(name, "display"))
-	{
-		if (!StrNICompare(val, "none", 4))
-			out->display = ZCSS_DISP_NONE;
-		else if (!StrNICompare(val, "inline-block", 12))
-			out->display = ZCSS_DISP_BLOCK;
-		else if (!StrNICompare(val, "inline-flex", 11) ||
-				 !StrNICompare(val, "inline-grid", 11))
-			out->display = ZCSS_DISP_FLEX;
-		else if (!StrNICompare(val, "inline", 6))
-			out->display = ZCSS_DISP_INLINE;
-		else if (!StrNICompare(val, "flex", 4) || !StrNICompare(val, "grid", 4))
-			out->display = ZCSS_DISP_FLEX; // rows of children (approx flex/grid)
-		else
-			out->display = ZCSS_DISP_BLOCK;
-	}
-	else if (!StrICompare(name, "flex-direction") || !StrICompare(name, "flex-flow"))
-	{
-		if (StrFind("column", val))
-			out->flex_col = 1;
-		else
-			out->flex_col = 0;
-	}
-	else if (!StrICompare(name, "grid-template-columns") ||
-			 !StrICompare(name, "grid-template"))
-	{ // count the explicit column tracks so grids lay out in the right number
-	  // of columns instead of our width heuristic
-		n = ZCssGridCols(val);
-		if (1 <= n <= 12)
-			out->grid_cols = n;
-	}
-	else if (!StrICompare(name, "justify-content") ||
-			 !StrICompare(name, "place-content") ||
-			 !StrICompare(name, "align-items") ||
-			 !StrICompare(name, "place-items") ||
-			 !StrICompare(name, "justify-items") ||
-			 !StrICompare(name, "text-align-last"))
-	{//No real flexbox, but map a centered flex container onto our text-align
-	 //centering (which inherits), so modern centered layouts stop hugging the
-	 //left edge. center wins; explicit start/end map to left/right.
-		if (StrFind("center", val))
-			out->align = 1;
-		else if (StrFind("end", val) || StrFind("right", val))
-			out->align = 2;
-		else if (StrFind("start", val) || StrFind("left", val))
-			out->align = 0;
-	}
-	else if (!StrICompare(name, "visibility"))
-	{
-		if (!StrNICompare(val, "hidden", 6))
-			out->display = ZCSS_DISP_NONE;
-	}
-	else if (!StrICompare(name, "clip") || !StrICompare(name, "clip-path"))
-	{//The "screen-reader only" idiom (clip:rect(0 0 0 0) / clip-path:inset(50%))
-	 //visually removes an element while keeping it for a11y. We have no clip, so
-	 //treat it as hidden - otherwise these off-screen labels (e.g. DuckDuckGo's
-	 //hidden <h1>) render as big stray text.
-		if (StrFind("rect(", val) || StrFind("inset(", val) ||
-			StrFind("circle(0", val) || StrFind("polygon(", val))
-			out->display = ZCSS_DISP_NONE;
-	}
-	else if (!StrICompare(name, "opacity"))
-	{
-		if (!StrCompare(val, "0") || !StrNCompare(val, "0.0", 3))
-			out->display = ZCSS_DISP_NONE;
-	}
-	else if (!StrICompare(name, "text-transform"))
-	{
-		if (!StrNICompare(val, "uppercase", 9))
-			out->uppercase = 1;
-		else
-			out->uppercase = 0;
-	}
-	else if (!StrICompare(name, "white-space"))
-	{
-		if (!StrNICompare(val, "pre", 3))
-			out->pre = 1;
-		else
-			out->pre = 0;
-	}
-	else if (!StrICompare(name, "list-style") ||
-			 !StrICompare(name, "list-style-type"))
-	{
-		if (StrIMatch("none", val))
-			out->list_none = 1;
-	}
-}
-
+#include "CSSVal"
+#include "CSSDecl"
 U0 ZCssParseDecls(U8 *src, U8 *end, CZStyle *out)
 { // "name: value; name: value" between src and end
 	U8	name[32], val[128];
@@ -1519,21 +750,187 @@ I64 ZCssSimpleSpec(U8 *tag, U8 *cls, U8 *id)
 U0 ZCssRuleAdd(U8 *sel, U8 *sel_end, CZStyle *style)
 { // one comma-free selector; keeps its last two simple-selector parts
 	CZCssRule	*rule;
-	U8			*p, *cur_s, *cur_e, *prev_s, *prev_e;
+	U8			*p, *cur_s, *cur_e, *prev_s, *prev_e, *q;
 	I64			 comb, pend; // 0 descendant, 1 '>', 2 sibling ('+'/'~')
 	Bool		 in_gap;
+	U8			 sbuf[160], pname[24], abuf[24], avbuf[32];
+	I64			 sn, an, dep;
+	I8			 pseudo;
 
 	if (zcss_rule_count >= ZCSS_MAX_RULES)
 		return;
 
-	// reject pseudo-classes and attribute selectors outright
+	// SANITIZE the selector instead of dropping it: resolve/strip pseudo-classes
+	// and capture one [attr(=val)] filter. Dropping every rule containing ':' or
+	// '[' silently killed :root, :not(), structural pseudos and attribute rules
+	// on virtually every modern site.
+	sn = 0;
+	an = 0;
+	pseudo = 0;
+	abuf[0]	 = 0;
+	avbuf[0] = 0;
 	p = sel;
-	while (p < sel_end)
+	while (p < sel_end && sn < 150)
 	{
-		if (*p == ':' || *p == '[')
-			return;
-		p++;
+		if (*p == '[')
+		{ // attribute selector: [name] / [name=val] (quotes stripped, ~*|^ ignored)
+			p++;
+			an = 0;
+			while (p < sel_end && *p != ']' && *p != '=' && *p != '~' &&
+				   *p != '*' && *p != '^' && *p != '|')
+			{
+				if (an < 23 && *p != ' ')
+					abuf[an++] = ZChLower(*p);
+				p++;
+			}
+			abuf[an] = 0;
+			while (p < sel_end && *p != ']' && *p != '=')
+				p++;
+			if (p < sel_end && *p == '=')
+			{
+				p++;
+				an = 0;
+				while (p < sel_end && *p != ']')
+				{
+					if (*p != '"' && *p != 0x27 && an < 31)
+						avbuf[an++] = *p;
+					p++;
+				}
+				avbuf[an] = 0;
+			}
+			if (p < sel_end)
+				p++; // closing ]
+		}
+		else if (*p == ':')
+		{
+			q = p;
+			while (q < sel_end && *q == ':')
+				q++;
+			an = 0;
+			while (q < sel_end && an < 23 &&
+				   ('a' <= ZChLower(*q) <= 'z' || *q == '-'))
+			{
+				pname[an++] = ZChLower(*q);
+				q++;
+			}
+			pname[an] = 0;
+			if (!StrCompare(pname, "root"))
+			{ // :root == the html element
+				if (sn < 146)
+				{
+					sbuf[sn++] = 'h'; sbuf[sn++] = 't';
+					sbuf[sn++] = 'm'; sbuf[sn++] = 'l';
+				}
+				p = q;
+			}
+			else if (!StrCompare(pname, "link") || !StrCompare(pname, "visited"))
+				p = q; // style like the base element
+			else if (!StrCompare(pname, "first-child"))
+			{
+				pseudo = 1;
+				p = q;
+			}
+			else if (!StrCompare(pname, "last-child"))
+			{
+				pseudo = 2;
+				p = q;
+			}
+			else if (!StrCompare(pname, "nth-child"))
+			{
+				pseudo = 3; // default odd
+				if (q < sel_end && *q == '(')
+				{
+					if (!StrNICompare(q, "(even", 5) || !StrNICompare(q, "(2n)", 4))
+						pseudo = 4;
+					else if (!StrNICompare(q, "(1)", 3))
+						pseudo = 1;
+					dep = 0;
+					while (q < sel_end)
+					{ // skip the (...) argument
+						if (*q == '(')
+							dep++;
+						else if (*q == ')')
+							dep--;
+						q++;
+						if (!dep)
+							goto zcss_nth_done;
+					}
+zcss_nth_done:;
+				}
+				p = q;
+			}
+			else if (!StrCompare(pname, "not"))
+			{ // approximation: apply the base selector (over-applies; better than
+			  // losing the rule's base styling entirely)
+				dep = 0;
+				while (q < sel_end)
+				{
+					if (*q == '(')
+						dep++;
+					else if (*q == ')')
+					{
+						dep--;
+						if (!dep)
+						{
+							q++;
+							goto zcss_not_done;
+						}
+					}
+					q++;
+				}
+zcss_not_done:;
+				p = q;
+			}
+			else if (!StrCompare(pname, "before"))
+			{ // generated content: special rule consulted by the layout, never
+			  // matched against the element itself
+				pseudo = 5;
+				p = q;
+			}
+			else if (!StrCompare(pname, "after"))
+			{
+				pseudo = 6;
+				p = q;
+			}
+			else if (!StrCompare(pname, "is") || !StrCompare(pname, "where") ||
+					 !StrCompare(pname, "matches") || !StrCompare(pname, "has"))
+			{ // :is()/:where()/:matches()/:has(): skip the argument, keep the base
+			  // selector (over-applies vs. exact list membership, but retains the
+			  // rule instead of dropping it). Same tactic as :not() above.
+				dep = 0;
+				while (q < sel_end)
+				{
+					if (*q == '(')
+						dep++;
+					else if (*q == ')')
+					{
+						dep--;
+						if (!dep)
+						{
+							q++;
+							goto zcss_fn_done;
+						}
+					}
+					q++;
+				}
+zcss_fn_done:;
+				p = q;
+			}
+			else
+				return; // dynamic-state pseudos (:hover, :focus, :active,
+						// :checked, :enabled ...): statically never match at rest,
+						// so drop the rule - the element keeps its base styling
+		}
+		else
+		{
+			sbuf[sn] = *p;
+			sn++;
+			p++;
+		}
 	}
+	sbuf[sn] = 0;
+	sel = sbuf;
+	sel_end = sbuf + sn;
 
 	// walk whitespace/combinator-separated tokens, remembering the last two;
 	// the current token only shifts into prev when a NEW one starts, so
@@ -1553,10 +950,12 @@ U0 ZCssRuleAdd(U8 *sel, U8 *sel_end, CZStyle *style)
 		{
 			if (cur_s)
 				in_gap = TRUE;
-			if (*p == '>' && pend < 1)
+			if (*p == '>')
 				pend = 1;
-			if ((*p == '+' || *p == '~') && pend < 2)
-				pend = 2;
+			if (*p == '+')
+				pend = 2; // adjacent sibling
+			if (*p == '~')
+				pend = 3; // general sibling
 		}
 		else
 		{
@@ -1580,26 +979,51 @@ U0 ZCssRuleAdd(U8 *sel, U8 *sel_end, CZStyle *style)
 
 	rule = &zcss_rules[zcss_rule_count];
 	ZCssSimpleParse(cur_s, cur_e, rule->sel_tag, rule->sel_class, rule->sel_id);
+	rule->root_class[0] = 0;
+	q = sel; // leading body.CLASS / html.CLASS = page-scope: record the class so
+	while (*q == ' ' || *q == '\t')  // ZCssRuleMatch can gate on the <body> class
+		q++;
+	if (!StrNCompare(q, "body.", 5) || !StrNCompare(q, "html.", 5))
+	{
+		q += 5;
+		an = 0;
+		while (*q && *q != ' ' && *q != '\t' && *q != '.' && *q != '#' &&
+			   *q != '>' && *q != '+' && *q != '~' && an < 31)
+			rule->root_class[an++] = *q++;
+		rule->root_class[an] = 0;
+	}
 	rule->has_anc	= FALSE;
 	rule->anc_child = FALSE;
+	rule->anc_comb	= 0;
 	rule->anc_tag[0]   = 0;
 	rule->anc_class[0] = 0;
 	rule->anc_id[0]	   = 0;
-	if (prev_s && comb < 2)
-	{ // '+'/'~' siblings: fall back to the target part alone
+	if (prev_s)
+	{ // descendant / child / sibling: store the anchor part + its combinator
 		ZCssSimpleParse(prev_s, prev_e, rule->anc_tag, rule->anc_class,
 						rule->anc_id);
 		if (rule->anc_tag[0] || rule->anc_class[0] || rule->anc_id[0])
 		{
 			rule->has_anc	= TRUE;
 			rule->anc_child = (comb == 1);
+			rule->anc_comb	= comb; // 2 '+', 3 '~' now matched, not dropped
 		}
 	}
+
+	StrCopy(rule->sel_attr, abuf);		// [attr(=val)] filter ("" = none)
+	StrCopy(rule->sel_attr_val, avbuf);
+	rule->pseudo = pseudo;
+	if (pseudo >= 5)
+		zcss_has_gen = TRUE;
 
 	rule->spec = ZCssSimpleSpec(rule->sel_tag, rule->sel_class, rule->sel_id);
 	if (rule->has_anc)
 		rule->spec += ZCssSimpleSpec(rule->anc_tag, rule->anc_class,
 									 rule->anc_id);
+	if (rule->sel_attr[0])
+		rule->spec += 10; // attribute selector counts like a class
+	if (rule->pseudo)
+		rule->spec += 10; // structural pseudo-class likewise
 	if (!rule->spec)
 		rule->spec = 1; // bare '*'
 
@@ -1616,13 +1040,21 @@ U0 ZCssRuleAdd(U8 *sel, U8 *sel_end, CZStyle *style)
 
 // The browser sets this to its content width before stylesheets parse, so
 // @media (min-width/max-width) blocks evaluate against the real viewport.
-public I64 zcss_viewport_w = 1024; // statically initialized (JIT zeroes nothing)
+// (media width queries evaluate against zcss_view_w - the ONE viewport global,
+// set by WebBrowser before sheet parsing and by GxLayout before each layout.
+// It replaced a separate zcss_viewport_w that could drift from the unit sizes.)
 
 I64 ZCssMediaWidth(U8 *p, U8 *end)
-{ // parse the number after "min-width"/"max-width" (":" then px); 0 if none
-	while (p < end && (*p == ':' || *p == ' ' || *p == '\t'))
+{ // px number after "min-width"/"max-width". Handles calc(): "max-width:
+  // calc(640px - 1px)" -> the FIRST number (640) is the breakpoint that matters.
+  // Skip any non-digit (colon, spaces, "calc(", "(") to reach it.
+	while (p < end && !('0' <= *p <= '9'))
+	{
+		if (*p == '{' || *p == '}') // safety: don't run past the query
+			return 0;
 		p++;
-	if (p >= end || !('0' <= *p <= '9'))
+	}
+	if (p >= end)
 		return 0;
 	return Str2I64(p);
 }
@@ -1669,11 +1101,13 @@ U0 ZCssParseRegion(U8 *p, U8 *end)
 				{
 					if (!StrNICompare(scan, "print", 5))
 						is_print = TRUE;
-					if (!StrNICompare(scan, "light", 5))
-						is_print = TRUE; // prefers-color-scheme: light (or any
-										 // light-media query): we render dark,
-										 // so skip - entering both schemes'
-										 // blocks makes last-wins color soup
+					// prefers-color-scheme: honor the detected system theme.
+					// Dark system -> apply dark blocks, skip light blocks.
+					// Light system -> the reverse. Same as any real browser.
+					if (!StrNICompare(scan, "dark", 4) && !zcss_pref_dark)
+						is_print = TRUE;
+					if (!StrNICompare(scan, "light", 5) && zcss_pref_dark)
+						is_print = TRUE;
 					if (!StrNICompare(scan, "min-width", 9))
 						mq_min = ZCssMediaWidth(scan + 9, at_e);
 					if (!StrNICompare(scan, "max-width", 9))
@@ -1682,9 +1116,9 @@ U0 ZCssParseRegion(U8 *p, U8 *end)
 				}
 				// evaluate width conditions against the real viewport, so
 				// mobile and desktop breakpoint blocks stop BOTH applying
-				if (mq_min > 0 && zcss_viewport_w < mq_min)
+				if (mq_min > 0 && zcss_view_w < mq_min)
 					is_print = TRUE;
-				if (mq_max > 0 && zcss_viewport_w > mq_max)
+				if (mq_max > 0 && zcss_view_w > mq_max)
 					is_print = TRUE;
 				body = p + 1;
 				depth = 0;
@@ -1787,12 +1221,95 @@ Bool ZCssSimpleMatch(U8 *tag, U8 *cls, U8 *id, CZNode *node)
 
 Bool ZCssRuleMatch(CZCssRule *rule, CZNode *node)
 {
-	CZNode *anc;
+	CZNode *anc, *sib;
+	U8	   *attr;
+	I64		idx;
+	Bool	is_last;
 
+	if (rule->pseudo >= 5)
+		return FALSE; // ::before/::after style generated content, not the element
+	if (rule->root_class[0] &&
+		!ZCssClassListHas(zcss_body_class, rule->root_class))
+		return FALSE; // body.page_X-scoped rule, but this page isn't page_X
 	if (!ZCssSimpleMatch(rule->sel_tag, rule->sel_class, rule->sel_id, node))
 		return FALSE;
+	if (rule->sel_attr[0])
+	{ // [attr] presence / [attr=val] equality
+		attr = ZNodeAttr(node, rule->sel_attr);
+		if (!attr)
+			return FALSE;
+		if (rule->sel_attr_val[0] && StrICompare(attr, rule->sel_attr_val))
+			return FALSE;
+	}
+	if (rule->pseudo)
+	{ // structural pseudos: position among the parent's ELEMENT children
+		if (!node->parent)
+			return FALSE;
+		idx = 0;
+		is_last = FALSE;
+		sib = node->parent->first_child;
+		while (sib)
+		{
+			if (sib->type == ZH_ELEM)
+			{
+				idx++;
+				if (sib == node)
+				{
+					is_last = TRUE; // provisional: last unless a later elem shows
+					if (rule->pseudo == 1 && idx != 1)
+						return FALSE;
+					if (rule->pseudo == 3 && !(idx & 1))
+						return FALSE;
+					if (rule->pseudo == 4 && (idx & 1))
+						return FALSE;
+				}
+				else if (is_last)
+				{ // an element after node: node is not :last-child
+					if (rule->pseudo == 2)
+						return FALSE;
+					sib = NULL;
+					goto zcss_pseudo_ok;
+				}
+			}
+			if (sib)
+				sib = sib->next;
+		}
+zcss_pseudo_ok:;
+		if (rule->pseudo == 2 && !is_last)
+			return FALSE;
+	}
 	if (rule->has_anc)
 	{
+		if (rule->anc_comb == 2 || rule->anc_comb == 3)
+		{ // sibling: scan the element siblings BEFORE node in the same parent.
+		  // '+' adjacent = the immediately preceding element; '~' general = any
+		  // preceding element. (State like :checked on the anchor is ignored, so
+		  // the checkbox-hack "#cb:not(:checked) ~ .menu" applies at rest = the
+		  // default collapsed look, matching a real browser before interaction.)
+			if (!node->parent)
+				return FALSE;
+			sib = node->parent->first_child;
+			anc = NULL; // remembers the last element sibling seen before node
+			while (sib && sib != node)
+			{
+				if (sib->type == ZH_ELEM)
+					anc = sib;
+				sib = sib->next;
+			}
+			if (rule->anc_comb == 2)
+				return anc &&
+					ZCssSimpleMatch(rule->anc_tag, rule->anc_class, rule->anc_id, anc);
+			// general '~': any preceding element sibling matches
+			sib = node->parent->first_child;
+			while (sib && sib != node)
+			{
+				if (sib->type == ZH_ELEM &&
+					ZCssSimpleMatch(rule->anc_tag, rule->anc_class, rule->anc_id, sib))
+					return TRUE;
+				sib = sib->next;
+			}
+			return FALSE;
+		}
 		anc = node->parent;
 		if (rule->anc_child)
 			return anc &&
@@ -1807,6 +1324,54 @@ Bool ZCssRuleMatch(CZCssRule *rule, CZNode *node)
 	}
 
 	return TRUE;
+}
+
+public U8 *ZCssGenText(CZNode *node, I64 where)
+{ // generated-content lookup: the ::before (where=5) / ::after (where=6) rule
+  // text for this element, or NULL. Highest specificity wins.
+	CZCssRule *r;
+	CZNode	  *anc;
+	I64		   i, best_spec = -1, best = -1;
+	Bool	   ok;
+
+	for (i = 0; i < zcss_rule_count; i++)
+	{
+		r = &zcss_rules[i];
+		if (r->pseudo != where || r->style.content_idx < 0)
+			goto zcss_gen_next;
+		if (!ZCssSimpleMatch(r->sel_tag, r->sel_class, r->sel_id, node))
+			goto zcss_gen_next;
+		if (r->has_anc)
+		{
+			ok = FALSE;
+			anc = node->parent;
+			if (r->anc_child)
+				ok = anc &&
+					 ZCssSimpleMatch(r->anc_tag, r->anc_class, r->anc_id, anc);
+			else
+				while (anc)
+				{
+					if (ZCssSimpleMatch(r->anc_tag, r->anc_class, r->anc_id, anc))
+					{
+						ok = TRUE;
+						anc = NULL;
+					}
+					else
+						anc = anc->parent;
+				}
+			if (!ok)
+				goto zcss_gen_next;
+		}
+		if (r->spec >= best_spec)
+		{
+			best_spec = r->spec;
+			best = r->style.content_idx;
+		}
+zcss_gen_next:;
+	}
+	if (best >= 0 && best < zcss_content_count && zcss_content[best][0])
+		return zcss_content[best];
+	return NULL;
 }
 
 #define ZCSS_MAX_MATCH 96

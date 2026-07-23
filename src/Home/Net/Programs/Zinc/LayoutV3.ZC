@@ -1,0 +1,2018 @@
+//Layout v3: UNIFIED engine. One dispatch (V3Node), one box model (V3Block).
+//No v1<->v2 delegation: lists, tables, images, svg, widgets, links, floats,
+//flex, grid, positioning are ALL laid by this engine. It reuses only stateless
+//primitives from the files above it in the include chain:
+//  - inline flow:  GxText/GxWord/GxRunFlush/GxNewline/GxLineAlign (cursor runs)
+//  - emit + caches: GxOpAdd, GxWidget, GxImgFind/GxImgGet, SVGRenderToDC
+//  - style:        ZCssApply/ZnUaStyle/ZStyleMerge/ZStyleStripBox/ZCssGenText
+//  - metrics:      L2HeightPx/L2HeightPxCB/L2OffPx, CL2State save/restore
+//Selected per-window by zinc_v3 (Layout3() / the ZincV3 entry / YDE menu).
+
+public Bool zinc_v3 = FALSE;
+I64 v3_meas_depth = 0;
+I64 v3_depth = 0;		// live recursion depth; hard-capped (stack overflow =
+						// repeating page-fault cascade, the wikipedia crash)
+#define V3_MEAS_MAX	3	// dry-run nesting cap: each level stacks a full
+						// subtree walk, so keep it shallow
+
+extern U0 V3Node(CZNode *node, CZStyle *inh);
+
+public U0 Layout3(Bool on)
+{ // switch to/from the unified engine at runtime
+	zinc_v3 = on;
+	gx.relayout = TRUE;
+}
+
+/* ---- measurement (dry run) ---- */
+
+U0 V3Measure(CZNode *node, CZStyle *inh, I64 avail, I64 *w_out, I64 *h_out)
+{ // lay node into a scratch window avail wide; report content w/h; roll back
+	CL2State sv;
+	CZStyle	 mi;
+	I64		 i, x0, y0, maxx;
+
+	*w_out = 0;
+	*h_out = FONT_HEIGHT + GX_LINE_LEAD;
+	if (!node)
+		return;
+	if (avail < 24)
+		avail = 24;
+	if (v3_meas_depth >= V3_MEAS_MAX || gx.op_count >= GX_OPS_MAX - 64)
+	{
+		*w_out = avail / 2;
+		return;
+	}
+	v3_meas_depth++;
+	L2StateSave(&sv);
+
+	gx.x = GX_MARGIN + gx.indent;
+	gx.line_start_op = gx.op_count;
+	gx.line_align = 0;
+	x0 = gx.x;
+	y0 = gx.y;
+	gx.wrap_w = x0 + avail;
+
+	// measure LEFT-aligned: text-align:center/right (including the measured
+	// node's OWN align, e.g. 100r's .nav_link) would push ops to the middle so
+	// maxx came back ~2x the intrinsic width -> centered flex items stacked 1
+	// per row. zinc_no_align disables the shift for the whole measure subtree.
+	MemCopy(&mi, inh, sizeof(CZStyle));
+	mi.align = 0;
+	zinc_no_align = TRUE;
+	V3Node(node, &mi);
+	GxRunFlush;
+	zinc_no_align = FALSE;
+
+	maxx = x0;
+	for (i = sv.op_count; i < gx.op_count; i++)
+		if (gx.ops[i].x + gx.ops[i].w > maxx)
+			maxx = gx.ops[i].x + gx.ops[i].w;
+	*w_out = maxx - x0;
+	*h_out = gx.y - y0;
+	if (gx.x > x0)
+		*h_out += gx.line_h;
+	if (*h_out < FONT_HEIGHT)
+		*h_out = FONT_HEIGHT;
+
+	L2StateRestore(&sv);
+	v3_meas_depth--;
+}
+
+/* ---- leaves: svg / img / sprite ---- */
+
+U0 V3Svg(CZNode *node, CZStyle *style)
+{ // inline vector image via GrSVG, cached per node+size
+	U8		 skey[48];
+	U8		*sat, *attr;
+	CGxImg	*ge;
+	CGxOp	*op;
+	F64		 vx = 0.0, vy = 0.0, vw = 0.0, vh = 0.0, ssc;
+	I64		 sw = 0, sh = 0, savail, shint;
+
+	if (!node->text)
+		return;
+	GxRunFlush;
+	if (gx.x <= GX_MARGIN + gx.indent && style->align > 0)
+		gx.line_align = style->align;
+	sat = ZNodeAttr(node, "width");
+	if (sat) sw = SvgNum(&sat);
+	sat = ZNodeAttr(node, "height");
+	if (sat) sh = SvgNum(&sat);
+	sat = ZNodeAttr(node, "viewBox");
+	if (sat)
+	{ vx = SvgNum(&sat); vy = SvgNum(&sat); vw = SvgNum(&sat); vh = SvgNum(&sat); }
+	if (sw <= 0 || sh <= 0)
+	{
+		if (vw > 0.0 && vh > 0.0) { sw = ToI64(vw); sh = ToI64(vh); }
+		else { sw = 24; sh = 24; }
+	}
+	if (vw <= 0.0 || vh <= 0.0)
+	{ vx = 0.0; vy = 0.0; vw = ToF64(sw); vh = ToF64(sh); }
+	savail = gx.wrap_w - gx.x - GX_MARGIN;
+	if (savail < 24)
+		savail = gx.wrap_w - GX_MARGIN * 2;
+	if (sw > savail && savail > 0)
+	{
+		ssc = ToF64(savail) / ToF64(sw);
+		sw = savail;
+		sh = ToI64(ToF64(sh) * ssc);
+	}
+	if (sh > 320)
+	{ ssc = 320.0 / ToF64(sh); sw = ToI64(ToF64(sw) * ssc); sh = 320; }
+	if (sw < 1) sw = 1;
+	if (sh < 1) sh = 1;
+
+	StrPrint(skey, "svg:%X:%d", node->text, sw);
+	ge = GxImgFind(skey);
+	if (!ge)
+	{
+		ge = GxImgGet(skey);
+		if (ge)
+		{
+			shint = gx.page_fg;
+			if (shint < 0)
+				shint = 0xE8ECF4;
+			ge->fetched = TRUE;
+			ge->dc = SVGRenderToDC(node->text, vx, vy, vw, vh, sw, sh,
+								   shint, sys_task);
+		}
+	}
+	if (ge && ge->dc)
+	{
+		if (gx.x + sw > gx.wrap_w && gx.x > GX_MARGIN)
+			GxNewline(0);
+		op = GxOpAdd(GXO_IMG, gx.x, gx.y, sw, sh);
+		if (op)
+		{
+			op->sc = ge->dc;
+			if (gx.link_depth > 0)
+				op->href = gx.cur_href;
+		}
+		gx.x += sw + FONT_WIDTH;
+		if (sh + GX_LINE_LEAD > gx.line_h)
+			gx.line_h = sh + GX_LINE_LEAD;
+		return;
+	}
+	attr = ZNodeAttr(node, "aria-label");
+	if (!attr)
+		attr = ZNodeAttr(node, "title");
+	if (attr && *attr)
+		GxText(attr, style, 1, FALSE);
+}
+
+U0 V3DCInvert(CDC *dc)
+{ // filter: invert(1) - invert RGB of a truecolor DC in place, leaving
+  // transparent pixels alone (100r's dark-mode text logos + .invert icons are
+  // black-on-transparent PNGs that must flip to white on the black page).
+	I64	 x, y;
+	U32	*row, p;
+
+	if (!dc)
+		return;
+	for (y = 0; y < dc->height; y++)
+	{
+		row = dc->body + y * dc->width_internal;
+		for (x = 0; x < dc->width; x++)
+		{
+			p = row[x];
+			if (p != PIXF_TRANSPARENT)
+				row[x] = (p & 0xFF000000) | (~p & 0x00FFFFFF);
+		}
+	}
+	dc->flags &= ~DCF_NO_TRANSPARENTS; // keep skipping transparent pixels
+}
+
+U0 V3Img(CZNode *node, CZStyle *style)
+{ // raster image: cache hit blits real size; miss reserves an attr-sized
+  // placeholder and queues the URL for GxImgTask
+	U8		*src = ZNodeAttr(node, "src"), *abs, *attr, *ai;
+	CGxImg	*ce, *se;
+	CGxOp	*op;
+	CDC		*blit;
+	I64		 iw, ih, aw;
+	U8		 dkey[48];
+
+	if (!src || !*src)
+		src = ZNodeAttr(node, "data-src");
+	GxRunFlush;
+	if (gx.x <= GX_MARGIN + gx.indent && style->align > 0)
+		gx.line_align = style->align;
+	if (src && !StrNICompare(src, "data:", 5))
+	{
+		StrPrint(dkey, "data:%X", src);
+		ce = GxImgFind(dkey);
+		if (!ce)
+		{
+			ce = GxImgGet(dkey);
+			if (ce)
+			{
+				ce->fetched = TRUE;
+				ce->dc = DataURIToDC(src, sys_task);
+			}
+		}
+		if (ce && ce->dc)
+		{
+			iw = ce->dc->width;
+			ih = ce->dc->height;
+			if (iw > gx.wrap_w - gx.x - GX_MARGIN)
+			{
+				ih = ih * (gx.wrap_w - gx.x - GX_MARGIN) / iw;
+				iw = gx.wrap_w - gx.x - GX_MARGIN;
+			}
+			if (iw < 1) iw = 1;
+			if (ih < 1) ih = 1;
+			if (gx.x + iw > gx.wrap_w && gx.x > GX_MARGIN)
+				GxNewline(0);
+			op = GxOpAdd(GXO_IMG, gx.x, gx.y, iw, ih);
+			if (op)
+			{
+				op->sc = ce->dc;
+				if (gx.link_depth > 0)
+					op->href = gx.cur_href;
+			}
+			gx.x += iw + FONT_WIDTH;
+			if (ih + GX_LINE_LEAD > gx.line_h)
+				gx.line_h = ih + GX_LINE_LEAD;
+			return;
+		}
+		attr = ZNodeAttr(node, "alt");
+		if (attr && *attr)
+			GxText(attr, style, 1, FALSE);
+		return;
+	}
+	if (src && *src)
+	{
+		abs = ZincResolveLink(src);
+		ce = GxImgGet(abs);
+		if (ce && ce->dc)
+		{
+			iw = ce->dc->width;
+			ih = ce->dc->height;
+			// CSS width/height override the natural size AND the width= attr
+			// (CSS beats presentational attributes - 100r's nav sets width=200
+			// on the tag but nav a img{width:144px} in CSS, so 144 must win or
+			// the sprites render oversize, 2 per row not 6). Aspect preserved.
+			if (style->width > 0)
+				aw = style->width;
+			else if (style->width < 0)
+				aw = (gx.wrap_w - gx.x) * -style->width / 100;
+			else
+			{
+				ai = ZNodeAttr(node, "width");
+				if (ai)
+					aw = ClampI64(Str2I64(ai), 1, 2000);
+				else
+					aw = 0;
+			}
+			if (aw > 0 && iw > 0)
+			{
+				ih = ih * aw / iw;
+				iw = aw;
+			}
+			if (iw > gx.wrap_w - gx.x)
+			{
+				ih = ih * (gx.wrap_w - gx.x) / iw;
+				iw = gx.wrap_w - gx.x;
+			}
+			if (gx.x + iw > gx.wrap_w && gx.x > GX_MARGIN)
+				GxNewline(0);
+			// GrBlot draws a DC at its NATURAL size, so a CSS-resized (and/or
+			// filter:invert'd) image needs its own derived DC. Cache one per
+			// (base, size, invert) so it's built once and freed with the page.
+			blit = ce->dc;
+			if (iw < 1)
+				iw = ce->dc->width;
+			if (ih < 1)
+				ih = ce->dc->height;
+			if (style->invert == 1 ||
+				iw != ce->dc->width || ih != ce->dc->height)
+			{
+				if (style->invert == 1)
+					StrPrint(dkey, "iv:%X:%dx%d", ce->dc, iw, ih);
+				else
+					StrPrint(dkey, "sc:%X:%dx%d", ce->dc, iw, ih);
+				se = GxImgFind(dkey);
+				if (!se)
+				{
+					se = GxImgGet(dkey);
+					if (se)
+					{
+						se->fetched = TRUE;
+						se->dc = DEDCScaleNew(ce->dc, iw, ih, sys_task);
+						if (se->dc && style->invert == 1)
+							V3DCInvert(se->dc);
+					}
+				}
+				if (se && se->dc)
+					blit = se->dc;
+			}
+			op = GxOpAdd(GXO_IMG, gx.x, gx.y, iw, ih);
+			if (op)
+			{
+				op->sc = blit;
+				if (gx.link_depth > 0) // <a><img></a>: image navigates the link
+					op->href = gx.cur_href;
+			}
+			gx.x += iw + FONT_WIDTH;
+			if (ih + GX_LINE_LEAD > gx.line_h)
+				gx.line_h = ih + GX_LINE_LEAD;
+			Free(abs);
+			return;
+		}
+		iw = 0;
+		ih = 0;
+		if (style->width > 0) // CSS width beats the width= attr (as above)
+			iw = style->width;
+		else
+		{
+			attr = ZNodeAttr(node, "width");
+			if (attr)
+				iw = ClampI64(Str2I64(attr), 0, 2000);
+		}
+		attr = ZNodeAttr(node, "height");
+		if (attr && !ih)
+			ih = ClampI64(Str2I64(attr), 0, 2000);
+		if (iw && !ih)
+			ih = iw * 3 / 4;
+		if (!iw)
+		{
+			iw = 80;
+			ih = 40;
+		}
+		if (iw > gx.wrap_w - gx.x)
+		{
+			ih = MaxI64(1, ih * MaxI64(1, gx.wrap_w - gx.x) / iw);
+			iw = MaxI64(1, gx.wrap_w - gx.x);
+		}
+		op = GxOpAdd(GXO_IMG, gx.x, gx.y, iw, ih);
+		if (op)
+		{
+			op->img_url = abs; //queued for GxImgTask; owned by the op
+			op->fg = ColorRGB(0xE8, 0xE8, 0xEA);
+			if (gx.link_depth > 0) // link placeholder stays clickable
+				op->href = gx.cur_href;
+		}
+		else
+			Free(abs);
+		gx.x += iw + FONT_WIDTH;
+		if (ih + GX_LINE_LEAD > gx.line_h)
+			gx.line_h = ih + GX_LINE_LEAD;
+		return;
+	}
+	attr = ZNodeAttr(node, "alt");
+	op = GxOpAdd(GXO_RECT, gx.x, gx.y, 60, 16);
+	if (op)
+		op->fg = ColorRGB(0xE8, 0xE8, 0xEA);
+	if (attr && *attr)
+		GxText(attr, style, 1, FALSE);
+	else
+		GxText("[img]", style, 1, FALSE);
+}
+
+U0 V3Sprite(CZNode *node, CZStyle *author)
+{ // fixed-size background sprite / icon cell (flags etc): the element IS the
+  // sprite; emit exactly its CSS cell inline and advance the cursor
+	CGxOp *op;
+
+	GxRunFlush;
+	if (gx.x + author->width > gx.wrap_w && gx.x > GX_MARGIN + gx.indent)
+		GxNewline(0);
+	op = GxOpAdd(GXO_BOX, gx.x, gx.y, author->width, author->height);
+	if (op)
+	{
+		op->has_bg = author->bg >= 0;
+		op->fg = GxPenBg(author->bg, de_theme.win_bg);
+		if (author->radius > 0)
+			op->wkind = author->radius;
+		if (author->bg_img >= 0 && author->bg_img < zcss_bgimg_count)
+		{
+			op->img_url = ZincResolveLink(zcss_bgimg[author->bg_img]);
+			op->bg_px  = author->bg_px;
+			op->bg_py  = author->bg_py;
+			op->bg_sw  = author->bg_sw;
+			op->bg_sh  = author->bg_sh;
+			op->bg_rep = author->bg_repeat;
+		}
+	}
+	gx.x += author->width + 4;
+	if (author->height + GX_LINE_LEAD > gx.line_h)
+		gx.line_h = author->height + GX_LINE_LEAD;
+}
+
+U0 V3Pill(CZNode *node, CZStyle *style, CZStyle *author)
+{ // an INLINE element with a background/border: buttons, tags, <kbd>, <code>,
+  // badges. Rendered inline-block: measure the content, draw a rounded box
+  // behind it, then flow the text on top (AA'd against the pill bg). This is
+  // the primitive behind nearly every "styled span/link" on the modern web.
+	CZStyle	 kid;
+	CZNode	*child;
+	CGxOp	*op;
+	U8		*href;
+	I64		 mw, mh, padx, pady, bw, bh, sx, sy;
+	I64		 save_bg, save_ind, save_wrap, box_op;
+	Bool	 is_link;
+
+	GxRunFlush;
+	MemCopy(&kid, style, sizeof(CZStyle));
+	ZStyleStripBox(&kid);
+	padx = MaxI64(author->pl, author->pr);
+	if (padx < 4)
+		padx = 6;
+	pady = MaxI64(author->pt, author->pb);
+	if (pady < 1)
+		pady = 2;
+
+	V3Measure(node, &kid, gx.wrap_w - (GX_MARGIN + gx.indent), &mw, &mh);
+	bw = mw + 2 * padx;
+	bh = MaxI64(mh, FONT_HEIGHT) + 2 * pady;
+	if (author->width > 0)
+		bw = author->width + 2 * padx;
+	if (gx.x + bw > gx.wrap_w && gx.x > GX_MARGIN + gx.indent)
+		GxNewline(0);
+	sx = gx.x;
+	sy = gx.y;
+
+	op = GxOpAdd(GXO_BOX, sx, sy, bw, bh);
+	box_op = -1;
+	if (op)
+	{
+		box_op = gx.op_count - 1;
+		op->has_bg = author->bg >= 0;
+		op->fg = GxPenBg(author->bg, de_theme.win_bg);
+		op->ul = author->border >= 0;
+		op->bg = GxPenBg(author->border, de_theme.panel_edge);
+		if (author->radius > 0)
+			op->wkind = author->radius;
+	}
+	gx.line_start_op = gx.op_count;
+
+	save_bg = gx.cur_bg;
+	save_ind = gx.indent;
+	save_wrap = gx.wrap_w;
+	if (author->bg >= 0)
+	{
+		gx.cur_bg = author->bg; // pill text AA's against the pill fill
+		kid.bg = -1;
+	}
+	gx.indent = sx + padx - GX_MARGIN;
+	gx.x = GX_MARGIN + gx.indent;
+	gx.y = sy + pady;
+	gx.wrap_w = sx + bw;
+
+	is_link = FALSE;
+	href = ZNodeAttr(node, "href");
+	if (!StrCompare(node->tag, "a") && href && *href)
+	{
+		is_link = TRUE;
+		gx.link_depth++;
+		gx.cur_href = href;
+	}
+	child = node->first_child;
+	while (child)
+	{
+		V3Node(child, &kid);
+		child = child->next;
+	}
+	GxRunFlush;
+	if (is_link)
+		gx.link_depth--;
+
+	gx.cur_bg = save_bg;
+	gx.indent = save_ind;
+	gx.wrap_w = save_wrap;
+	gx.x = sx + bw + FONT_WIDTH;
+	gx.y = sy;
+	if (bh + GX_LINE_LEAD > gx.line_h)
+		gx.line_h = bh + GX_LINE_LEAD;
+}
+
+/* ---- flex + grid ---- */
+
+U0 V3FlexRow(CZNode *node, CZStyle *style, CZStyle *author)
+{ // flex row / grid container: basis from explicit width or measured content;
+  // grid tracks (px/fr) + named areas when the CSS declared them
+	CZNode	*items[L2_FLEX_MAX];
+	I64		 basis[L2_FLEX_MAX], grow[L2_FLEX_MAX], want[L2_FLEX_MAX];
+	CZStyle	 kid, ca;
+	CZNode	*child, *rest;
+	I64		 n, i, k, m, row_start, base, avail, gapv, total, extra, gsum;
+	I64		 mw, mh, bw, x, xoff, y0, ymax, save_indent, save_wrap, room, jgap;
+	I64		 g, kt, c, fixsum, frsum, freew, trackw[ZCSS_GRID_TRK];
+	I64		 cs, sp, lastcol, itw, itx, colx[ZCSS_GRID_TRK + 1];
+
+	MemCopy(&kid, style, sizeof(CZStyle));
+	ZStyleStripBox(&kid);
+
+	n = 0;
+	child = node->first_child;
+	while (child && n < L2_FLEX_MAX)
+	{
+		if (child->type == ZH_ELEM && !ZnTagSkipped(child->tag))
+		{
+			ZCssApply(child, &ca);
+			if (ca.display != ZCSS_DISP_NONE)
+			{
+				items[n] = child;
+				grow[n] = 0;
+				if (ca.grow > 0)
+					grow[n] = ca.grow;
+				n++;
+			}
+		}
+		child = child->next;
+	}
+	rest = child;
+	if (!n)
+		return;
+
+	base  = GX_MARGIN + gx.indent;
+	avail = gx.wrap_w - base;
+	if (avail < 60)
+		avail = 60;
+	gapv = author->gap;
+	if (gapv < 0)
+		gapv = 8;
+
+	g = author->grid_idx;
+	if (g >= 0 && g < zcss_grid_count && zcss_gtrk_n[g] > 0)
+	{ // real grid tracks: fixed px keep size, fr share the leftover
+		kt = zcss_gtrk_n[g];
+		fixsum = 0;
+		frsum = 0;
+		for (c = 0; c < kt; c++)
+		{
+			fixsum += zcss_gtrk_px[g][c];
+			frsum += zcss_gtrk_fr[g][c];
+		}
+		freew = avail - gapv * (kt - 1) - fixsum;
+		if (freew < 0)
+			freew = 0;
+		for (c = 0; c < kt; c++)
+		{
+			if (zcss_gtrk_fr[g][c] > 0 && frsum > 0)
+				trackw[c] = MaxI64(24, freew * zcss_gtrk_fr[g][c] / frsum);
+			else
+				trackw[c] = MaxI64(24, MinI64(zcss_gtrk_px[g][c], avail));
+		}
+		if (zcss_gacount[g] > 0)
+		{ // grid-template-areas: place children at their named columns
+			colx[0] = base;
+			for (c = 0; c < kt; c++)
+				colx[c + 1] = colx[c] + trackw[c] + gapv;
+			save_indent = gx.indent;
+			save_wrap = gx.wrap_w;
+			y0 = gx.y;
+			ymax = y0;
+			lastcol = -1;
+			for (i = 0; i < n; i++)
+			{
+				ZCssApply(items[i], &ca);
+				cs = 0;
+				sp = 1;
+				if (ca.grid_area_idx >= 0)
+					for (m = 0; m < zcss_gacount[g]; m++)
+						if (!StrCompare(zcss_carea[ca.grid_area_idx],
+										zcss_ganame[g][m]))
+						{
+							cs = zcss_gacol[g][m];
+							sp = zcss_gaspan[g][m];
+							break;
+						}
+				if (cs >= kt)
+					cs = kt - 1;
+				if (cs + sp > kt)
+					sp = kt - cs;
+				if (sp < 1)
+					sp = 1;
+				if (i > 0 && (cs <= lastcol || sp >= kt))
+					y0 = ymax;
+				itx = colx[cs];
+				itw = colx[cs + sp] - colx[cs] - gapv;
+				if (itw < 24)
+					itw = 24;
+				gx.y = y0;
+				gx.indent = itx - GX_MARGIN;
+				gx.wrap_w = itx + itw;
+				gx.x = GX_MARGIN + gx.indent;
+				gx.line_start_op = gx.op_count;
+				V3Node(items[i], &kid);
+				GxRunFlush;
+				GxLineAlign;
+				if (gx.x > GX_MARGIN + gx.indent)
+					gx.y += gx.line_h;
+				ymax = MaxI64(ymax, gx.y);
+				lastcol = cs;
+			}
+			gx.indent = save_indent;
+			gx.wrap_w = save_wrap;
+			gx.y = ymax;
+			gx.x = GX_MARGIN + gx.indent;
+			gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+			while (rest)
+			{
+				V3Node(rest, &kid);
+				rest = rest->next;
+			}
+			return;
+		}
+		for (i = 0; i < n; i++)
+		{ // each item is one track wide, unless grid-column: span N widens it
+		  // (responsive grids collapse by giving items a >1 span at narrow widths)
+			ZCssApply(items[i], &ca);
+			sp = ca.grid_span;
+			if (sp < 1)
+				sp = 1;
+			if (sp > kt)
+				sp = kt;
+			basis[i] = trackw[i % kt] * sp + gapv * (sp - 1);
+		}
+	}
+	else if (author->grid_cols > 1)
+	{ // count-only grid: equal columns
+		k = author->grid_cols;
+		if (k > n)
+			k = n;
+		mw = (avail - gapv * (k - 1)) / k;
+		if (mw < 24)
+			mw = 24;
+		for (i = 0; i < n; i++)
+			basis[i] = mw;
+	}
+	else
+		for (i = 0; i < n; i++)
+		{ // flex basis: explicit width beats measured content width
+			ZCssApply(items[i], &ca);
+			bw = 0;
+			if (ca.width > 0)
+				bw = MinI64(ca.width, avail);
+			else if (ca.width < 0)
+				bw = avail * -ca.width / 100;
+			else
+			{
+				V3Measure(items[i], &kid, avail, &mw, &mh);
+				bw = MinI64(mw + 8, avail);
+			}
+			if (bw < 24)
+				bw = 24;
+			basis[i] = bw;
+		}
+
+	i = 0;
+	while (i < n)
+	{ // greedy row packing
+		row_start = i;
+		total = 0;
+		k = 0;
+		while (i < n)
+		{
+			bw = basis[i];
+			if (k)
+				bw += gapv;
+			if (k && total + bw > avail)
+				break;
+			total += bw;
+			k++;
+			i++;
+		}
+
+		extra = avail - total;
+		gsum = 0;
+		for (m = row_start; m < i; m++)
+			gsum += grow[m];
+		for (m = row_start; m < i; m++)
+			want[m] = basis[m];
+		if (extra > 0 && gsum > 0)
+		{
+			for (m = row_start; m < i; m++)
+				want[m] += extra * grow[m] / gsum;
+			extra = 0;
+		}
+		else if (extra < 0)
+		{
+			room = avail - gapv * (k - 1);
+			total -= gapv * (k - 1);
+			if (total > 0)
+				for (m = row_start; m < i; m++)
+					want[m] = MaxI64(24, basis[m] * room / total);
+			extra = 0;
+		}
+
+		xoff = 0;
+		jgap = 0;
+		if (extra > 0)
+		{
+			if (author->justify == 3 && k > 1)
+				jgap = extra / (k - 1);
+			else if (author->justify == 4 && k > 0)
+			{
+				jgap = extra / k;
+				xoff = jgap / 2;
+			}
+			else if (author->justify == 5)
+			{
+				jgap = extra / (k + 1);
+				xoff = jgap;
+			}
+			else if (author->justify == 1 || (author->justify < 0 && author->align == 1))
+				xoff = extra / 2;
+			else if (author->justify == 2 || (author->justify < 0 && author->align == 2))
+				xoff = extra;
+		}
+
+		save_indent = gx.indent;
+		save_wrap	= gx.wrap_w;
+		x	 = base + xoff;
+		y0	 = gx.y;
+		ymax = y0;
+		for (m = row_start; m < i; m++)
+		{
+			gx.y	  = y0;
+			gx.indent = x - GX_MARGIN;
+			gx.wrap_w = x + want[m];
+			gx.x	  = GX_MARGIN + gx.indent;
+			gx.line_start_op = gx.op_count;
+			V3Node(items[m], &kid);
+			GxRunFlush;
+			GxLineAlign;
+			if (gx.x > GX_MARGIN + gx.indent)
+				gx.y += gx.line_h;
+			ymax = MaxI64(ymax, gx.y);
+			x += want[m] + gapv + jgap;
+		}
+		gx.indent = save_indent;
+		gx.wrap_w = save_wrap;
+		gx.y	  = ymax;
+		gx.x	  = GX_MARGIN + gx.indent;
+		gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+	}
+
+	while (rest)
+	{
+		V3Node(rest, &kid);
+		rest = rest->next;
+	}
+}
+
+Bool V3IsFormTag(U8 *tag)
+{
+	return !StrCompare(tag, "input") || !StrCompare(tag, "select") ||
+		   !StrCompare(tag, "textarea") || !StrCompare(tag, "button");
+}
+
+U0 V3FlexCol(CZNode *node, CZStyle *style, CZStyle *author)
+{ // flex column: stack children; cross axis honors align-items; main axis
+  // honors justify-content against the container height (hero centering)
+	CZNode	*items[L2_FLEX_MAX];
+	I64		 ch[L2_FLEX_MAX], cwv[L2_FLEX_MAX];
+	CZStyle	 kid, ca;
+	CZNode	*child, *rest;
+	I64		 n, i, base, avail, gapv, cw, mw, mh, xc, save_indent, save_wrap;
+	I64		 total, cont_h, y_extra;
+
+	MemCopy(&kid, style, sizeof(CZStyle));
+	ZStyleStripBox(&kid);
+
+	n = 0;
+	child = node->first_child;
+	while (child && n < L2_FLEX_MAX)
+	{
+		if (child->type == ZH_ELEM && !ZnTagSkipped(child->tag))
+		{
+			ZCssApply(child, &ca);
+			if (ca.display != ZCSS_DISP_NONE)
+			{
+				items[n] = child;
+				n++;
+			}
+		}
+		child = child->next;
+	}
+	rest = child;
+	if (!n)
+		return;
+
+	base  = GX_MARGIN + gx.indent;
+	avail = gx.wrap_w - base;
+	if (avail < 60)
+		avail = 60;
+	gapv = author->gap;
+	if (gapv < 0)
+		gapv = 0;
+
+	// measure ONLY what placement needs: dry runs are the expensive part (each
+	// nests a full subtree walk) and measuring everything blew the stack on
+	// deeply nested pages. Default (stretch + flex-start) measures NOTHING.
+	cont_h = L2HeightPxCB(author->height);
+	total = 0;
+	for (i = 0; i < n; i++)
+	{
+		ZCssApply(items[i], &ca);
+		if (ca.width > 0)
+			cw = MinI64(ca.width, avail);
+		else if (ca.width < 0)
+			cw = avail * -ca.width / 100;
+		else if (author->align == 1 || author->align == 2)
+		{ // center/end: shrink-to-fit needs a width measure
+			V3Measure(items[i], &kid, avail, &mw, &mh);
+			cw = MinI64(MaxI64(mw, 24), avail);
+		}
+		else
+			cw = avail; // stretch (default)
+		cwv[i] = cw;
+		ch[i] = 0;
+		if (cont_h > 0 && (author->justify == 1 || author->justify == 2))
+		{ // vertical justify needs the item heights
+			V3Measure(items[i], &kid, cw, &mw, &mh);
+			ch[i] = mh;
+			total += mh;
+			if (i)
+				total += gapv;
+		}
+	}
+
+	y_extra = 0;
+	if (cont_h > total && total > 0)
+	{ // main-axis justify against the declared container height
+		if (author->justify == 1)
+			y_extra = (cont_h - total) / 2;
+		else if (author->justify == 2)
+			y_extra = cont_h - total;
+	}
+	gx.y += y_extra;
+
+	save_indent = gx.indent;
+	save_wrap	= gx.wrap_w;
+	for (i = 0; i < n; i++)
+	{
+		cw = cwv[i];
+		if (author->align == 1)
+			xc = base + (avail - cw) / 2;
+		else if (author->align == 2)
+			xc = base + avail - cw;
+		else
+			xc = base;
+		gx.indent = xc - GX_MARGIN;
+		gx.wrap_w = xc + cw;
+		gx.x	  = GX_MARGIN + gx.indent;
+		gx.line_start_op = gx.op_count;
+		if (V3IsFormTag(items[i]->tag) && author->align != 1 && author->align != 2)
+			gx.flex_stretch_w = cw; // stretched form control fills the column
+		V3Node(items[i], &kid);
+		gx.flex_stretch_w = 0;
+		GxRunFlush;
+		GxLineAlign;
+		if (gx.x > GX_MARGIN + gx.indent)
+			gx.y += gx.line_h;
+		if (i < n - 1)
+			gx.y += gapv;
+	}
+	gx.indent = save_indent;
+	gx.wrap_w = save_wrap;
+	gx.x	  = GX_MARGIN + gx.indent;
+	gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+
+	while (rest)
+	{
+		V3Node(rest, &kid);
+		rest = rest->next;
+	}
+}
+
+/* ---- tables ---- */
+
+U0 V3TableRow(CZNode *row, CZStyle *kid, I64 *colx, I64 u)
+{ // one <tr>: cells at the precomputed column offsets, row height = tallest cell
+	CZNode	*cell;
+	CZStyle	 cellau, ckid;
+	CGxOp	*op;
+	U8		*attr;
+	I64		 k = 0, span, y0, ymax, save_indent, save_wrap, cell_box, save_cbg;
+
+	// cells start LEFT-aligned: a legacy <center> wrapping the table centers the
+	// TABLE box, it must NOT center every cell's text (HN's titles are left; the
+	// rank cell's own align="right" still wins via the cell's re-applied style).
+	MemCopy(&ckid, kid, sizeof(CZStyle));
+	ckid.align = 0;
+	save_indent = gx.indent;
+	save_wrap	= gx.wrap_w;
+	save_cbg	= gx.cur_bg;
+	y0	 = gx.y;
+	ymax = y0;
+	cell = row->first_child;
+	while (cell && k < u)
+	{
+		if (cell->type == ZH_ELEM &&
+			(!StrCompare(cell->tag, "td") || !StrCompare(cell->tag, "th")))
+		{
+			span = 1;
+			attr = ZNodeAttr(cell, "colspan");
+			if (attr)
+				span = ClampI64(Str2I64(attr), 1, 8);
+			gx.y	  = y0;
+			gx.indent = colx[k] - GX_MARGIN;
+			gx.wrap_w = colx[MinI64(k + span, u)] - 6;
+			gx.x	  = GX_MARGIN + gx.indent;
+			gx.line_start_op = gx.op_count;
+			ZCssApply(cell, &cellau);
+			cell_box = -1;
+			if (cellau.bg >= 0)
+			{
+				op = GxOpAdd(GXO_BOX, gx.x - 2, y0 - 1, gx.wrap_w - gx.x + 4, 8);
+				if (op)
+				{
+					cell_box = gx.op_count - 1;
+					op->has_bg = TRUE;
+					op->fg = GxPenBg(cellau.bg, de_theme.win_bg);
+				}
+				gx.line_start_op = gx.op_count;
+				gx.cur_bg = cellau.bg;
+			}
+			V3Node(cell, &ckid);
+			GxRunFlush;
+			GxLineAlign;
+			if (gx.x > GX_MARGIN + gx.indent)
+				gx.y += gx.line_h;
+			if (cellau.bg >= 0)
+				gx.cur_bg = save_cbg;
+			if (cell_box >= 0)
+				gx.ops[cell_box].h = MaxI64(8, gx.y + 2 - y0);
+			ymax = MaxI64(ymax, gx.y);
+			k += span;
+		}
+		cell = cell->next;
+	}
+	gx.indent = save_indent;
+	gx.wrap_w = save_wrap;
+	gx.y	  = ymax;
+	gx.x	  = GX_MARGIN + gx.indent;
+	gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+}
+
+U0 V3RowMeasure(CZNode *row, CZStyle *kid, I64 u, I64 avail, I64 *colnat)
+{ // grow each column's natural (single-line) width from this row's cells
+	CZNode	*cell = row->first_child;
+	U8		*attr;
+	I64		 k = 0, span, mw, mh;
+
+	while (cell && k < u)
+	{
+		if (cell->type == ZH_ELEM &&
+			(!StrCompare(cell->tag, "td") || !StrCompare(cell->tag, "th")))
+		{
+			span = 1;
+			attr = ZNodeAttr(cell, "colspan");
+			if (attr)
+				span = ClampI64(Str2I64(attr), 1, 8);
+			if (span == 1)
+			{ // spanning cells don't pin a single column's width
+				V3Measure(cell, kid, avail, &mw, &mh);
+				if (mw > colnat[k])
+					colnat[k] = MinI64(mw, avail);
+			}
+			k += span;
+		}
+		cell = cell->next;
+	}
+}
+
+U0 V3TableRows(CZNode *tbl, CZStyle *kid)
+{ // table content: size columns to their content (narrow cols stay narrow, the
+  // widest content column absorbs the slack - like a real browser), then lay
+  // every row (through thead/tbody wrappers)
+	CZNode	*child, *row, *cell;
+	U8		*attr;
+	I64		 u = 0, base, avail, span, c, natsum, widest, cwid, rows_seen;
+	I64		 colnat[9], colx[9];
+
+	// find the first row anywhere under table/thead/tbody and count cells
+	row = NULL;
+	child = tbl->first_child;
+	while (child && !row)
+	{
+		if (child->type == ZH_ELEM)
+		{
+			if (!StrCompare(child->tag, "tr"))
+				row = child;
+			else if (!StrCompare(child->tag, "thead") ||
+					 !StrCompare(child->tag, "tbody") ||
+					 !StrCompare(child->tag, "tfoot"))
+			{
+				row = child->first_child;
+				while (row && !(row->type == ZH_ELEM &&
+								!StrCompare(row->tag, "tr")))
+					row = row->next;
+			}
+		}
+		if (!row)
+			child = child->next;
+	}
+	if (row)
+	{
+		cell = row->first_child;
+		while (cell)
+		{
+			if (cell->type == ZH_ELEM &&
+				(!StrCompare(cell->tag, "td") || !StrCompare(cell->tag, "th")))
+			{
+				span = 1;
+				attr = ZNodeAttr(cell, "colspan");
+				if (attr)
+					span = ClampI64(Str2I64(attr), 1, 8);
+				u += span;
+			}
+			cell = cell->next;
+		}
+	}
+	if (u < 1)
+		u = 1;
+	if (u > 8)
+		u = 8;
+	base  = GX_MARGIN + gx.indent;
+	avail = gx.wrap_w - base;
+	if (avail < 60)
+		avail = 60;
+
+	// --- content-based column widths (scan up to 24 rows) ---
+	for (c = 0; c < u; c++)
+		colnat[c] = 0;
+	rows_seen = 0;
+	child = tbl->first_child;
+	while (child && rows_seen < 24)
+	{
+		if (child->type == ZH_ELEM)
+		{
+			if (!StrCompare(child->tag, "tr"))
+			{
+				V3RowMeasure(child, kid, u, avail, colnat);
+				rows_seen++;
+			}
+			else if (!StrCompare(child->tag, "thead") ||
+					 !StrCompare(child->tag, "tbody") ||
+					 !StrCompare(child->tag, "tfoot"))
+			{
+				row = child->first_child;
+				while (row && rows_seen < 24)
+				{
+					if (row->type == ZH_ELEM && !StrCompare(row->tag, "tr"))
+					{
+						V3RowMeasure(row, kid, u, avail, colnat);
+						rows_seen++;
+					}
+					row = row->next;
+				}
+			}
+		}
+		child = child->next;
+	}
+	natsum = 0;
+	widest = 0;
+	for (c = 0; c < u; c++)
+	{
+		colnat[c] += 10; // cell padding/gutter
+		natsum += colnat[c];
+		if (colnat[c] > colnat[widest])
+			widest = c;
+	}
+	if (natsum < 1)
+		natsum = 1;
+	colx[0] = base;
+	for (c = 0; c < u; c++)
+	{
+		if (natsum <= avail)
+		{ // room to spare: narrow cols keep content width, widest takes slack
+			cwid = colnat[c];
+			if (c == widest)
+				cwid += avail - natsum;
+		}
+		else // overflow: scale every column down proportionally
+			cwid = MaxI64(24, colnat[c] * avail / natsum);
+		colx[c + 1] = colx[c] + cwid;
+	}
+
+	GxRunFlush;
+	if (gx.x > base)
+		GxNewline(0);
+	child = tbl->first_child;
+	while (child)
+	{
+		if (child->type == ZH_ELEM)
+		{
+			if (!StrCompare(child->tag, "tr"))
+				V3TableRow(child, kid, colx, u);
+			else if (!StrCompare(child->tag, "thead") ||
+					 !StrCompare(child->tag, "tbody") ||
+					 !StrCompare(child->tag, "tfoot"))
+			{
+				row = child->first_child;
+				while (row)
+				{
+					if (row->type == ZH_ELEM && !StrCompare(row->tag, "tr"))
+						V3TableRow(row, kid, colx, u);
+					row = row->next;
+				}
+			}
+			else if (!StrCompare(child->tag, "caption"))
+				V3Node(child, kid);
+		}
+		child = child->next;
+	}
+}
+
+/* ---- floats ---- */
+
+U0 V3Float(CZNode *node, CZStyle *style, CZStyle *author)
+{ // float:left/right - out of flow at the line edge; flow wraps beside it
+	CZStyle	 kid;
+	CGxOp	*op;
+	I64		 fw, fx, avail, mw, mh, lx, rx, ftop, fbot, box_op;
+	I64		 save_x, save_y, save_ind, save_wrap;
+
+	GxRunFlush;
+	GxFloatRecompute(gx.y);
+	lx = GX_MARGIN + gx.indent;
+	if (gx_float_lx > lx)
+		lx = gx_float_lx;
+	rx = gx.wrap_w;
+	if (gx_float_rx < rx)
+		rx = gx_float_rx;
+	avail = rx - lx;
+	if (avail < 40)
+		avail = 40;
+
+	MemCopy(&kid, style, sizeof(CZStyle));
+	ZStyleStripBox(&kid);
+	fw = 0;
+	if (author->width > 0)
+		fw = MinI64(author->width, avail);
+	else if (author->width < 0)
+		fw = avail * -author->width / 100;
+	else
+	{
+		V3Measure(node, &kid, avail / 2, &mw, &mh);
+		fw = MinI64(mw + 10, avail / 2);
+	}
+	if (fw < 40)
+		fw = 40;
+	if (author->float_side == 2)
+		fx = rx - fw;
+	else
+		fx = lx;
+
+	save_x	  = gx.x;
+	save_y	  = gx.y;
+	save_ind  = gx.indent;
+	save_wrap = gx.wrap_w;
+	ftop = gx.y;
+	box_op = -1;
+	if (author->bg >= 0 || author->border >= 0)
+	{
+		op = GxOpAdd(GXO_BOX, fx - 2, ftop - 2, fw + 4, 8);
+		if (op)
+		{
+			box_op = gx.op_count - 1;
+			op->has_bg = author->bg >= 0;
+			op->fg = GxPenBg(author->bg, de_theme.win_bg);
+			op->ul = author->border >= 0;
+			op->bg = GxPenBg(author->border, de_theme.panel_edge);
+			if (author->radius > 0)
+				op->wkind = author->radius;
+		}
+		if (author->bg >= 0)
+			kid.bg = -1;
+	}
+	gx.indent = fx - GX_MARGIN;
+	gx.wrap_w = fx + fw;
+	gx.x = GX_MARGIN + gx.indent;
+	gx.line_start_op = gx.op_count;
+
+	V3Node(node, &kid);
+	GxRunFlush;
+	if (gx.x > GX_MARGIN + gx.indent)
+		GxNewline(0);
+	fbot = gx.y;
+	if (author->height > 0 && fbot < ftop + author->height)
+		fbot = ftop + author->height;
+	if (fbot <= ftop)
+		fbot = ftop + FONT_HEIGHT;
+	if (box_op >= 0)
+		gx.ops[box_op].h = MaxI64(8, fbot - gx.ops[box_op].y);
+
+	GxFloatAdd(author->float_side - 1, fx - 2, fx + fw, ftop, fbot);
+
+	gx.indent = save_ind;
+	gx.wrap_w = save_wrap;
+	gx.x = save_x;
+	gx.y = save_y;
+	gx.line_start_op = gx.op_count;
+}
+
+U0 V3Columns(CZNode *node, CZStyle *kid, I64 ncols)
+{ // CSS multi-column: balance the children across ncols equal columns, filling
+  // top-to-bottom then moving right (newspaper flow) at ~total_height/ncols.
+	CZNode	*child;
+	I64		 base, avail, gapv, colw, colx, coltop, coly, colbot, ci;
+	I64		 mw, mh, totalh, target, save_indent, save_wrap;
+
+	base = GX_MARGIN + gx.indent;
+	avail = gx.wrap_w - base;
+	gapv = 24;
+	if (ncols < 2 || avail < 160)
+	{ // too narrow to split: normal single-column flow
+		child = node->first_child;
+		while (child)
+		{
+			V3Node(child, kid);
+			child = child->next;
+		}
+		return;
+	}
+	colw = (avail - gapv * (ncols - 1)) / ncols;
+	if (colw < 60)
+		colw = 60;
+
+	totalh = 0;
+	child = node->first_child;
+	while (child)
+	{
+		if (child->type == ZH_ELEM || (child->type == ZH_TEXT && child->text))
+		{
+			V3Measure(child, kid, colw, &mw, &mh);
+			totalh += mh;
+		}
+		child = child->next;
+	}
+	target = totalh / ncols + 1;
+
+	save_indent = gx.indent;
+	save_wrap = gx.wrap_w;
+	coltop = gx.y;
+	coly = coltop;
+	colbot = coltop;
+	ci = 0;
+	colx = base;
+	child = node->first_child;
+	while (child)
+	{
+		if (child->type == ZH_ELEM || (child->type == ZH_TEXT && child->text))
+		{
+			gx.indent = colx - GX_MARGIN;
+			gx.wrap_w = colx + colw;
+			gx.x = GX_MARGIN + gx.indent;
+			gx.y = coly;
+			gx.line_start_op = gx.op_count;
+			V3Node(child, kid);
+			GxRunFlush;
+			if (gx.x > GX_MARGIN + gx.indent)
+				gx.y += gx.line_h;
+			coly = gx.y;
+			if (coly > colbot)
+				colbot = coly;
+			if (coly - coltop >= target && ci < ncols - 1)
+			{ // column full: advance to the next one
+				ci++;
+				colx = base + ci * (colw + gapv);
+				coly = coltop;
+			}
+		}
+		child = child->next;
+	}
+	gx.indent = save_indent;
+	gx.wrap_w = save_wrap;
+	gx.y = colbot;
+	gx.x = GX_MARGIN + gx.indent;
+	gx.line_h = FONT_HEIGHT + GX_LINE_LEAD;
+}
+
+/* ---- the unified box ---- */
+
+U0 V3Block(CZNode *node, CZStyle *style, CZStyle *author)
+{ // full box model: margins/padding/border/background, width + margin:auto,
+  // position rel/abs/fixed, containing blocks, flex/grid/table/list content,
+  // height floors, overflow clip, transform, z-index - ONE engine, no seam.
+	CZStyle	 kid;
+	CZNode	*child;
+	CGxOp	*op;
+	U8		 mark[8];
+	I64		 mt_eff, mb_eff, ml_eff, mr_eff, pt_eff, pb_eff, pl_eff, pr_eff;
+	I64		 box_op, op0, avail, bw, center_add, save_wrap, save_wrap2;
+	I64		 box_y0, dx, dy, mw, mh, x0, saved_y, saved_indent, saved_wrapa;
+	I64		 save_cbx, save_cby, save_cbw, save_cbh, save_curbg;
+	I64		 eff_h, eff_h_cb, save_anch, flt_inset;
+	Bool	 boxed, is_body, is_abs, is_flex, is_flex_col, is_posn, spr_fixed;
+	Bool	 is_list, is_li, is_table;
+
+	is_body		= L2IsBody(node->tag);
+	is_flex		= author->display == ZCSS_DISP_FLEX && author->flex_col != 1;
+	is_flex_col	= author->display == ZCSS_DISP_FLEX && author->flex_col == 1;
+	is_abs		= author->pos == 2 || author->pos == 3;
+	is_posn		= author->pos >= 1;
+	is_list		= !StrCompare(node->tag, "ul") || !StrCompare(node->tag, "ol");
+	is_li		= !StrCompare(node->tag, "li");
+	is_table	= !StrCompare(node->tag, "table");
+	eff_h	 = L2HeightPx(author->height);
+	eff_h_cb = L2HeightPxCB(author->height);
+	save_anch = gx.anc_h;
+	if (eff_h_cb > 0)
+		gx.anc_h = eff_h_cb;
+	save_curbg = gx.cur_bg;
+	save_cbx = gx.cb_x;
+	save_cby = gx.cb_y;
+	save_cbw = gx.cb_w;
+	save_cbh = gx.cb_h;
+
+	GxRunFlush;
+	if (gx.x > GX_MARGIN + gx.indent)
+		GxNewline(0);
+	if ((author->clear_side & 1) && gx.y < GxFloatBottom(0))
+		gx.y = GxFloatBottom(0);
+	if ((author->clear_side & 2) && gx.y < GxFloatBottom(1))
+		gx.y = GxFloatBottom(1);
+
+	MemCopy(&kid, style, sizeof(CZStyle));
+	ZStyleStripBox(&kid);
+
+	if (is_body)
+	{ // page root: no box, just flow the children
+		kid.bg = -1;
+		child = node->first_child;
+		while (child)
+		{
+			V3Node(child, &kid);
+			child = child->next;
+		}
+		GxRunFlush;
+		if (gx.x > GX_MARGIN + gx.indent)
+			GxNewline(0);
+		return;
+	}
+
+	mt_eff = author->mt;
+	mb_eff = author->mb;
+	if (mt_eff < 0)
+		mt_eff = GxDefSpace(node->tag);
+	if (mb_eff < 0)
+		mb_eff = GxDefSpace(node->tag);
+	ml_eff = MaxI64(0, style->ml);
+	mr_eff = MaxI64(0, style->mr);
+	pl_eff = MaxI64(0, style->pl);
+	pr_eff = MaxI64(0, style->pr);
+	if (!StrCompare(node->tag, "blockquote") && style->ml < 0)
+		ml_eff = 24;
+	boxed = author->bg >= 0 || author->border >= 0 || author->bg_img >= 0 ||
+			author->grad >= 0 || author->sh_col >= 0;
+	spr_fixed = author->bg_img >= 0 && author->width > 0 && author->width <= 64 &&
+				author->height > 0 && author->height <= 64;
+	pt_eff = author->pt;
+	pb_eff = author->pb;
+	if (pt_eff < 0)
+	{
+		if (boxed)
+			pt_eff = 4;
+		else
+			pt_eff = 0;
+	}
+	if (pb_eff < 0)
+	{
+		if (boxed)
+			pb_eff = 4;
+		else
+			pb_eff = 0;
+	}
+
+	saved_y = 0;
+	saved_indent = 0;
+	saved_wrapa = 0;
+	if (is_abs)
+	{ // out of flow: position against the containing block
+		saved_y		 = gx.y;
+		saved_indent = gx.indent;
+		saved_wrapa	 = gx.wrap_w;
+		avail = gx.cb_w;
+		if (avail < 60)
+			avail = 60;
+		bw = 0;
+		if (author->width > 0)
+			bw = MinI64(author->width, avail);
+		else if (author->width < 0)
+			bw = avail * -author->width / 100;
+		else
+		{
+			V3Measure(node, &kid, avail, &mw, &mh);
+			bw = MinI64(mw + pl_eff + pr_eff + 12, avail);
+		}
+		if (bw < 40)
+			bw = 40;
+		if (author->off_l > ZCSS_OFF_UNSET)
+			x0 = gx.cb_x + L2OffPx(author->off_l, gx.cb_w);
+		else if (author->off_r > ZCSS_OFF_UNSET)
+			x0 = gx.cb_x + gx.cb_w - L2OffPx(author->off_r, gx.cb_w) - bw;
+		else
+			x0 = gx.cb_x;
+		if (x0 < 0)
+			x0 = 0;
+		gx.indent = x0 - GX_MARGIN;
+		gx.wrap_w = x0 + bw;
+		if (author->off_t > ZCSS_OFF_UNSET)
+			gx.y = gx.cb_y + L2OffPx(author->off_t, gx.cb_h);
+		else
+			gx.y = saved_y;
+		gx.x = GX_MARGIN + gx.indent;
+	}
+	else
+	{
+		gx.y += mt_eff;
+		gx.indent += ml_eff;
+		flt_inset = 0;
+		if (gx_float_n)
+		{ // a block that FOLLOWS a narrow left float (a sidebar like lobste.rs's
+		  // 40px .voters) forms the column beside it: shift the whole block past
+		  // the float. Only for NARROW floats - wide image floats keep the normal
+		  // line-box wrap so following headings/paras still go full width below.
+			GxFloatRecompute(gx.y);
+			if (gx_float_lx > GX_MARGIN + gx.indent &&
+				gx_float_lx - GX_MARGIN < 160)
+			{
+				flt_inset = gx_float_lx - (GX_MARGIN + gx.indent);
+				gx.indent += flt_inset;
+			}
+		}
+		save_wrap2 = gx.wrap_w;
+		if (mr_eff + pr_eff > 0 &&
+			gx.wrap_w - (mr_eff + pr_eff) > GX_MARGIN + gx.indent + 40)
+			gx.wrap_w -= mr_eff + pr_eff;
+		save_wrap = 0;
+		center_add = 0;
+		if (style->width)
+		{ // width/max-width narrows the wrap; margin:auto centers
+			avail = gx.wrap_w - (GX_MARGIN + gx.indent);
+			if (style->width > 0)
+				bw = MinI64(style->width, avail);
+			else
+				bw = avail * -style->width / 100;
+			if (bw >= 60 && bw < avail)
+			{
+				// margin:auto centers a sized block; so does a legacy <center>
+				// ancestor (inherited align==center) - that's how HN's 85% table
+				// sits centered while its cell text stays left.
+				if (style->ml_auto == 1 || style->align == 1)
+					center_add = (avail - bw) / 2;
+				gx.indent += center_add;
+				if (!save_wrap)
+					save_wrap = gx.wrap_w;
+				gx.wrap_w = GX_MARGIN + gx.indent + bw;
+			}
+		}
+	}
+
+	op0 = gx.op_count;
+	box_op = -1;
+	box_y0 = gx.y;
+	if (boxed)
+	{
+		op = GxOpAdd(GXO_BOX, GX_MARGIN + gx.indent - 3, gx.y - 2,
+					 gx.wrap_w - (GX_MARGIN + gx.indent - 3), 8);
+		if (op)
+		{
+			box_op = gx.op_count - 1;
+			op->has_bg = author->bg >= 0;
+			op->fg = GxPenBg(author->bg, de_theme.win_bg);
+			op->ul = author->border >= 0;
+			op->bg = GxPenBg(author->border, de_theme.panel_edge);
+			op->grad = author->grad;
+			op->sh_col = author->sh_col;
+			op->sh_dx = author->sh_dx;
+			op->sh_dy = author->sh_dy;
+			op->sh_blur = author->sh_blur;
+			if (author->radius > 0)
+				op->wkind = author->radius;
+			if (author->bg_img >= 0 && author->bg_img < zcss_bgimg_count)
+			{
+				op->img_url = ZincResolveLink(zcss_bgimg[author->bg_img]);
+				op->bg_px  = author->bg_px;
+				op->bg_py  = author->bg_py;
+				op->bg_sw  = author->bg_sw;
+				op->bg_sh  = author->bg_sh;
+				op->bg_rep = author->bg_repeat;
+			}
+		}
+		gx.line_start_op = gx.op_count;
+		kid.bg = -1;
+		if (author->bg >= 0)
+			gx.cur_bg = author->bg;
+	}
+	if (spr_fixed && box_op >= 0)
+	{
+		gx.ops[box_op].x = GX_MARGIN + gx.indent;
+		gx.ops[box_op].y = box_y0;
+		gx.ops[box_op].w = author->width;
+		gx.ops[box_op].h = author->height;
+	}
+	gx.indent += pl_eff;
+	gx.y += pt_eff;
+	gx.x = GX_MARGIN + gx.indent;
+
+	if (is_posn)
+	{ // containing block for absolute descendants
+		gx.cb_x = GX_MARGIN + gx.indent;
+		gx.cb_y = gx.y;
+		gx.cb_w = gx.wrap_w - (GX_MARGIN + gx.indent);
+		if (gx.cb_w < 40)
+			gx.cb_w = 40;
+		gx.cb_h = MaxI64(0, eff_h_cb);
+	}
+
+	if (is_list)
+	{ // list container: push the marker stack + indent
+		if (gx.list_sp < 8)
+		{
+			gx.list_typ[gx.list_sp] = !StrCompare(node->tag, "ol");
+			gx.list_ctr[gx.list_sp] = 0;
+			gx.list_sp++;
+		}
+		gx.indent += 18;
+		gx.x = GX_MARGIN + gx.indent;
+	}
+	if (is_li && style->list_none != 1)
+	{ // marker: numbered for <ol> OR list-style-type:decimal[-leading-zero]
+	  // (100r's ul.jump numbers a <ul>); bullet otherwise.
+		if (gx.list_sp > 0 &&
+			(gx.list_typ[gx.list_sp - 1] || style->list_num >= 1))
+		{
+			gx.list_ctr[gx.list_sp - 1]++;
+			if (style->list_num == 2)
+				StrPrint(mark, "%02d.", gx.list_ctr[gx.list_sp - 1] % 100);
+			else
+				StrPrint(mark, "%d.", gx.list_ctr[gx.list_sp - 1] % 1000);
+		}
+		else
+		{
+			mark[0] = '*';
+			mark[1] = 0;
+		}
+		GxText(mark, style, 1, FALSE);
+	}
+
+	if (is_table)
+		V3TableRows(node, &kid);
+	else if (is_flex)
+		V3FlexRow(node, style, author);
+	else if (is_flex_col)
+		V3FlexCol(node, style, author);
+	else if (author->columns > 1)
+		V3Columns(node, &kid, author->columns);
+	else
+	{
+		child = node->first_child;
+		while (child)
+		{
+			V3Node(child, &kid);
+			child = child->next;
+		}
+	}
+
+	if (is_list)
+	{
+		gx.indent -= 18;
+		if (gx.list_sp > 0)
+			gx.list_sp--;
+	}
+
+	gx.anc_h  = save_anch;
+	gx.cur_bg = save_curbg;
+	gx.cb_x = save_cbx;
+	gx.cb_y = save_cby;
+	gx.cb_w = save_cbw;
+	gx.cb_h = save_cbh;
+
+	GxRunFlush;
+	if (gx.x > GX_MARGIN + gx.indent)
+		GxNewline(0);
+	gx.y += pb_eff;
+	if (eff_h > 0 && gx.y < box_y0 + eff_h)
+		gx.y = box_y0 + eff_h; // min-height floor
+	if (box_op >= 0 && !spr_fixed)
+	{
+		gx.ops[box_op].h = MaxI64(8, gx.y + 2 - gx.ops[box_op].y);
+		gx.line_start_op = gx.op_count;
+	}
+	else if (box_op >= 0)
+		gx.line_start_op = gx.op_count;
+
+	if (is_abs)
+	{ // restore the flow as if we were never here
+		gx.indent = saved_indent;
+		gx.wrap_w = saved_wrapa;
+		gx.y	  = saved_y;
+		gx.x	  = GX_MARGIN + gx.indent;
+	}
+	else
+	{
+		gx.y += mb_eff;
+		if (save_wrap)
+		{
+			gx.wrap_w = save_wrap;
+			gx.indent -= center_add;
+		}
+		gx.wrap_w = save_wrap2;
+		gx.indent -= ml_eff + pl_eff + flt_inset;
+		gx.x = GX_MARGIN + gx.indent;
+
+		if (author->pos == 1)
+		{ // position:relative subtree shift
+			dx = 0;
+			dy = 0;
+			if (author->off_l > ZCSS_OFF_UNSET)
+				dx = L2OffPx(author->off_l, gx.cb_w);
+			else if (author->off_r > ZCSS_OFF_UNSET)
+				dx = -L2OffPx(author->off_r, gx.cb_w);
+			if (author->off_t > ZCSS_OFF_UNSET)
+				dy = L2OffPx(author->off_t, gx.cb_h);
+			if (dx || dy)
+			{
+				for (bw = op0; bw < gx.op_count; bw++)
+				{
+					gx.ops[bw].x += dx;
+					gx.ops[bw].y += dy;
+				}
+			}
+		}
+	}
+
+	if (author->tf_set && gx.op_count > op0)
+	{ // transform: translate(...) post-layout shift; % vs own box
+		dx = author->tf_x;
+		dy = author->tf_y;
+		if (author->tf_xp)
+		{
+			if (box_op >= 0)
+				bw = gx.ops[box_op].w;
+			else
+				bw = gx.wrap_w - (GX_MARGIN + gx.indent);
+			dx = bw * author->tf_x / 100;
+		}
+		if (author->tf_yp)
+		{
+			if (box_op >= 0)
+				dy = gx.ops[box_op].h * author->tf_y / 100;
+			else
+				dy = 0;
+		}
+		if (dx || dy)
+		{
+			for (bw = op0; bw < gx.op_count; bw++)
+			{
+				gx.ops[bw].x += dx;
+				gx.ops[bw].y += dy;
+			}
+		}
+	}
+
+	if (author->ovf_hide == 1 && eff_h > 0)
+	{ // overflow:hidden with a height: cull + clamp the flow to the clip edge
+		dy = box_y0 + eff_h;
+		for (bw = op0; bw < gx.op_count; bw++)
+		{
+			if (gx.ops[bw].y >= dy)
+			{
+				gx.ops[bw].w = 0;
+				gx.ops[bw].h = 0;
+			}
+			else if (gx.ops[bw].y + gx.ops[bw].h > dy &&
+					 (gx.ops[bw].type == GXO_BOX || gx.ops[bw].type == GXO_RECT))
+				gx.ops[bw].h = dy - gx.ops[bw].y;
+		}
+		if (gx.y > dy)
+			gx.y = dy;
+		if (box_op >= 0 && gx.ops[box_op].y + gx.ops[box_op].h > dy)
+			gx.ops[box_op].h = MaxI64(8, dy - gx.ops[box_op].y);
+	}
+	if (author->zidx > 0)
+	{ // z-index: mark the subtree for the late paint pass
+		for (bw = op0; bw < gx.op_count; bw++)
+			if (!gx.ops[bw].z)
+				gx.ops[bw].z = author->zidx;
+	}
+	if (author->pos == 3)
+	{ // position:fixed pins to the viewport
+		for (bw = op0; bw < gx.op_count; bw++)
+			gx.ops[bw].pinned = TRUE;
+	}
+}
+
+/* ---- the unified dispatch ---- */
+
+U0 V3Node(CZNode *node, CZStyle *inh)
+{
+	CZStyle	 style, author, kid;
+	CZNode	*child, *sm;
+	CGxOp	*op;
+	U8		*gen, *attr, *type;
+	I64		 i, ax, ay, aw, sv_x, sv_y, sv_ind, sv_wrap, togi, sy0;
+	Bool	 blockish, dopen;
+
+	if (!node || gx.op_count >= GX_OPS_MAX - 8)
+		return;
+	if (node->type == ZH_TEXT)
+	{
+		GxText(node->text, inh, GxScaleOf(inh), inh->pre == 1);
+		return;
+	}
+	if (ZnTagSkipped(node->tag))
+		return;
+	if (v3_depth >= 48)
+		return; // recursion cap: pathological DOM depth must not blow the stack
+	v3_depth++;
+
+	MemCopy(&style, inh, sizeof(CZStyle));
+	ZnUaStyle(node->tag, &style);
+	ZCssApply(node, &author);
+	if (author.display == ZCSS_DISP_NONE)
+		goto v3_done;
+	ZStyleMerge(&style, &author);
+	style.display = -1;
+
+	attr = ZNodeAttr(node, "align");
+	if (attr)
+	{ // legacy presentational align
+		if (!StrNICompare(attr, "center", 6))
+			style.align = 1;
+		else if (!StrNICompare(attr, "right", 5))
+			style.align = 2;
+		else if (!StrNICompare(attr, "left", 4))
+			style.align = 0;
+	}
+	if (!StrCompare(node->tag, "font"))
+	{
+		attr = ZNodeAttr(node, "color");
+		if (attr)
+		{
+			i = ZCssColor(attr);
+			if (i >= 0)
+				style.fg = i;
+		}
+		attr = ZNodeAttr(node, "size");
+		if (attr)
+		{
+			i = Str2I64(attr);
+			if (1 <= i <= 7)
+				style.fsize = gx_font_sizes[i - 1];
+		}
+	}
+
+	gen = NULL;
+	if (zcss_has_gen)
+		gen = ZCssGenText(node, 5); // ::before
+	if (gen)
+		GxText(gen, inh, GxScaleOf(inh), FALSE);
+
+	// ---- leaves (all owned by v3; nothing routes to another engine) ----
+	if (!StrCompare(node->tag, "br"))
+	{
+		GxRunFlush;
+		GxNewline(0);
+		goto v3_after;
+	}
+	if (!StrCompare(node->tag, "hr"))
+	{
+		GxRunFlush;
+		GxNewline(4);
+		op = GxOpAdd(GXO_RECT, GX_MARGIN, gx.y + 3, gx.wrap_w - GX_MARGIN * 2, 2);
+		if (op)
+			op->fg = de_theme.panel_edge;
+		GxNewline(4);
+		goto v3_after;
+	}
+	if ((author.pos == 2 || author.pos == 3) &&
+		(!StrCompare(node->tag, "svg") || !StrCompare(node->tag, "img")))
+	{ // absolutely/fixed positioned image (Wikipedia's globe:
+	  //   .central-featured-logo{position:absolute;top:158px;left:35px})
+	  // - place it against the containing block + inset offsets, THEN draw.
+		aw = gx.cb_w;
+		if (aw < 40)
+			aw = 40;
+		if (author.width > 0)
+			aw = MinI64(author.width, gx.cb_w);
+		else if (author.width < 0)
+			aw = gx.cb_w * -author.width / 100;
+		if (author.off_l > ZCSS_OFF_UNSET)
+			ax = gx.cb_x + L2OffPx(author.off_l, gx.cb_w);
+		else if (author.off_r > ZCSS_OFF_UNSET)
+			ax = gx.cb_x + gx.cb_w - L2OffPx(author.off_r, gx.cb_w) - aw;
+		else
+			ax = gx.cb_x;
+		if (author.off_t > ZCSS_OFF_UNSET)
+			ay = gx.cb_y + L2OffPx(author.off_t, gx.cb_h);
+		else
+			ay = gx.y;
+		if (ax < 0)
+			ax = 0;
+		sv_x = gx.x;
+		sv_y = gx.y;
+		sv_ind = gx.indent;
+		sv_wrap = gx.wrap_w;
+		gx.indent = ax - GX_MARGIN;
+		gx.wrap_w = ax + MaxI64(aw, 200);
+		gx.x = GX_MARGIN + gx.indent;
+		gx.y = ay;
+		if (!StrCompare(node->tag, "img"))
+			V3Img(node, &style);
+		else
+			V3Svg(node, &style);
+		gx.x = sv_x;
+		gx.y = sv_y;
+		gx.indent = sv_ind;
+		gx.wrap_w = sv_wrap;
+		goto v3_after;
+	}
+	if (!StrCompare(node->tag, "svg") || !StrCompare(node->tag, "img"))
+	{ // display:block image/svg gets its OWN line (100r's nav stacks a rabbit
+	  // ABOVE its text label; both are `nav a img{display:block}`, so without
+	  // this they flowed side by side -> items twice as wide, 2 per row).
+		if (author.display == ZCSS_DISP_BLOCK)
+		{
+			GxRunFlush;
+			if (gx.x > GX_MARGIN + gx.indent)
+				GxNewline(0);
+		}
+		if (!StrCompare(node->tag, "img"))
+			V3Img(node, &style);
+		else
+			V3Svg(node, &style);
+		if (author.display == ZCSS_DISP_BLOCK)
+		{
+			GxRunFlush;
+			GxNewline(0);
+		}
+		goto v3_after;
+	}
+	if (!StrCompare(node->tag, "details"))
+	{ // <details>: render the <summary> (styled + clickable), and the rest only
+	  // when open. State lives in node->checked; a transparent click-box over the
+	  // summary toggles it (GxClickContent). <details open> starts expanded.
+		dopen = node->checked;
+		if (ZNodeAttr(node, "open"))
+			dopen = TRUE;
+		GxRunFlush;
+		if (gx.x > GX_MARGIN + gx.indent)
+			GxNewline(0);
+		sy0 = gx.y;
+		op = GxOpAdd(GXO_BOX, GX_MARGIN + gx.indent - 3, sy0 - 2,
+					 gx.wrap_w - (GX_MARGIN + gx.indent - 3), 8);
+		togi = -1;
+		if (op)
+		{ // invisible (no bg/border) click target carrying the details node
+			togi = gx.op_count - 1;
+			op->node = node;
+		}
+		MemCopy(&kid, &style, sizeof(CZStyle));
+		ZStyleStripBox(&kid);
+		sm = node->first_child;
+		while (sm && !(sm->type == ZH_ELEM && !StrCompare(sm->tag, "summary")))
+			sm = sm->next;
+		if (sm)
+			V3Node(sm, &kid);
+		else
+			GxText("Details", &style, 1, FALSE);
+		GxRunFlush;
+		if (gx.x > GX_MARGIN + gx.indent)
+			GxNewline(0);
+		if (togi >= 0)
+			gx.ops[togi].h = MaxI64(8, gx.y - sy0);
+		if (dopen)
+		{
+			child = node->first_child;
+			while (child)
+			{
+				if (!(child->type == ZH_ELEM && !StrCompare(child->tag, "summary")))
+					V3Node(child, &kid);
+				child = child->next;
+			}
+		}
+		goto v3_after;
+	}
+	if (!StrCompare(node->tag, "input"))
+	{
+		type = ZNodeAttr(node, "type");
+		if (!type)
+			type = "text";
+		if (!StrICompare(type, "hidden"))
+			goto v3_done;
+		if (!StrICompare(type, "checkbox"))
+			GxWidget(node, GXW_CHECK);
+		else if (!StrICompare(type, "radio"))
+			GxWidget(node, GXW_RADIO);
+		else if (!StrICompare(type, "submit") || !StrICompare(type, "image"))
+			GxWidget(node, GXW_SUBMIT);
+		else if (!StrICompare(type, "button"))
+			GxWidget(node, GXW_BUTTON);
+		else
+			GxWidget(node, GXW_TEXT);
+		goto v3_after;
+	}
+	if (!StrCompare(node->tag, "button"))
+	{
+		type = ZNodeAttr(node, "type");
+		if (type && !StrICompare(type, "button"))
+			GxWidget(node, GXW_BUTTON);
+		else
+			GxWidget(node, GXW_SUBMIT);
+		goto v3_after;
+	}
+	if (!StrCompare(node->tag, "select"))
+	{
+		GxWidget(node, GXW_SELECT);
+		goto v3_after;
+	}
+	if (!StrCompare(node->tag, "textarea"))
+	{
+		GxWidget(node, GXW_AREA);
+		goto v3_after;
+	}
+	if ((author.bg >= 0 || author.border >= 0) &&
+		author.display == ZCSS_DISP_INLINE)
+	{ // inline element with a background/border -> a pill (button/tag/kbd/code).
+	  // Covers <a class=button>, <code>, <kbd>, <dt>, styled <span>. Block boxes
+	  // with a bg fall through to V3Block; this is only for inline-level ones.
+		V3Pill(node, &style, &author);
+		goto v3_after;
+	}
+	if (!StrCompare(node->tag, "a"))
+	{
+		attr = ZNodeAttr(node, "href");
+		if (attr && *attr)
+		{ // link container: children flow inline with link styling + href
+			if (style.fg < 0)
+				style.fg = 0x4EA3FF;
+			GxRunFlush;
+			gx.link_depth++;
+			gx.cur_href = attr;
+			MemCopy(&kid, &style, sizeof(CZStyle));
+			ZStyleStripBox(&kid);
+			child = node->first_child;
+			while (child)
+			{
+				V3Node(child, &kid);
+				child = child->next;
+			}
+			GxRunFlush;
+			gx.link_depth--;
+			goto v3_after;
+		}
+	}
+	if (author.bg_img >= 0 && author.width > 0 && author.width <= 64 &&
+		author.height > 0 && author.height <= 64 && !node->first_child)
+	{ // fixed-size sprite/icon cell
+		V3Sprite(node, &author);
+		goto v3_after;
+	}
+
+	if (zinc_floats && v3_meas_depth == 0 &&
+		(author.float_side == 1 || author.float_side == 2))
+	{ // float: out of flow, content wraps beside
+		ZStyleMerge(&style, &author);
+		style.display = -1;
+		V3Float(node, &style, &author);
+		goto v3_after;
+	}
+
+	// ---- block vs inline classification ----
+	blockish = ZHtmlTagBlock(node->tag) || L2IsBody(node->tag) ||
+			   !StrCompare(node->tag, "center") ||
+			   !StrCompare(node->tag, "main") ||
+			   !StrCompare(node->tag, "aside") ||
+			   !StrCompare(node->tag, "figure") ||
+			   !StrCompare(node->tag, "ul") || !StrCompare(node->tag, "ol") ||
+			   !StrCompare(node->tag, "li") || !StrCompare(node->tag, "dl") ||
+			   !StrCompare(node->tag, "dt") || !StrCompare(node->tag, "dd") ||
+			   !StrCompare(node->tag, "table") || !StrCompare(node->tag, "pre");
+	if (author.display == ZCSS_DISP_BLOCK || author.display == ZCSS_DISP_FLEX)
+		blockish = TRUE;
+	if (author.pos >= 1)
+		blockish = TRUE;
+	if (author.display == ZCSS_DISP_INLINE && author.pos < 2)
+		blockish = FALSE;
+
+	if (!blockish)
+	{ // inline container: children stay in the current line flow
+		MemCopy(&kid, &style, sizeof(CZStyle));
+		ZStyleStripBox(&kid);
+		child = node->first_child;
+		while (child)
+		{
+			V3Node(child, &kid);
+			child = child->next;
+		}
+		goto v3_after;
+	}
+
+	V3Block(node, &style, &author);
+
+v3_after:;
+	gen = NULL;
+	if (zcss_has_gen)
+		gen = ZCssGenText(node, 6); // ::after
+	if (gen)
+		GxText(gen, inh, GxScaleOf(inh), FALSE);
+v3_done:;
+	v3_depth--;
+}
