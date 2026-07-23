@@ -1,0 +1,218 @@
+/***** fediverse feed (ActivityPub timeline) *****/
+
+I64 YhFeedChan()
+{//The feed lives in a pseudo-channel on pseudo-server YH_SRV_FEED.
+	I64		 i;
+	CYhChan	*ch;
+
+	for (i = 0; i < yh.num_chans; i++)
+		if (yh.chans[i].server == YH_SRV_FEED)
+			return i;
+	if (yh.num_chans >= YH_MAX_CHANS)
+		return -1;
+	ch = &yh.chans[yh.num_chans];
+	MemSet(ch, 0, sizeof(CYhChan));
+	StrCopy(ch->name, "monyverse");
+	ch->server = YH_SRV_FEED;
+	StrCopy(ch->last_ts, "1970-01-01T00:00:00");
+	return yh.num_chans++;
+}
+
+U0 YhPostRowAdd(I64 ci, CYhJson *row, U8 *missing, I64 missing_max)
+{//One posts row -> feed line(s): author, text, fav/boost counts, media.
+	U8		 text[YH_TEXT_LEN], hh, mm;
+	U8		*aid, *name, *created, *pid;
+	CYhJson	*media, *att;
+	CYhChan	*ch = &yh.chans[ci];
+	CYhLine	*ln;
+	I64		 pidx, favs = 0, boosts = 0;
+	U8		 abs[YH_IMG_URL_LEN];
+
+	created = YhjStr(YhjGet(row, "created_at"));
+	YhMsgTime(created, &hh, &mm);
+	aid = YhjStr(YhjGet(row, "author_id"));
+	pid = YhjStr(YhjGet(row, "id"));
+	name = NULL;
+	if (*aid)
+		name = YhProfileName(aid);
+	if (!name)
+	{
+		if (*aid)
+		{
+			if (*missing)
+				CatPrint(missing, ",");
+			if (StrLen(missing) + StrLen(aid) < missing_max - 2)
+				CatPrint(missing, "%s", aid);
+			name = "...";
+		}
+		else
+			name = "remote";
+	}
+
+	//Boost: show who's boosted, then render the embedded reblog content.
+	if (YhjGet(row, "reblog") && YhjGet(row, "reblog")->type == YHJ_OBJ)
+	{
+		StrPrint(text, "boosted a post by %s:",
+				 YhjStr(YhjGet(YhjGet(row, "reblog_author"), "username"), "someone"));
+		YhAdd(ci, YH_LK_SYSTEM, name, text, hh, mm);
+		YhContentToText(YhjGet(YhjGet(row, "reblog"), "content"), text, YH_TEXT_LEN);
+	}
+	else
+		YhContentToText(YhjGet(row, "content"), text, YH_TEXT_LEN);
+
+	if (YhjGet(row, "favorites_count"))
+		favs = ToI64(YhjGet(row, "favorites_count")->num);
+	if (YhjGet(row, "reblogs_count"))
+		boosts = ToI64(YhjGet(row, "reblogs_count")->num);
+	if ((favs || boosts) && StrLen(text) < YH_TEXT_LEN - 24)
+		CatPrint(text, "  {*%d ^%d}", favs, boosts);
+
+	if (!StrCompare(aid, yh.prof_id))
+		YhAdd(ci, YH_LK_SELF, name, text, hh, mm);
+	else
+		YhAdd(ci, YH_LK_MSG, name, text, hh, mm);
+	ln = YhLineLast(ci);
+	if (ln)
+	{
+		MemCopy(ln->id, pid, MinI64(StrLen(pid), YH_UUID_LEN - 1));
+		ln->id[MinI64(StrLen(pid), YH_UUID_LEN - 1)] = 0;
+		pidx = YhProfileFind(aid);
+		if (pidx >= 0)
+			ln->av = yh.profiles[pidx].av;
+	}
+
+	//Media attachments -> inline images.
+	media = YhjGet(row, "media_attachments");
+	if (media && media->type == YHJ_ARR)
+	{
+		att = media->child;
+		while (att)
+		{
+			if (*YhjStr(YhjGet(att, "url")))
+			{
+				YhImgAbs(YhjStr(YhjGet(att, "url")), abs, sizeof(abs));
+				YhAdd(ci, YH_LK_IMG, NULL, abs);
+				ln = YhLineLast(ci);
+				if (ln)
+					ln->img = YhImgGet(abs, YH_EMBED_W, YH_EMBED_H);
+			}
+			att = att->next;
+		}
+	}
+
+	if (StrCompare(created, ch->last_ts) > 0)
+	{
+		MemCopy(ch->last_ts, created, MinI64(StrLen(created), 39));
+		ch->last_ts[MinI64(StrLen(created), 39)] = 0;
+	}
+}
+
+U0 YhFetchFeed(Bool initial)
+{
+	I64		 ci = YhFeedChan, n, i;
+	CYhJson	*json, *row, *rows[64];
+	CYhChan	*ch;
+	U8		 missing[1600], enc_ts[56];
+
+	if (ci < 0)
+		return;
+	ch = &yh.chans[ci];
+	if (initial)
+		json = YhRest("GET",
+			"/rest/v1/posts?is_deleted=eq.false&visibility=eq.public"
+			"&order=created_at.desc&limit=25"
+			"&select=id,created_at,author_id,content,media_attachments,"
+			"reblog,reblog_author,favorites_count,reblogs_count",
+			NULL);
+	else
+	{
+		YhTsEnc(enc_ts, ch->last_ts);
+		json = YhRest("GET",
+			"/rest/v1/posts?is_deleted=eq.false&visibility=eq.public"
+			"&created_at=gt.%s&order=created_at.asc&limit=25"
+			"&select=id,created_at,author_id,content,media_attachments,"
+			"reblog,reblog_author,favorites_count,reblogs_count",
+			NULL, enc_ts);
+	}
+	if (!json)
+		return;
+
+	//Batch-resolve unknown authors first (names + avatars on first paint).
+	missing[0] = 0;
+	row = json->child;
+	while (row)
+	{
+		if (*YhjStr(YhjGet(row, "author_id")) &&
+			!YhProfileName(YhjStr(YhjGet(row, "author_id"))))
+		{
+			if (StrLen(missing) + 40 < sizeof(missing))
+			{
+				if (*missing)
+					CatPrint(missing, ",");
+				CatPrint(missing, "%s", YhjStr(YhjGet(row, "author_id")));
+			}
+		}
+		row = row->next;
+	}
+	YhFetchProfiles(missing);
+	missing[0] = 0;
+
+	if (initial)
+	{
+		n = 0;
+		row = json->child;
+		while (row && n < 64)
+		{
+			rows[n++] = row;
+			row = row->next;
+		}
+		for (i = n - 1; i >= 0; i--)
+			YhPostRowAdd(ci, rows[i], missing, sizeof(missing));
+		ch->loaded = TRUE;
+	}
+	else
+	{
+		row = json->child;
+		while (row)
+		{
+			YhPostRowAdd(ci, row, missing, sizeof(missing));
+			row = row->next;
+		}
+	}
+	YhjFree(json);
+}
+
+U0 YhSendPost(U8 *text)
+{//Publish to the fediverse: direct posts insert; the federation backend
+//picks it up (is_federated + federation_status pending) and delivers via
+//ActivityPub.
+	U8		 esc[YH_TEXT_LEN * 2];
+	U8		*body;
+	CYhJson	*json;
+	I64		 ci = YhFeedChan;
+
+	if (ci < 0)
+		return;
+	YhJsonEsc(esc, text, sizeof(esc));
+	body = MStrPrint(
+		"{\"author_id\":\"%s\",\"visibility\":\"public\","
+		"\"content\":[{\"type\":\"text\",\"text\":\"%s\"}],"
+		"\"is_local\":true,\"is_federated\":true,"
+		"\"metadata\":{\"created_via\":\"yharmony_zealos\","
+		"\"content_format\":\"message_parts_v1\"}}",
+		yh.prof_id, esc);
+	json = YhRest("POST", "/rest/v1/posts", body);
+	Free(body);
+	if (json)
+	{
+		if (json->child)
+		{
+			esc[0] = 0;
+			YhPostRowAdd(ci, json->child, esc, sizeof(esc));
+		}
+		YhjFree(json);
+	}
+	else
+		YhStatus("Post failed.");
+}
+

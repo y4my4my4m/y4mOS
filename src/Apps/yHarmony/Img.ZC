@@ -1,0 +1,103 @@
+/***** image pipeline *****/
+
+I64 YhImgGet(U8 *url, I64 maxw, I64 maxh)
+{//Cache index for a URL, enqueueing a background fetch on first sight.
+//-1 when the URL is empty or the cache is full.
+	I64		 i;
+	CYhImg	*im;
+
+	if (!url || !*url)
+		return -1;
+	for (i = 0; i < yh.img_count; i++)
+		if (!StrCompare(yh.imgs[i].url, url))
+			return i;
+	if (yh.img_count >= YH_IMG_MAX)
+		return -1;
+	im = &yh.imgs[yh.img_count];
+	MemCopy(im->url, url, MinI64(StrLen(url), YH_IMG_URL_LEN - 1));
+	im->url[MinI64(StrLen(url), YH_IMG_URL_LEN - 1)] = 0;
+	im->dc = NULL;
+	im->maxw = maxw;
+	im->maxh = maxh;
+	im->state = 1;	//Last write: the loader keys off this.
+	return yh.img_count++;
+}
+
+U0 YhImgAbs(U8 *src, U8 *dst, I64 max)
+{//Absolutize an image URL: "/x.png" -> https://{instance host}/x.png.
+	if (!StrNICompare(src, "http", 4))
+		StrPrint(dst, "%s", src);
+	else if (src[0] == '/' && yh.f_host[0])
+		StrPrint(dst, "https://%s%s", yh.f_host, src);
+	else
+		StrPrint(dst, "%s", src);
+	dst[max - 1] = 0;
+}
+
+U0 YhImgLoaderTask()
+{//Fetch + decode queued images, one at a time. Decoded on this task's heap,
+//then scaled into a DC on the UI task's heap (survives us).
+	I64		 i, w, h;
+	CYhImg	*im;
+	CHttpResponse *resp;
+	CDC		*raw, *fit;
+	Bool	 found;
+
+	while (!yh.quit)
+	{
+		found = FALSE;
+		for (i = 0; i < yh.img_count && !found; i++)
+		{
+			im = &yh.imgs[i];
+			if (im->state == 1)
+			{
+				found = TRUE;
+				raw = NULL;
+				resp = HttpGet(im->url);
+				if (resp && resp->status == 200 && resp->body_length > 8)
+				{
+					if (!MemCompare(resp->body + 1, "PNG", 3))
+						raw = PNGReadBuf(resp->body, resp->body_length);
+					else if (resp->body[0] == 0xFF && resp->body[1] == 0xD8)
+						raw = JPGReadBuf(resp->body, resp->body_length);
+					else if (!MemCompare(resp->body, "GIF8", 4))
+						raw = GIFReadBuf(resp->body, resp->body_length);
+				}
+				if (resp)
+					HttpResponseFree(resp);
+				if (raw && raw->width > 0 && raw->height > 0)
+				{//Scale to fit, preserving aspect.
+					w = im->maxw;
+					h = raw->height * w / raw->width;
+					if (h > im->maxh)
+					{
+						h = im->maxh;
+						w = raw->width * h / raw->height;
+					}
+					if (w < 1)
+						w = 1;
+					if (h < 1)
+						h = 1;
+					if (raw->width <= im->maxw && raw->height <= im->maxh)
+					{//Small enough already: 1:1 copy keeps it crisp.
+						w = raw->width;
+						h = raw->height;
+					}
+					fit = DEDCScaleNew(raw, w, h, yh.ui_task);
+					DCDel(raw);
+					im->dc = fit;
+					im->state = 2;
+				}
+				else
+				{
+					if (raw)
+						DCDel(raw);
+					im->state = 3;	//Failed (bad fetch / webp / corrupt).
+				}
+			}
+		}
+		if (!found)
+			Sleep(150);
+	}
+}
+

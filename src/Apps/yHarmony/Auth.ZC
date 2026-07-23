@@ -1,0 +1,282 @@
+/***** auth *****/
+
+Bool YhDiscoverTry(U8 *url)
+{//One /instance-info probe. Fills f_url + f_anon on success.
+	CHttpResponse *resp = HttpReq(url, "GET", NULL, "application/json", NULL);
+	CYhJson		  *json, *u, *k;
+	Bool		   ok = FALSE;
+
+	if (!resp)
+		return FALSE;
+	if (resp->status == 200 && resp->body)
+	{
+		json = YhjParse(resp->body);
+		if (json)
+		{
+			u = YhjGet(json, "supabaseUrl");
+			k = YhjGet(json, "supabaseAnonKey");
+			if (u && k && *YhjStr(u) && *YhjStr(k))
+			{
+				MemCopy(yh.f_url, YhjStr(u), MinI64(StrLen(YhjStr(u)), sizeof(yh.f_url) - 1));
+				yh.f_url[MinI64(StrLen(YhjStr(u)), sizeof(yh.f_url) - 1)] = 0;
+				MemCopy(yh.f_anon, YhjStr(k), MinI64(StrLen(YhjStr(k)), sizeof(yh.f_anon) - 1));
+				yh.f_anon[MinI64(StrLen(YhjStr(k)), sizeof(yh.f_anon) - 1)] = 0;
+				ok = TRUE;
+			}
+			YhjFree(json);
+		}
+	}
+	HttpResponseFree(resp);
+	return ok;
+}
+
+Bool YhDiscover()
+{//Resolve the instance domain -> Supabase url + anon key via the Harmony
+//federation backend's public discovery endpoint. Both mount points tried.
+	U8	 host[160];
+	U8	*url;
+	Bool ok;
+
+	if (!yh.f_host[0])
+		return yh.f_url[0] && yh.f_anon[0];	//Manual url+anon in the config.
+
+	//Strip any scheme + trailing slash the user typed.
+	if (!StrNICompare(yh.f_host, "https://", 8))
+		StrCopy(host, yh.f_host + 8);
+	else if (!StrNICompare(yh.f_host, "http://", 7))
+		StrCopy(host, yh.f_host + 7);
+	else
+		StrCopy(host, yh.f_host);
+	if (host[0] && host[StrLen(host) - 1] == '/')
+		host[StrLen(host) - 1] = 0;
+
+	YhStatus("Discovering instance...");
+	url = MStrPrint("https://%s/instance-info", host);
+	ok = YhDiscoverTry(url);
+	Free(url);
+	if (!ok)
+	{
+		url = MStrPrint("https://%s/api/federation/instance-info", host);
+		ok = YhDiscoverTry(url);
+		Free(url);
+	}
+	if (!ok)
+	{
+		YhStatus("Instance discovery failed (/instance-info).");
+		return FALSE;
+	}
+	return TRUE;
+}
+
+U0 YhMfa(CYhJson *user)
+{//TOTP second factor (GoTrue MFA). If the account has a verified totp
+//factor: challenge it, prompt for the 6-digit code, verify -> the session
+//is upgraded to AAL2 (new access/refresh tokens).
+	CYhJson	*factors, *f, *json;
+	U8		 fid[YH_UUID_LEN], cid[YH_UUID_LEN];
+	U8		*code, *body, *p;
+	I64		 expires;
+
+	factors = YhjGet(user, "factors");
+	if (!factors || factors->type != YHJ_ARR)
+		return;
+	fid[0] = 0;
+	f = factors->child;
+	while (f && !fid[0])
+	{
+		if (!StrCompare(YhjStr(YhjGet(f, "factor_type")), "totp") &&
+			!StrCompare(YhjStr(YhjGet(f, "status")), "verified"))
+			StrCopy(fid, YhjStr(YhjGet(f, "id")));
+		f = f->next;
+	}
+	if (!fid[0])
+		return;
+
+	json = YhRest("POST", "/auth/v1/factors/%s/challenge", "{}", fid);
+	if (!json)
+	{
+		YhStatus("MFA challenge failed.");
+		return;
+	}
+	StrCopy(cid, YhjStr(YhjGet(json, "id")));
+	YhjFree(json);
+	if (!cid[0])
+		return;
+
+	code = PopUpGetStr("yHarmony MFA - enter the 6-digit TOTP code:");
+	if (!code)
+		return;
+	p = code;	//Strip whitespace/newline the popup may leave.
+	while (*p == ' ')
+		p++;
+	if (StrLen(p) && p[StrLen(p) - 1] == '\n')
+		p[StrLen(p) - 1] = 0;
+
+	body = MStrPrint("{\"challenge_id\":\"%s\",\"code\":\"%s\"}", cid, p);
+	json = YhRest("POST", "/auth/v1/factors/%s/verify", body, fid);
+	Free(body);
+	Free(code);
+	if (!json)
+	{
+		YhStatus("MFA verify failed (wrong code?).");
+		return;
+	}
+	f = YhjGet(json, "access_token");
+	if (f && *YhjStr(f))
+	{//AAL2 session replaces the AAL1 one.
+		StrCopy(yh.jwt, YhjStr(f));
+		StrCopy(yh.refresh, YhjStr(YhjGet(json, "refresh_token")));
+		expires = 3600;
+		f = YhjGet(json, "expires_in");
+		if (f && f->type == YHJ_NUM)
+			expires = ToI64(f->num);
+		yh.tok_deadline = counts.jiffies + expires * 8 / 10 * JIFFY_FREQ;
+		StrPrint(yh.hdrs, "apikey: %s\r\nAuthorization: Bearer %s\r\n"
+				 "Prefer: return=representation\r\n", yh.f_anon, yh.jwt);
+	}
+	YhjFree(json);
+}
+
+Bool YhAuth()
+{
+	U8		 esc_e[160], esc_p[160];
+	U8		*body, *url;
+	CHttpResponse *resp;
+	CYhJson	*json, *f, *user;
+	I64		 expires;
+
+	if (!yh.f_email[0] || !yh.f_pass[0])
+	{
+		YhStatus("Email and password required.");
+		return FALSE;
+	}
+	if (!yh.f_url[0] || !yh.f_anon[0])
+	{//First run (or cache cleared): discover from the instance domain.
+		if (!YhDiscover)
+			return FALSE;
+	}
+	//Normalize the URL: no trailing slash.
+	if (yh.f_url[0] && yh.f_url[StrLen(yh.f_url) - 1] == '/')
+		yh.f_url[StrLen(yh.f_url) - 1] = 0;
+
+	StrPrint(yh.hdrs, "apikey: %s\r\n", yh.f_anon);	//Pre-auth: apikey only.
+	YhJsonEsc(esc_e, yh.f_email, sizeof(esc_e));
+	YhJsonEsc(esc_p, yh.f_pass, sizeof(esc_p));
+	body = MStrPrint("{\"email\":\"%s\",\"password\":\"%s\"}", esc_e, esc_p);
+	url = MStrPrint("%s/auth/v1/token?grant_type=password", yh.f_url);
+	resp = HttpReq(url, "POST", body, "application/json", yh.hdrs);
+	Free(body);
+	Free(url);
+	if (!resp)
+	{
+		YhStatus("Auth request failed (network).");
+		return FALSE;
+	}
+	if (resp->status != 200)
+	{
+		YhStatus("Login rejected (bad email/password/key?).");
+		NetLog("yHarmony auth %d: %s", resp->status, resp->body);
+		HttpResponseFree(resp);
+		return FALSE;
+	}
+	json = YhjParse(resp->body);
+	HttpResponseFree(resp);
+	if (!json)
+	{
+		YhStatus("Auth response unparsable.");
+		return FALSE;
+	}
+	f = YhjGet(json, "access_token");
+	if (!f || !*YhjStr(f))
+	{
+		YhStatus("No access token in the auth response.");
+		YhjFree(json);
+		return FALSE;
+	}
+	StrCopy(yh.jwt, YhjStr(f));
+	StrCopy(yh.refresh, YhjStr(YhjGet(json, "refresh_token")));
+	expires = 3600;
+	f = YhjGet(json, "expires_in");
+	if (f && f->type == YHJ_NUM)
+		expires = ToI64(f->num);
+	yh.tok_deadline = counts.jiffies + expires * 8 / 10 * JIFFY_FREQ;
+	user = YhjGet(json, "user");
+	StrCopy(yh.auth_uid, YhjStr(YhjGet(user, "id")));
+
+	//Prefer makes PostgREST return the inserted row (harmless on GETs).
+	StrPrint(yh.hdrs, "apikey: %s\r\nAuthorization: Bearer %s\r\n"
+			 "Prefer: return=representation\r\n", yh.f_anon, yh.jwt);
+
+	//Second factor, if the account has one enrolled (needs the Bearer hdr).
+	YhMfa(user);
+	YhjFree(json);
+
+	//auth uid -> Harmony profile (RLS keys off profiles.id, not auth.uid).
+	json = YhRest("GET",
+		"/rest/v1/profiles?auth_user_id=eq.%s&select=id,username,avatar_url",
+		NULL, yh.auth_uid);
+	if (!json || !json->child)
+	{
+		YhStatus("No Harmony profile for this account.");
+		YhjFree(json);
+		return FALSE;
+	}
+	StrCopy(yh.prof_id, YhjStr(YhjGet(json->child, "id")));
+	StrCopy(yh.username, YhjStr(YhjGet(json->child, "username"), "me"));
+	YhProfileAdd(yh.prof_id, yh.username, YhjStr(YhjGet(json->child, "avatar_url")));
+	YhjFree(json);
+	return TRUE;
+}
+
+U0 YhTokenRefresh()
+{
+	U8		*body, *url;
+	CHttpResponse *resp;
+	CYhJson	*json, *f;
+	I64		 expires;
+	U8		*hb;
+
+	body = MStrPrint("{\"refresh_token\":\"%s\"}", yh.refresh);
+	url = MStrPrint("%s/auth/v1/token?grant_type=refresh_token", yh.f_url);
+	StrPrint(yh.hdrs, "apikey: %s\r\n", yh.f_anon);
+	resp = HttpReq(url, "POST", body, "application/json", yh.hdrs);
+	Free(body);
+	Free(url);
+	if (resp && resp->status == 200)
+	{
+		json = YhjParse(resp->body);
+		if (json)
+		{
+			f = YhjGet(json, "access_token");
+			if (f && *YhjStr(f))
+			{
+				StrCopy(yh.jwt, YhjStr(f));
+				StrCopy(yh.refresh, YhjStr(YhjGet(json, "refresh_token")));
+				expires = 3600;
+				f = YhjGet(json, "expires_in");
+				if (f && f->type == YHJ_NUM)
+					expires = ToI64(f->num);
+				yh.tok_deadline = counts.jiffies + expires * 8 / 10 * JIFFY_FREQ;
+				if (yh.ws_ok)
+				{//Push the fresh token into the realtime session too.
+					hb = MStrPrint("{\"topic\":\"realtime:zealos\",\"event\":\"access_token\","
+								   "\"payload\":{\"access_token\":\"%s\"},\"ref\":\"%d\"}",
+								   yh.jwt, ++yh.ws_ref);
+					while (LBts(&yh.ws_lock, 0))
+						Yield;
+					WsSendStr(yh.ws, hb);
+					LBtr(&yh.ws_lock, 0);
+					Free(hb);
+				}
+			}
+			YhjFree(json);
+		}
+	}
+	else
+		yh.tok_deadline = counts.jiffies + 60 * JIFFY_FREQ;	//Retry in a minute.
+	if (resp)
+		HttpResponseFree(resp);
+	StrPrint(yh.hdrs, "apikey: %s\r\nAuthorization: Bearer %s\r\n"
+			 "Prefer: return=representation\r\n", yh.f_anon, yh.jwt);
+}
+

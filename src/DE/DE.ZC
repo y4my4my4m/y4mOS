@@ -293,7 +293,7 @@ U0 DEMenuTask()
 				Sys("ExeFile(\"::/DE/BrowserBoot\");");
 				de.net_up = TRUE;
 			}
-			User("ExeFile(\"::/DE/yHarmony\");\n");
+			User("Cd(\"::/Apps/yHarmony\");;ExeFile(\"Run\");\n");
 			break;
 		case 5:
 			if (!de.net_up)

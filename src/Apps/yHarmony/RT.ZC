@@ -1,0 +1,189 @@
+/***** realtime (WebSocket) *****/
+
+U0 YhWsRecvTask()
+{//Blocks on the socket; pushes raw JSON frames into the ring (strings live
+//on the PARENT task's heap so they survive if this task dies).
+	CTask	*parent = Fs->parent_task;
+	U8		*msg, *copy;
+	I64		 n;
+
+	while (!yh.quit && yh.ws && yh.ws->open)
+	{
+		n = WsRecv(yh.ws, &msg, 30000);
+		if (n < 0)
+			break;
+		if (n > 0 && msg)
+		{
+			if (yh.rt_wr - yh.rt_rd < YH_RT_RING)
+			{
+				copy = MAlloc(n + 1, parent);
+				MemCopy(copy, msg, n + 1);
+				yh.rt_ring[yh.rt_wr & (YH_RT_RING - 1)] = copy;
+				yh.rt_wr++;	//After the slot is filled.
+			}
+			Free(msg);
+		}
+	}
+	yh.ws_ok = FALSE;
+}
+
+U0 YhWsHbTask()
+{//Phoenix heartbeat every 4s. Keeps the server side alive AND keeps bytes
+//flowing back (phx_reply) so the TLS stall detector never fires while the
+//UI task is blocked in a popup.
+	U8 hb[128];
+
+	while (!yh.quit && yh.ws_ok && yh.ws && yh.ws->open)
+	{
+		StrPrint(hb, "{\"topic\":\"phoenix\",\"event\":\"heartbeat\","
+					 "\"payload\":{},\"ref\":\"%d\"}", ++yh.ws_ref);
+		while (LBts(&yh.ws_lock, 0))
+			Yield;
+		if (yh.ws && yh.ws->open)
+			WsSendStr(yh.ws, hb);
+		LBtr(&yh.ws_lock, 0);
+		Sleep(4000);
+	}
+}
+
+U0 YhWsConnect()
+{
+	U8	*wsurl, *join;
+	U8	 host[256];
+	I64	 i;
+
+	if (yh.ws_ok)
+		return;
+	//https://host -> wss://host/realtime/v1/websocket?...
+	if (!StrNICompare(yh.f_url, "https://", 8))
+		StrCopy(host, yh.f_url + 8);
+	else if (!StrNICompare(yh.f_url, "http://", 7))
+		StrCopy(host, yh.f_url + 7);
+	else
+		StrCopy(host, yh.f_url);
+	wsurl = MStrPrint("wss://%s/realtime/v1/websocket?apikey=%s&vsn=1.0.0",
+					  host, yh.f_anon);
+	yh.ws = WsOpen(wsurl);
+	Free(wsurl);
+	if (!yh.ws)
+	{
+		YhStatus("Realtime socket failed; polling instead.");
+		yh.reconnect_deadline = counts.jiffies + 60 * JIFFY_FREQ;
+		return;
+	}
+
+	//Join one channel subscribed to INSERTs on messages AND posts; the
+	//server applies RLS with our JWT, so only visible rows arrive.
+	join = MStrPrint(
+		"{\"topic\":\"realtime:zealos\",\"event\":\"phx_join\",\"payload\":{"
+		"\"config\":{\"broadcast\":{\"self\":false},\"presence\":{\"key\":\"\"},"
+		"\"postgres_changes\":[{\"event\":\"INSERT\",\"schema\":\"public\","
+		"\"table\":\"messages\"},{\"event\":\"INSERT\",\"schema\":\"public\","
+		"\"table\":\"posts\"}]},\"access_token\":\"%s\"},\"ref\":\"%d\"}",
+		yh.jwt, ++yh.ws_ref);
+	WsSendStr(yh.ws, join);	//No lock needed: tasks not spawned yet.
+	Free(join);
+
+	yh.ws_ok = TRUE;
+	yh.rt_wr = yh.rt_rd = 0;
+	yh.ws_task = Spawn(&YhWsRecvTask, NULL, "yHarmonyWS",, Fs);
+	yh.hb_task = Spawn(&YhWsHbTask,  NULL, "yHarmonyHB",, Fs);
+	YhStatus("Realtime connected.");
+}
+
+U0 YhWsShutdown()
+{
+	yh.ws_ok = FALSE;
+	if (yh.ws_task && TaskValidate(yh.ws_task))
+		Kill(yh.ws_task);
+	if (yh.hb_task && TaskValidate(yh.hb_task))
+		Kill(yh.hb_task);
+	yh.ws_task = yh.hb_task = NULL;
+	if (yh.ws)
+	{
+		WsClose(yh.ws);
+		yh.ws = NULL;
+	}
+	while (yh.rt_rd < yh.rt_wr)
+	{
+		Free(yh.rt_ring[yh.rt_rd & (YH_RT_RING - 1)]);
+		yh.rt_rd++;
+	}
+}
+
+I64 YhChanFind(U8 *id)
+{
+	I64 i;
+
+	for (i = 0; i < yh.num_chans; i++)
+		if (!StrCompare(yh.chans[i].id, id))
+			return i;
+	return -1;
+}
+
+U0 YhRtHandle(U8 *frame)
+{//One Phoenix frame off the ring. Routes messages -> their channel and
+//posts -> the feed, both through the shared row-adders (so replies, embeds
+//and avatars work identically live).
+	CYhJson	*json, *payload, *data, *record;
+	U8		*event, *table, *created, *author;
+	I64		 ci;
+	CYhChan	*ch;
+	U8		 missing[80];
+
+	json = YhjParse(frame);
+	if (!json)
+		return;
+	event = YhjStr(YhjGet(json, "event"));
+	if (StrCompare(event, "postgres_changes"))
+	{//Heartbeat replies / join replies / system: ignore.
+		YhjFree(json);
+		return;
+	}
+	payload = YhjGet(json, "payload");
+	data = YhjGet(payload, "data");
+	record = YhjGet(data, "record");
+	if (!record)
+	{
+		YhjFree(json);
+		return;
+	}
+	table = YhjStr(YhjGet(data, "table"));
+
+	if (!StrCompare(table, "posts"))
+	{
+		ci = YhFeedChan;
+		author = YhjStr(YhjGet(record, "author_id"));
+	}
+	else
+	{
+		ci = YhChanFind(YhjStr(YhjGet(record, "channel_id")));
+		if (ci < 0)	//DM pseudo-channels are keyed by the conversation uuid.
+			ci = YhChanFind(YhjStr(YhjGet(record, "conversation_id")));
+		author = YhjStr(YhjGet(record, "user_id"));
+	}
+	if (ci < 0)
+	{//Channel we haven't loaded (other server): drop for now.
+		YhjFree(json);
+		return;
+	}
+	ch = &yh.chans[ci];
+	created = YhjStr(YhjGet(record, "created_at"));
+	if (*created && StrCompare(created, ch->last_ts) <= 0)
+	{//Already have it (poll or the send echo raced the socket).
+		YhjFree(json);
+		return;
+	}
+	if (*author && !YhProfileName(author))
+	{//Single unknown author: fetch inline (small + rare).
+		StrPrint(missing, "%s", author);
+		YhFetchProfiles(missing);
+	}
+	missing[0] = 0;
+	if (!StrCompare(table, "posts"))
+		YhPostRowAdd(ci, record, missing, sizeof(missing));
+	else
+		YhMsgRowAdd(ci, record, missing, sizeof(missing));
+	YhjFree(json);
+}
+

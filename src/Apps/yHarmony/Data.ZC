@@ -1,0 +1,187 @@
+
+#define YH_MAX_SERVERS	8
+#define YH_MAX_CHANS	32
+#define YH_MAX_LINES	200
+#define YH_TEXT_LEN		400
+#define YH_NAME_LEN		48
+#define YH_UUID_LEN		40
+#define YH_IN_MAX		400
+#define YH_HIST_MAX		8
+#define YH_MAX_PROFILES	128
+
+#define YH_CFG_PATH		"::/Home/YHARMONY.CFG"
+
+#define YH_ROW_H		(FONT_HEIGHT + 2)
+#define YH_CHAN_PANEL_W	170
+
+//Line kinds.
+#define YH_LK_MSG		0
+#define YH_LK_SELF		1
+#define YH_LK_STATUS	2
+#define YH_LK_ERROR		3
+#define YH_LK_SYSTEM	4
+#define YH_LK_REPLY		5	//Dim "replying to <nick>: snippet" line.
+#define YH_LK_IMG		6	//Inline image block; text = URL, img = cache idx.
+
+//Async image cache (avatars / server icons / embeds).
+#define YH_IMG_MAX		48
+#define YH_IMG_URL_LEN	240
+#define YH_EMBED_W		180
+#define YH_EMBED_H		120
+
+//The fediverse feed rides a pseudo-server index.
+#define YH_SRV_FEED		-2
+//Direct messages ride another pseudo-server; each DM conversation is a
+//pseudo-channel whose id is the conversation uuid.
+#define YH_SRV_DM		-3
+
+//App states.
+#define YH_ST_FORM		0
+#define YH_ST_CHAT		1
+
+//Realtime ring (single producer = WS task, single consumer = UI task).
+#define YH_RT_RING		64
+
+
+/***** data model *****/
+
+class CYhLine
+{
+	U8	kind, hh, mm;
+	U8	nick[YH_NAME_LEN];
+	U8	text[YH_TEXT_LEN];
+	U8	id[YH_UUID_LEN];	//Message/post uuid (reactions + reply lookups).
+	I16	av;					//Avatar image cache idx, -1 none.
+	I16	img;				//YH_LK_IMG: embed cache idx, -1 none.
+};
+
+class CYhImg
+{//One cached image. UI task enqueues (state 0->1), the loader task fetches,
+//decodes (PNG/JPG/GIF; webp = fail -> fallback chip) and scales, then flips
+//state to 2. dc lives on the UI task heap.
+	U8	 url[YH_IMG_URL_LEN];
+	CDC	*dc;
+	I64	 state;				//0 free, 1 queued, 2 ready, 3 failed.
+	I64	 maxw, maxh;
+};
+
+class CYhChan
+{
+	U8		 id[YH_UUID_LEN];
+	U8		 name[YH_NAME_LEN];
+	I64		 server;			//Index into servers[].
+	CYhLine	*lines;				//Ring of YH_MAX_LINES; NULL until first open.
+	I64		 count;
+	I64		 unread;
+	Bool	 loaded;			//History page fetched.
+	Bool	 is_dm;				//id is a conversation uuid, not a channel.
+	U8		 last_ts[40];		//Newest created_at seen (poll watermark).
+};
+
+class CYhServer
+{
+	U8	id[YH_UUID_LEN];
+	U8	name[YH_NAME_LEN];
+	Bool chans_loaded;
+	I64	 tab_x, tab_w;			//Draw pass fills for hit tests.
+	I16	 icon;					//Image cache idx, -1 none.
+};
+
+class CYhProfile
+{
+	U8	id[YH_UUID_LEN];
+	U8	name[YH_NAME_LEN];
+	I16	av;						//Avatar image cache idx, -1 none.
+};
+
+class CYhGlobals
+{
+	I64			 state;
+	Bool		 quit;
+	//Session.
+	U8			 jwt[2048], refresh[512], auth_uid[YH_UUID_LEN];
+	U8			 prof_id[YH_UUID_LEN], username[YH_NAME_LEN];
+	I64			 tok_deadline;	//jiffies when the JWT should be refreshed.
+	U8			 hdrs[3072];	//"apikey: ...\r\nAuthorization: Bearer ...\r\n"
+	//Data.
+	CYhServer	 servers[YH_MAX_SERVERS];
+	I64			 num_servers, cur_srv;
+	CYhChan		 chans[YH_MAX_CHANS];
+	I64			 num_chans, cur_chan;	//cur_chan: index or -1.
+	CYhProfile	 profiles[YH_MAX_PROFILES];
+	I64			 num_profiles;
+	//Image pipeline.
+	CYhImg		 imgs[YH_IMG_MAX];
+	I64			 img_count;
+	CTask		*img_task;
+	CTask		*ui_task;		//Owner of all image DCs.
+	I64			 feed_tab_x, feed_tab_w;
+	I64			 dm_tab_x, dm_tab_w;
+	//Realtime.
+	CWs			*ws;
+	Bool		 ws_ok;
+	I64			 ws_lock;		//Bit 0 = send lock (UI + heartbeat task).
+	I64			 ws_ref;
+	CTask		*ws_task, *hb_task;
+	U8			*rt_ring[YH_RT_RING];
+	I64			 rt_wr, rt_rd;
+	I64			 poll_deadline, reconnect_deadline;
+	//UI.
+	I64			 scroll;
+	U8			 input[YH_IN_MAX];
+	I64			 input_len;
+	U8			 hist[YH_HIST_MAX * YH_IN_MAX];
+	I64			 hist_count, hist_pos;
+	I64			 last_z;
+	//Login form. Only host/email/password are typed; the Supabase URL + anon
+	//key are auto-discovered from the instance's public /instance-info
+	//endpoint (federation backend) and cached in the config.
+	U8			 f_host[128];
+	U8			 f_url[128], f_anon[512], f_email[80], f_pass[80];
+	I64			 f_focus;
+	U8			 f_status[96];
+	Bool		 f_autoconn;
+	//Pens.
+	CColorROPU32 c_red, c_green;
+	CColorROPU32 c_nick[16];
+} yh;
+
+/***** config *****/
+
+U0 YhConfigSave()
+{
+	U8 *buf;
+
+	if (!DriveIsWritable)
+		return;
+	buf = MStrPrint(
+		"# yHarmony settings. host = your instance domain; url + anon are\n"
+		"# auto-discovered from https://host/instance-info and cached here.\n"
+		"host %s\n"
+		"url %s\n"
+		"anon %s\n"
+		"email %s\n"
+		"password %s\n"
+		"autoconnect %d\n",
+		yh.f_host, yh.f_url, yh.f_anon, yh.f_email, yh.f_pass,
+		yh.f_autoconn != 0);
+	FileWrite(YH_CFG_PATH, buf, StrLen(buf));
+	Free(buf);
+}
+
+U0 YhConfigLoad()
+{//Reuses the DE key=value parser (DE.ZC is compiled before apps launch).
+	I64	 size;
+	U8	*body = FileRead(YH_CFG_PATH, &size);
+
+	if (!body)
+		return;
+	DEConfigValStr(body, "host",     yh.f_host,  sizeof(yh.f_host));
+	DEConfigValStr(body, "url",      yh.f_url,   sizeof(yh.f_url));
+	DEConfigValStr(body, "anon",     yh.f_anon,  sizeof(yh.f_anon));
+	DEConfigValStr(body, "email",    yh.f_email, sizeof(yh.f_email));
+	DEConfigValStr(body, "password", yh.f_pass,  sizeof(yh.f_pass));
+	yh.f_autoconn = DEConfigValI64(body, "autoconnect", 0) != 0;
+	Free(body);
+}
+

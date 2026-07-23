@@ -1,0 +1,278 @@
+/***** tiny JSON parser (tree of CYhJson, own code - no lexer quirks) *****/
+
+#define YHJ_NULL	0
+#define YHJ_BOOL	1
+#define YHJ_NUM		2
+#define YHJ_STR		3
+#define YHJ_ARR		4
+#define YHJ_OBJ		5
+
+class CYhJson
+{
+	I64		 type;
+	U8		*key;		//Set when this node is an object member.
+	U8		*str;		//YHJ_STR value.
+	F64		 num;
+	Bool	 b;
+	CYhJson	*child;		//First child (ARR/OBJ).
+	CYhJson	*next;		//Next sibling.
+};
+
+U0 YhjFree(CYhJson *v)
+{
+	CYhJson *c, *n;
+
+	if (!v)
+		return;
+	c = v->child;
+	while (c)
+	{
+		n = c->next;
+		YhjFree(c);
+		c = n;
+	}
+	Free(v->key);
+	Free(v->str);
+	Free(v);
+}
+
+U8 *yhj_p;	//Parse cursor (single-threaded parse; UI task only).
+
+U0 YhjSkipWs()
+{
+	while (*yhj_p == ' ' || *yhj_p == '\t' || *yhj_p == '\r' || *yhj_p == '\n')
+		yhj_p++;
+}
+
+U8 *YhjString()
+{//Parse "..." at cursor; returns MAlloc'ed decoded string or NULL.
+	U8	*out;
+	I64	 cap = 64, n = 0, h, i, cp;
+
+	if (*yhj_p != '"')
+		return NULL;
+	yhj_p++;
+	out = MAlloc(cap);
+	while (*yhj_p && *yhj_p != '"')
+	{
+		if (n + 4 >= cap)
+		{
+			cap *= 2;
+			out = ReAlloc(out, cap);
+		}
+		if (*yhj_p == '\\')
+		{
+			yhj_p++;
+			switch (*yhj_p)
+			{
+				case 'n':	out[n++] = '\n';	break;
+				case 't':	out[n++] = ' ';		break;
+				case 'r':	break;
+				case 'b':	break;
+				case 'f':	break;
+				case 'u':	//\uXXXX -> ASCII if it fits, else '?'.
+					cp = 0;
+					for (i = 0; i < 4 && yhj_p[1]; i++)
+					{
+						yhj_p++;
+						h = *yhj_p;
+						if ('0' <= h <= '9')		cp = cp * 16 + h - '0';
+						else if ('a' <= h <= 'f')	cp = cp * 16 + h - 'a' + 10;
+						else if ('A' <= h <= 'F')	cp = cp * 16 + h - 'A' + 10;
+					}
+					if (32 <= cp < 0x7F)
+						out[n++] = cp;
+					else
+						out[n++] = '?';
+					break;
+				case 0:		break;
+				default:	out[n++] = *yhj_p;	//\" \\ \/ etc.
+			}
+			if (*yhj_p)
+				yhj_p++;
+		}
+		else
+		{
+			if (*yhj_p & 0x80)
+			{//UTF-8 lead byte: emit '?' once, skip continuations.
+				out[n++] = '?';
+				yhj_p++;
+				while ((*yhj_p & 0xC0) == 0x80)
+					yhj_p++;
+			}
+			else
+			{
+				if (*yhj_p >= 32)
+					out[n++] = *yhj_p;
+				yhj_p++;
+			}
+		}
+	}
+	if (*yhj_p == '"')
+		yhj_p++;
+	out[n] = 0;
+	return out;
+}
+
+CYhJson *YhjValue()
+{//Recursive descent from the cursor. NULL only on hard garbage.
+	CYhJson	*v = CAlloc(sizeof(CYhJson)), *c, *tail;
+	U8		*s;
+	F64		 f;
+	Bool	 neg;
+
+	YhjSkipWs;
+	switch (*yhj_p)
+	{
+		case '"':
+			v->type = YHJ_STR;
+			v->str = YhjString;
+			if (!v->str)
+				v->str = StrNew("");
+			return v;
+		case '{':
+			v->type = YHJ_OBJ;
+			yhj_p++;
+			tail = NULL;
+			YhjSkipWs;
+			while (*yhj_p && *yhj_p != '}')
+			{
+				YhjSkipWs;
+				s = YhjString;	//Key.
+				if (!s)
+					break;
+				YhjSkipWs;
+				if (*yhj_p == ':')
+					yhj_p++;
+				c = YhjValue;
+				if (!c)
+				{
+					Free(s);
+					break;
+				}
+				c->key = s;
+				if (tail)
+					tail->next = c;
+				else
+					v->child = c;
+				tail = c;
+				YhjSkipWs;
+				if (*yhj_p == ',')
+					yhj_p++;
+				YhjSkipWs;
+			}
+			if (*yhj_p == '}')
+				yhj_p++;
+			return v;
+		case '[':
+			v->type = YHJ_ARR;
+			yhj_p++;
+			tail = NULL;
+			YhjSkipWs;
+			while (*yhj_p && *yhj_p != ']')
+			{
+				c = YhjValue;
+				if (!c)
+					break;
+				if (tail)
+					tail->next = c;
+				else
+					v->child = c;
+				tail = c;
+				YhjSkipWs;
+				if (*yhj_p == ',')
+					yhj_p++;
+				YhjSkipWs;
+			}
+			if (*yhj_p == ']')
+				yhj_p++;
+			return v;
+		case 't':
+			v->type = YHJ_BOOL;
+			v->b = TRUE;
+			while ('a' <= *yhj_p <= 'z')
+				yhj_p++;
+			return v;
+		case 'f':
+			v->type = YHJ_BOOL;
+			v->b = FALSE;
+			while ('a' <= *yhj_p <= 'z')
+				yhj_p++;
+			return v;
+		case 'n':
+			v->type = YHJ_NULL;
+			while ('a' <= *yhj_p <= 'z')
+				yhj_p++;
+			return v;
+		case 0:
+			Free(v);
+			return NULL;
+		default:	//Number (or garbage byte: consume one to guarantee progress).
+			if (*yhj_p == '-' || '0' <= *yhj_p <= '9')
+			{
+				v->type = YHJ_NUM;
+				neg = FALSE;
+				if (*yhj_p == '-')
+				{
+					neg = TRUE;
+					yhj_p++;
+				}
+				f = 0;
+				while ('0' <= *yhj_p <= '9')
+					f = f * 10 + (*yhj_p++ - '0');
+				if (*yhj_p == '.')
+				{
+					yhj_p++;
+					while ('0' <= *yhj_p <= '9')
+						yhj_p++;	//Fraction ignored (ids/counts only).
+				}
+				if (*yhj_p == 'e' || *yhj_p == 'E')
+				{
+					yhj_p++;
+					if (*yhj_p == '+' || *yhj_p == '-')
+						yhj_p++;
+					while ('0' <= *yhj_p <= '9')
+						yhj_p++;
+				}
+				if (neg)
+					f = -f;
+				v->num = f;
+				return v;
+			}
+			yhj_p++;
+			Free(v);
+			return NULL;
+	}
+}
+
+CYhJson *YhjParse(U8 *text)
+{
+	if (!text)
+		return NULL;
+	yhj_p = text;
+	return YhjValue;
+}
+
+CYhJson *YhjGet(CYhJson *obj, U8 *key)
+{//Object member by key; NULL if absent.
+	CYhJson *c;
+
+	if (!obj || obj->type != YHJ_OBJ)
+		return NULL;
+	c = obj->child;
+	while (c)
+	{
+		if (c->key && !StrCompare(c->key, key))
+			return c;
+		c = c->next;
+	}
+	return NULL;
+}
+
+U8 *YhjStr(CYhJson *v, U8 *default="")
+{
+	if (v && v->type == YHJ_STR && v->str)
+		return v->str;
+	return default;
+}
+

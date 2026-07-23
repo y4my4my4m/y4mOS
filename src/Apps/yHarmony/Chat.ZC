@@ -1,0 +1,914 @@
+/***** buffers / log *****/
+
+CColorROPU32 YhNickPen(U8 *nick)
+{//Hash the name into the palette - standard modern IRC/Discord behavior.
+	I64 h = 0;
+
+	while (*nick)
+		h = h * 31 + *nick++;
+	return yh.c_nick[h & 15];
+}
+
+U0 YhAdd(I64 ci, I64 kind, U8 *nick, U8 *text, U8 hh=255, U8 mm=0)
+{//Append a line to a channel ring. hh=255 -> stamp with local time.
+	CYhChan		*ch;
+	CYhLine		*ln;
+	CDateStruct	 ds;
+	I64			 n;
+
+	if (ci < 0 || ci >= yh.num_chans)
+		return;
+	ch = &yh.chans[ci];
+	if (!ch->lines)
+		ch->lines = CAlloc(sizeof(CYhLine) * YH_MAX_LINES);
+	ln = &ch->lines[ch->count % YH_MAX_LINES];
+	if (hh == 255)
+	{
+		Date2Struct(&ds, Now);
+		ln->hh = ds.hour;
+		ln->mm = ds.min;
+	}
+	else
+	{
+		ln->hh = hh;
+		ln->mm = mm;
+	}
+	ln->kind = kind;
+	ln->nick[0] = 0;
+	ln->id[0] = 0;
+	ln->av = -1;
+	ln->img = -1;
+	if (nick)
+	{
+		n = MinI64(StrLen(nick), YH_NAME_LEN - 1);
+		MemCopy(ln->nick, nick, n);
+		ln->nick[n] = 0;
+	}
+	n = MinI64(StrLen(text), YH_TEXT_LEN - 1);
+	MemCopy(ln->text, text, n);
+	ln->text[n] = 0;
+	ch->count++;
+	if (ci != yh.cur_chan && kind != YH_LK_REPLY && kind != YH_LK_IMG)
+		ch->unread++;
+}
+
+CYhLine *YhLineLast(I64 ci)
+{//The line YhAdd just wrote (for patching id/av/img after the append).
+	CYhChan *ch = &yh.chans[ci];
+
+	if (!ch->lines || !ch->count)
+		return NULL;
+	return &ch->lines[(ch->count - 1) % YH_MAX_LINES];
+}
+
+CYhLine *YhLineById(I64 ci, U8 *id)
+{//Search the ring for a message id (reply-preview lookups).
+	CYhChan	*ch = &yh.chans[ci];
+	I64		 i, first;
+
+	if (!ch->lines || !*id)
+		return NULL;
+	first = MaxI64(0, ch->count - YH_MAX_LINES);
+	for (i = ch->count - 1; i >= first; i--)
+		if (!StrCompare(ch->lines[i % YH_MAX_LINES].id, id))
+			return &ch->lines[i % YH_MAX_LINES];
+	return NULL;
+}
+
+U0 YhStatus(U8 *text)
+{//Status line into the current channel (or form status when not in chat).
+	if (yh.state == YH_ST_CHAT && yh.cur_chan >= 0)
+		YhAdd(yh.cur_chan, YH_LK_STATUS, NULL, text);
+	else
+	{
+		MemCopy(yh.f_status, text, MinI64(StrLen(text), 95));
+		yh.f_status[MinI64(StrLen(text), 95)] = 0;
+	}
+}
+
+/***** profiles cache *****/
+
+I64 YhProfileFind(U8 *id)
+{
+	I64 i;
+
+	for (i = 0; i < yh.num_profiles; i++)
+		if (!StrCompare(yh.profiles[i].id, id))
+			return i;
+	return -1;
+}
+
+U8 *YhProfileName(U8 *id)
+{//NULL when unknown (caller batches a fetch).
+	I64 i = YhProfileFind(id);
+
+	if (i < 0)
+		return NULL;
+	return yh.profiles[i].name;
+}
+
+U0 YhProfileAdd(U8 *id, U8 *name, U8 *av_url=NULL)
+{
+	I64	 i = yh.num_profiles;
+	U8	 abs[YH_IMG_URL_LEN];
+
+	if (YhProfileFind(id) >= 0)
+		return;
+	if (i >= YH_MAX_PROFILES)
+		i = yh.num_profiles = 0;	//Wrap: cheap eviction.
+	MemCopy(yh.profiles[i].id, id, MinI64(StrLen(id), YH_UUID_LEN - 1));
+	yh.profiles[i].id[MinI64(StrLen(id), YH_UUID_LEN - 1)] = 0;
+	MemCopy(yh.profiles[i].name, name, MinI64(StrLen(name), YH_NAME_LEN - 1));
+	yh.profiles[i].name[MinI64(StrLen(name), YH_NAME_LEN - 1)] = 0;
+	yh.profiles[i].av = -1;
+	if (av_url && *av_url)
+	{
+		YhImgAbs(av_url, abs, sizeof(abs));
+		yh.profiles[i].av = YhImgGet(abs, 10, 10);
+	}
+	if (i == yh.num_profiles)
+		yh.num_profiles++;
+}
+
+/***** REST helpers *****/
+
+CYhJson *YhRest(U8 *method, U8 *path_fmt, U8 *body=NULL, ...)
+{//One PostgREST/GoTrue call. path_fmt is printed with argv, then prefixed
+//with the instance URL. Returns the parsed JSON tree (caller YhjFree's) or
+//NULL. Retries once through a token refresh on 401.
+	U8			  *path, *url;
+	CHttpResponse *resp;
+	CYhJson		  *json;
+	U8			   tmp[128];
+
+	path = StrPrintJoin(NULL, path_fmt, argc, argv);
+	url = MStrPrint("%s%s", yh.f_url, path);
+	Free(path);
+	resp = HttpReq(url, method, body, "application/json", yh.hdrs);
+	Free(url);
+	if (!resp)
+	{
+		YhStatus("Request failed (no response).");
+		return NULL;
+	}
+	if (resp->status == 401)
+	{
+		HttpResponseFree(resp);
+		YhStatus("401: session expired.");
+		return NULL;
+	}
+	if (resp->status < 200 || resp->status >= 300)
+	{
+		StrPrint(tmp, "HTTP %d from the instance.", resp->status);
+		YhStatus(tmp);
+		if (resp->body)
+			NetLog("yHarmony: %d body: %s", resp->status, resp->body);
+		HttpResponseFree(resp);
+		return NULL;
+	}
+	json = NULL;
+	if (resp->body && resp->body_length)
+		json = YhjParse(resp->body);
+	HttpResponseFree(resp);
+	return json;
+}
+
+U0 YhJsonEsc(U8 *dst, U8 *src, I64 max)
+{//Escape for embedding inside a JSON string literal.
+	I64 n = 0;
+
+	while (*src && n < max - 3)
+	{
+		if (*src == '"' || *src == '\\')
+		{
+			dst[n++] = '\\';
+			dst[n++] = *src;
+		}
+		else if (*src == '\n')
+		{
+			dst[n++] = '\\';
+			dst[n++] = 'n';
+		}
+		else if (*src >= 32)
+			dst[n++] = *src;
+		src++;
+	}
+	dst[n] = 0;
+}
+
+/***** content rendering *****/
+
+U0 YhContentToText(CYhJson *content, U8 *out, I64 max)
+{//Flatten Harmony's MessagePart[] into plain text.
+	CYhJson	*part, *f;
+	I64		 n = 0, len;
+	U8		*s;
+
+	out[0] = 0;
+	if (!content || content->type != YHJ_ARR)
+		return;
+	part = content->child;
+	while (part && n < max - 4)
+	{
+		s = NULL;
+		f = YhjGet(part, "text");
+		if (f)
+			s = YhjStr(f);
+		else
+		{
+			f = YhjGet(part, "username");
+			if (f)
+			{
+				out[n++] = '@';
+				s = YhjStr(f);
+			}
+			else if (YhjGet(part, "emoji"))
+			{//Custom emoji: render as :name:.
+				f = YhjGet(YhjGet(part, "emoji"), "name");
+				out[n++] = ':';
+				s = YhjStr(f, "emoji");
+				len = MinI64(StrLen(s), max - 3 - n);
+				MemCopy(out + n, s, len);
+				n += len;
+				out[n++] = ':';
+				s = NULL;
+			}
+			else if (!StrCompare(YhjStr(YhjGet(part, "type")), "hashtag"))
+			{
+				out[n++] = '#';
+				s = YhjStr(YhjGet(part, "name"));
+			}
+			else
+			{
+				f = YhjGet(part, "url");
+				if (f)
+					s = YhjStr(f);
+				else
+				{
+					f = YhjGet(part, "name");	//File-ish parts.
+					if (f)
+						s = YhjStr(f);
+				}
+			}
+		}
+		if (s)
+		{
+			len = MinI64(StrLen(s), max - 1 - n);
+			MemCopy(out + n, s, len);
+			n += len;
+		}
+		if (part->next && n < max - 2)
+			out[n++] = ' ';
+		part = part->next;
+	}
+	out[n] = 0;
+}
+
+Bool YhUrlIsImage(U8 *url)
+{//Cheap extension sniff, query strings tolerated. (Only ToUpper exists.)
+	U8	up[YH_IMG_URL_LEN];
+	I64	i = 0;
+
+	while (url[i] && i < YH_IMG_URL_LEN - 1)
+	{
+		up[i] = ToUpper(url[i]);
+		i++;
+	}
+	up[i] = 0;
+	return StrFind(".PNG", up) || StrFind(".JPG", up) ||
+		   StrFind(".JPEG", up) || StrFind(".GIF", up);
+}
+
+U0 YhEmbedParts(I64 ci, CYhJson *content)
+{//Emit YH_LK_IMG lines for image file parts / image URLs in a message.
+	CYhJson	*part, *f;
+	CYhLine	*ln;
+	U8		*url, abs[YH_IMG_URL_LEN];
+
+	if (!content || content->type != YHJ_ARR)
+		return;
+	part = content->child;
+	while (part)
+	{
+		url = NULL;
+		f = YhjGet(part, "url");
+		if (f && *YhjStr(f))
+		{
+			if (!StrCompare(YhjStr(YhjGet(part, "type")), "file"))
+			{//FileContent: trust fileType.
+				if (!StrNCompare(YhjStr(YhjGet(part, "fileType")), "image", 5))
+					url = YhjStr(f);
+			}
+			else if (YhUrlIsImage(YhjStr(f)))
+				url = YhjStr(f);
+		}
+		if (url)
+		{
+			YhImgAbs(url, abs, sizeof(abs));
+			YhAdd(ci, YH_LK_IMG, NULL, abs);
+			ln = YhLineLast(ci);
+			if (ln)
+				ln->img = YhImgGet(abs, YH_EMBED_W, YH_EMBED_H);
+		}
+		part = part->next;
+	}
+}
+
+/***** messages *****/
+
+U0 YhTsEnc(U8 *dst, U8 *src)
+{//URL-encode a timestamp for a query param: '+' -> %2B (else it decodes as a
+//space server-side). Passed to YhRest as a %s ARG so the '%' never hits the
+//format parser.
+	while (*src)
+	{
+		if (*src == '+')
+		{
+			*dst++ = '%';
+			*dst++ = '2';
+			*dst++ = 'B';
+			src++;
+		}
+		else
+			*dst++ = *src++;
+	}
+	*dst = 0;
+}
+
+U0 YhMsgTime(U8 *created_at, U8 *hh, U8 *mm)
+{//"2026-07-23T18:19:23..." -> 18,19. UTC (no tz conversion).
+	*hh = 0;
+	*mm = 0;
+	if (StrLen(created_at) >= 16)
+	{
+		*hh = (created_at[11] - '0') * 10 + created_at[12] - '0';
+		*mm = (created_at[14] - '0') * 10 + created_at[15] - '0';
+	}
+}
+
+U0 YhFetchProfiles(U8 *idlist)
+{//idlist = "uuid,uuid,...". Fills the cache.
+	CYhJson	*json, *row;
+
+	if (!*idlist)
+		return;
+	json = YhRest("GET",
+		"/rest/v1/profiles?id=in.(%s)&select=id,username,display_name,avatar_url",
+		NULL, idlist);
+	if (!json)
+		return;
+	row = json->child;
+	while (row)
+	{
+		if (YhjGet(row, "id"))
+		{
+			if (YhjGet(row, "username") && *YhjStr(YhjGet(row, "username")))
+				YhProfileAdd(YhjStr(YhjGet(row, "id")), YhjStr(YhjGet(row, "username")),
+							 YhjStr(YhjGet(row, "avatar_url")));
+			else
+				YhProfileAdd(YhjStr(YhjGet(row, "id")), YhjStr(YhjGet(row, "display_name"), "user"),
+							 YhjStr(YhjGet(row, "avatar_url")));
+		}
+		row = row->next;
+	}
+	YhjFree(json);
+}
+
+U0 YhMsgRowAdd(I64 ci, CYhJson *row, U8 *missing, I64 missing_max)
+{//One PostgREST message row -> channel line(s). Unknown authors are appended
+//to the comma-separated `missing` id list for a later batch profile fetch.
+//Also emits the reply-preview line and any inline image embeds.
+	U8		 text[YH_TEXT_LEN], snip[100], hh, mm;
+	U8		*uid, *name, *created, *rid, *mid;
+	I64		 kind, pidx;
+	CYhChan	*ch = &yh.chans[ci];
+	CYhLine	*ln, *target;
+
+	YhContentToText(YhjGet(row, "content"), text, YH_TEXT_LEN);
+	created = YhjStr(YhjGet(row, "created_at"));
+	YhMsgTime(created, &hh, &mm);
+	uid = YhjStr(YhjGet(row, "user_id"));
+	mid = YhjStr(YhjGet(row, "id"));
+	name = NULL;
+	if (*uid)
+		name = YhProfileName(uid);
+	if (!name)
+	{
+		if (*uid)
+		{
+			if (*missing)
+				CatPrint(missing, ",");
+			if (StrLen(missing) + StrLen(uid) < missing_max - 2)
+				CatPrint(missing, "%s", uid);
+			name = "...";	//Redrawn correctly on the next page load; poll fills cache first.
+		}
+		else
+			name = "bot";
+	}
+
+	//Reply preview: dim quote line above the message (webapp-style).
+	rid = YhjStr(YhjGet(row, "reply_to"));
+	if (*rid)
+	{
+		target = YhLineById(ci, rid);
+		if (target)
+		{
+			MemCopy(snip, target->text, MinI64(StrLen(target->text), 60));
+			snip[MinI64(StrLen(target->text), 60)] = 0;
+			YhAdd(ci, YH_LK_REPLY, target->nick, snip, hh, mm);
+		}
+		else
+			YhAdd(ci, YH_LK_REPLY, "", "(earlier message)", hh, mm);
+	}
+
+	kind = YH_LK_MSG;
+	if (YhjGet(row, "is_system") && YhjGet(row, "is_system")->b)
+		kind = YH_LK_SYSTEM;
+	else if (!StrCompare(uid, yh.prof_id))
+		kind = YH_LK_SELF;
+	YhAdd(ci, kind, name, text, hh, mm);
+	ln = YhLineLast(ci);
+	if (ln)
+	{
+		MemCopy(ln->id, mid, MinI64(StrLen(mid), YH_UUID_LEN - 1));
+		ln->id[MinI64(StrLen(mid), YH_UUID_LEN - 1)] = 0;
+		pidx = YhProfileFind(uid);
+		if (pidx >= 0)
+			ln->av = yh.profiles[pidx].av;
+	}
+
+	YhEmbedParts(ci, YhjGet(row, "content"));
+
+	if (StrCompare(created, ch->last_ts) > 0)
+	{
+		MemCopy(ch->last_ts, created, MinI64(StrLen(created), 39));
+		ch->last_ts[MinI64(StrLen(created), 39)] = 0;
+	}
+}
+
+U0 YhFetchReactions(I64 ci)
+{//Batch-load reactions for the lines in the ring and append " {name xN}"
+//chips to each message's text. Display-only (adding needs a picker - later).
+	CYhChan	*ch = &yh.chans[ci];
+	CYhLine	*ln;
+	CYhJson	*json, *ej, *row;
+	U8		 ids[1700], eids[1300];
+	U8		 enames[32][32], eid_list[32][YH_UUID_LEN];
+	I64		 n_emoji = 0;
+	U8		*mid, *eid, *nm;
+	I64		 i, j, k, first, cnt;
+	U8		 chip[48];
+
+	if (!ch->lines)
+		return;
+	ids[0] = 0;
+	first = MaxI64(0, ch->count - YH_MAX_LINES);
+	for (i = first; i < ch->count; i++)
+	{
+		ln = &ch->lines[i % YH_MAX_LINES];
+		if (ln->id[0] && StrLen(ids) + 40 < sizeof(ids))
+		{
+			if (*ids)
+				CatPrint(ids, ",");
+			CatPrint(ids, "%s", ln->id);
+		}
+	}
+	if (!*ids)
+		return;
+
+	json = YhRest("GET",
+		"/rest/v1/reactions?message_id=in.(%s)&select=message_id,emoji_id",
+		NULL, ids);
+	if (!json)
+		return;
+	if (!json->child)
+	{
+		YhjFree(json);
+		return;
+	}
+
+	//Distinct emoji ids -> names.
+	eids[0] = 0;
+	row = json->child;
+	while (row)
+	{
+		eid = YhjStr(YhjGet(row, "emoji_id"));
+		if (*eid)
+		{
+			k = -1;
+			for (j = 0; j < n_emoji; j++)
+				if (!StrCompare(eid_list[j], eid))
+					k = j;
+			if (k < 0 && n_emoji < 32)
+			{
+				StrCopy(eid_list[n_emoji], eid);
+				StrCopy(enames[n_emoji], "?");
+				n_emoji++;
+				if (StrLen(eids) + 40 < sizeof(eids))
+				{
+					if (*eids)
+						CatPrint(eids, ",");
+					CatPrint(eids, "%s", eid);
+				}
+			}
+		}
+		row = row->next;
+	}
+	if (*eids)
+	{
+		ej = YhRest("GET", "/rest/v1/emojis?id=in.(%s)&select=id,name",
+					NULL, eids);
+		if (ej)
+		{
+			row = ej->child;
+			while (row)
+			{
+				eid = YhjStr(YhjGet(row, "id"));
+				nm = YhjStr(YhjGet(row, "name"), "?");
+				for (j = 0; j < n_emoji; j++)
+					if (!StrCompare(eid_list[j], eid))
+					{
+						MemCopy(enames[j], nm, MinI64(StrLen(nm), 31));
+						enames[j][MinI64(StrLen(nm), 31)] = 0;
+					}
+				row = row->next;
+			}
+			YhjFree(ej);
+		}
+	}
+
+	//Per message line: per-emoji counts appended once.
+	for (i = first; i < ch->count; i++)
+	{
+		ln = &ch->lines[i % YH_MAX_LINES];
+		if (ln->id[0] && (ln->kind == YH_LK_MSG || ln->kind == YH_LK_SELF))
+		{
+			for (j = 0; j < n_emoji; j++)
+			{
+				cnt = 0;
+				row = json->child;
+				while (row)
+				{
+					mid = YhjStr(YhjGet(row, "message_id"));
+					eid = YhjStr(YhjGet(row, "emoji_id"));
+					if (!StrCompare(mid, ln->id) && !StrCompare(eid, eid_list[j]))
+						cnt++;
+					row = row->next;
+				}
+				if (cnt)
+				{
+					if (cnt > 1)
+						StrPrint(chip, " {%s x%d}", enames[j], cnt);
+					else
+						StrPrint(chip, " {%s}", enames[j]);
+					if (StrLen(ln->text) + StrLen(chip) < YH_TEXT_LEN - 1)
+						CatPrint(ln->text, "%s", chip);
+				}
+			}
+		}
+	}
+	YhjFree(json);
+}
+
+U0 YhFetchMessages(I64 ci, Bool initial)
+{//initial: last 40, else only rows newer than the watermark.
+	CYhJson	*json, *row, *rows[64];
+	CYhChan	*ch = &yh.chans[ci];
+	I64		 n, i;
+	U8		 missing[1600], enc_ts[56];
+	U8		*col;
+
+	//DM conversations filter on conversation_id instead of channel_id.
+	if (ch->is_dm)
+		col = "conversation_id";
+	else
+		col = "channel_id";
+	if (initial)
+		json = YhRest("GET",
+			"/rest/v1/messages?%s=eq.%s&thread_id=is.null"
+			"&is_deleted=not.is.true&order=created_at.desc&limit=40"
+			"&select=id,created_at,user_id,content,is_system,reply_to",
+			NULL, col, ch->id);
+	else
+	{
+		YhTsEnc(enc_ts, ch->last_ts);
+		json = YhRest("GET",
+			"/rest/v1/messages?%s=eq.%s&thread_id=is.null"
+			"&is_deleted=not.is.true&created_at=gt.%s&order=created_at.asc&limit=40"
+			"&select=id,created_at,user_id,content,is_system,reply_to",
+			NULL, col, ch->id, enc_ts);
+	}
+	if (!json)
+		return;
+
+	//Pass 1: batch-resolve unknown authors so names render on first paint.
+	missing[0] = 0;
+	row = json->child;
+	while (row)
+	{
+		if (YhjGet(row, "user_id"))
+		{
+			if (*YhjStr(YhjGet(row, "user_id")) &&
+				!YhProfileName(YhjStr(YhjGet(row, "user_id"))))
+			{
+				if (*missing)
+					CatPrint(missing, ",");
+				if (StrLen(missing) + 40 < sizeof(missing))
+					CatPrint(missing, "%s", YhjStr(YhjGet(row, "user_id")));
+			}
+		}
+		row = row->next;
+	}
+	YhFetchProfiles(missing);
+	missing[0] = 0;
+
+	if (initial)
+	{//Rows arrive newest-first; append oldest-first.
+		n = 0;
+		row = json->child;
+		while (row && n < 64)
+		{
+			rows[n++] = row;
+			row = row->next;
+		}
+		for (i = n - 1; i >= 0; i--)
+			YhMsgRowAdd(ci, rows[i], missing, sizeof(missing));
+		ch->loaded = TRUE;
+	}
+	else
+	{
+		row = json->child;
+		while (row)
+		{
+			YhMsgRowAdd(ci, row, missing, sizeof(missing));
+			row = row->next;
+		}
+	}
+	YhjFree(json);
+	if (initial)
+		YhFetchReactions(ci);
+}
+
+U0 YhSendMessage(U8 *text)
+{
+	U8		 esc[YH_TEXT_LEN * 2];
+	U8		*body;
+	CYhJson	*json;
+
+	U8		*col;
+
+	if (yh.cur_chan < 0)
+		return;
+	if (yh.chans[yh.cur_chan].is_dm)
+		col = "conversation_id";
+	else
+		col = "channel_id";
+	YhJsonEsc(esc, text, sizeof(esc));
+	body = MStrPrint(
+		"{\"user_id\":\"%s\",\"%s\":\"%s\","
+		"\"content\":[{\"type\":\"text\",\"text\":\"%s\"}],"
+		"\"metadata\":{\"created_via\":\"yharmony_zealos\"}}",
+		yh.prof_id, col, yh.chans[yh.cur_chan].id, esc);
+	json = YhRest("POST", "/rest/v1/messages", body);
+	Free(body);
+	if (json)
+	{//Prefer: return=representation gives the row back: echo it and bump the
+	 //watermark so realtime/poll won't show it twice.
+		if (json->child)
+			YhMsgRowAdd(yh.cur_chan, json->child, esc, sizeof(esc));
+		YhjFree(json);
+	}
+	else
+		YhStatus("Send failed.");
+}
+
+/***** servers + channels *****/
+
+U0 YhFetchChannels(I64 si)
+{
+	CYhJson	*json, *row;
+	CYhChan	*ch;
+	U8		*nm;
+
+	json = YhRest("GET",
+		"/rest/v1/channels?server_id=eq.%s&type=eq.0&order=order.asc"
+		"&select=id,name",
+		NULL, yh.servers[si].id);
+	if (!json)
+		return;
+	row = json->child;
+	while (row && yh.num_chans < YH_MAX_CHANS)
+	{
+		ch = &yh.chans[yh.num_chans];
+		MemSet(ch, 0, sizeof(CYhChan));
+		MemCopy(ch->id, YhjStr(YhjGet(row, "id")), YH_UUID_LEN - 1);
+		nm = YhjStr(YhjGet(row, "name"), "channel");
+		MemCopy(ch->name, nm, MinI64(StrLen(nm), YH_NAME_LEN - 1));
+		ch->server = si;
+		StrCopy(ch->last_ts, "1970-01-01T00:00:00");
+		yh.num_chans++;
+		row = row->next;
+	}
+	YhjFree(json);
+	yh.servers[si].chans_loaded = TRUE;
+}
+
+I64 YhFirstChan(I64 si)
+{
+	I64 i;
+
+	for (i = 0; i < yh.num_chans; i++)
+		if (yh.chans[i].server == si)
+			return i;
+	return -1;
+}
+
+U0 YhSwitchChan(I64 ci)
+{
+	if (ci < 0 || ci >= yh.num_chans)
+		return;
+	yh.cur_chan = ci;
+	yh.cur_srv = yh.chans[ci].server;
+	yh.chans[ci].unread = 0;
+	yh.scroll = 0;
+	if (!yh.chans[ci].loaded && yh.chans[ci].server != YH_SRV_FEED)
+		YhFetchMessages(ci, TRUE);
+	//Feed initial load happens in YhNetPump (YhFetchFeed is defined later;
+	//single-pass compiler).
+}
+
+U0 YhSwitchServer(I64 si)
+{
+	I64 ci;
+
+	if (si < 0 || si >= yh.num_servers)
+		return;
+	yh.cur_srv = si;
+	if (!yh.servers[si].chans_loaded)
+		YhFetchChannels(si);
+	ci = YhFirstChan(si);
+	if (ci >= 0 && (yh.cur_chan < 0 || yh.chans[yh.cur_chan].server != si))
+		YhSwitchChan(ci);
+}
+
+U0 YhFetchServers()
+{
+	CYhJson		*json, *row;
+	CYhServer	*sv;
+	U8			 ids[YH_MAX_SERVERS * 40 + 8], abs[YH_IMG_URL_LEN];
+	U8			*nm;
+
+	//Membership first, then names in one batch.
+	json = YhRest("GET",
+		"/rest/v1/user_servers?user_id=eq.%s&status=eq.accepted&select=server_id",
+		NULL, yh.prof_id);
+	if (!json)
+		return;
+	ids[0] = 0;
+	row = json->child;
+	while (row && yh.num_servers < YH_MAX_SERVERS)
+	{
+		if (YhjGet(row, "server_id"))
+		{
+			if (*ids)
+				CatPrint(ids, ",");
+			CatPrint(ids, "%s", YhjStr(YhjGet(row, "server_id")));
+			yh.num_servers++;	//Reserve; names fill below.
+		}
+		row = row->next;
+	}
+	YhjFree(json);
+	yh.num_servers = 0;
+	if (!*ids)
+	{
+		YhStatus("No servers joined on this account.");
+		return;
+	}
+
+	json = YhRest("GET", "/rest/v1/servers?id=in.(%s)&select=id,name,icon", NULL, ids);
+	if (!json)
+		return;
+	row = json->child;
+	while (row && yh.num_servers < YH_MAX_SERVERS)
+	{
+		sv = &yh.servers[yh.num_servers];
+		MemSet(sv, 0, sizeof(CYhServer));
+		MemCopy(sv->id, YhjStr(YhjGet(row, "id")), YH_UUID_LEN - 1);
+		nm = YhjStr(YhjGet(row, "name"), "server");
+		MemCopy(sv->name, nm, MinI64(StrLen(nm), YH_NAME_LEN - 1));
+		sv->icon = -1;
+		if (*YhjStr(YhjGet(row, "icon")))
+		{
+			YhImgAbs(YhjStr(YhjGet(row, "icon")), abs, sizeof(abs));
+			sv->icon = YhImgGet(abs, 16, 16);
+		}
+		yh.num_servers++;
+		row = row->next;
+	}
+	YhjFree(json);
+}
+
+
+U0 YhFetchDMs()
+{//DM conversations -> pseudo-channels on YH_SRV_DM. Channel name = the other
+//participant's username (group DMs show the first other member + count).
+	CYhJson	*json, *row;
+	CYhChan	*ch;
+	U8		 convo_ids[12 * 40 + 8], missing[1600];
+	U8		 my_convos[12][YH_UUID_LEN];
+	U8		 other[12][YH_UUID_LEN];
+	I64		 extra[12];
+	I64		 n_convo = 0, i, k;
+	U8		*cid, *uid, *nm;
+
+	//My open conversations.
+	json = YhRest("GET",
+		"/rest/v1/conversation_participants?user_id=eq.%s&left_at=is.null"
+		"&select=conversation_id",
+		NULL, yh.prof_id);
+	if (!json)
+		return;
+	convo_ids[0] = 0;
+	row = json->child;
+	while (row && n_convo < 12)
+	{
+		cid = YhjStr(YhjGet(row, "conversation_id"));
+		if (*cid)
+		{
+			StrCopy(my_convos[n_convo], cid);
+			other[n_convo][0] = 0;
+			extra[n_convo] = 0;
+			n_convo++;
+			if (*convo_ids)
+				CatPrint(convo_ids, ",");
+			CatPrint(convo_ids, "%s", cid);
+		}
+		row = row->next;
+	}
+	YhjFree(json);
+	if (!n_convo)
+		return;
+
+	//All participants of those conversations: pick the other side(s).
+	json = YhRest("GET",
+		"/rest/v1/conversation_participants?conversation_id=in.(%s)"
+		"&left_at=is.null&select=conversation_id,user_id",
+		NULL, convo_ids);
+	if (!json)
+		return;
+	missing[0] = 0;
+	row = json->child;
+	while (row)
+	{
+		cid = YhjStr(YhjGet(row, "conversation_id"));
+		uid = YhjStr(YhjGet(row, "user_id"));
+		if (*cid && *uid && StrCompare(uid, yh.prof_id))
+		{
+			for (i = 0; i < n_convo; i++)
+				if (!StrCompare(my_convos[i], cid))
+				{
+					if (!other[i][0])
+						StrCopy(other[i], uid);
+					else
+						extra[i]++;	//Group DM: count additional members.
+				}
+			if (!YhProfileName(uid) && StrLen(missing) + 40 < sizeof(missing))
+			{
+				if (*missing)
+					CatPrint(missing, ",");
+				CatPrint(missing, "%s", uid);
+			}
+		}
+		row = row->next;
+	}
+	YhjFree(json);
+	YhFetchProfiles(missing);
+
+	//Create the pseudo-channels (skip ones we already have).
+	for (i = 0; i < n_convo; i++)
+	{
+		for (k = 0; k < yh.num_chans; k++)
+			if (!StrCompare(yh.chans[k].id, my_convos[i]))
+				break;
+		if (k >= yh.num_chans && yh.num_chans < YH_MAX_CHANS)
+		{
+			ch = &yh.chans[yh.num_chans];
+			MemSet(ch, 0, sizeof(CYhChan));
+			StrCopy(ch->id, my_convos[i]);
+			ch->server = YH_SRV_DM;
+			ch->is_dm = TRUE;
+			StrCopy(ch->last_ts, "1970-01-01T00:00:00");
+			nm = NULL;
+			if (other[i][0])
+				nm = YhProfileName(other[i]);
+			if (!nm)
+				nm = "dm";
+			if (extra[i])
+				StrPrint(ch->name, "%s+%d", nm, extra[i]);
+			else
+				StrPrint(ch->name, "%s", nm);
+			ch->name[YH_NAME_LEN - 1] = 0;
+			yh.num_chans++;
+		}
+	}
+}
