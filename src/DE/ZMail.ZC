@@ -345,14 +345,14 @@ U0 ZMailDecodeWord(U8 *dst, I64 dstmax, U8 *src)
 
 U0 ZMailClipSet(U8 *s)
 {//Copy text to the OS clipboard so Ctrl+V pastes it anywhere (browser, editor).
-//Dollars are doubled: DocPrint treats a bare '$' as a DolDoc command.
+//Dollars are doubled: DocPrint treats a bare dollar as a DolDoc command.
 	U8	*esc = MAlloc(StrLen(s) * 2 + 1);
 	U8	*d = esc;
 
 	while (*s)
 	{
-		if (*s == '$')
-			*d++ = '$';
+		if (*s == 0x24)
+			*d++ = 0x24;
 		*d++ = *s++;
 	}
 	*d = 0;
