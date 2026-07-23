@@ -1,0 +1,1976 @@
+//yHarmony - native client for Harmony (Discord-style federated chat
+//https://github.com/y4my4my4m/harmony). Talks straight to the instance's Supabase APIs - GoTrue auth,
+//PostgREST for data, Phoenix realtime over the native WebSocket - so the
+//Harmony backend needs zero changes.
+//
+//Needs the net stack (BrowserBoot: TCP/TLS/HTTP/WS) and the DE theme.
+//Launched from the YDE menu via ExeFile("::/DE/yHarmony").
+//
+//UI: login form -> chat. Server tabs on top, channel panel on the left,
+//wheel/<PGUP>/<PGDN> scroll, <UP>/<DOWN> input history, <ESC> quits.
+//Realtime: WebSocket postgres_changes subscription; falls back to polling
+//when the socket dies. Settings persist to ::/Home/YHARMONY.CFG (hand-edit
+//it - pasting the anon key there beats typing it in the form).
+
+#define YH_MAX_SERVERS	8
+#define YH_MAX_CHANS	32
+#define YH_MAX_LINES	200
+#define YH_TEXT_LEN		400
+#define YH_NAME_LEN		48
+#define YH_UUID_LEN		40
+#define YH_IN_MAX		400
+#define YH_HIST_MAX		8
+#define YH_MAX_PROFILES	128
+
+#define YH_CFG_PATH		"::/Home/YHARMONY.CFG"
+
+#define YH_ROW_H		(FONT_HEIGHT + 2)
+#define YH_CHAN_PANEL_W	170
+
+//Line kinds.
+#define YH_LK_MSG		0
+#define YH_LK_SELF		1
+#define YH_LK_STATUS	2
+#define YH_LK_ERROR		3
+#define YH_LK_SYSTEM	4
+
+//App states.
+#define YH_ST_FORM		0
+#define YH_ST_CHAT		1
+
+//Realtime ring (single producer = WS task, single consumer = UI task).
+#define YH_RT_RING		64
+
+/***** tiny JSON parser (tree of CYhJson, own code - no lexer quirks) *****/
+
+#define YHJ_NULL	0
+#define YHJ_BOOL	1
+#define YHJ_NUM		2
+#define YHJ_STR		3
+#define YHJ_ARR		4
+#define YHJ_OBJ		5
+
+class CYhJson
+{
+	I64		 type;
+	U8		*key;		//Set when this node is an object member.
+	U8		*str;		//YHJ_STR value.
+	F64		 num;
+	Bool	 b;
+	CYhJson	*child;		//First child (ARR/OBJ).
+	CYhJson	*next;		//Next sibling.
+};
+
+U0 YhjFree(CYhJson *v)
+{
+	CYhJson *c, *n;
+
+	if (!v)
+		return;
+	c = v->child;
+	while (c)
+	{
+		n = c->next;
+		YhjFree(c);
+		c = n;
+	}
+	Free(v->key);
+	Free(v->str);
+	Free(v);
+}
+
+U8 *yhj_p;	//Parse cursor (single-threaded parse; UI task only).
+
+U0 YhjSkipWs()
+{
+	while (*yhj_p == ' ' || *yhj_p == '\t' || *yhj_p == '\r' || *yhj_p == '\n')
+		yhj_p++;
+}
+
+U8 *YhjString()
+{//Parse "..." at cursor; returns MAlloc'ed decoded string or NULL.
+	U8	*out;
+	I64	 cap = 64, n = 0, h, i, cp;
+
+	if (*yhj_p != '"')
+		return NULL;
+	yhj_p++;
+	out = MAlloc(cap);
+	while (*yhj_p && *yhj_p != '"')
+	{
+		if (n + 4 >= cap)
+		{
+			cap *= 2;
+			out = ReAlloc(out, cap);
+		}
+		if (*yhj_p == '\\')
+		{
+			yhj_p++;
+			switch (*yhj_p)
+			{
+				case 'n':	out[n++] = '\n';	break;
+				case 't':	out[n++] = ' ';		break;
+				case 'r':	break;
+				case 'b':	break;
+				case 'f':	break;
+				case 'u':	//\uXXXX -> ASCII if it fits, else '?'.
+					cp = 0;
+					for (i = 0; i < 4 && yhj_p[1]; i++)
+					{
+						yhj_p++;
+						h = *yhj_p;
+						if ('0' <= h <= '9')		cp = cp * 16 + h - '0';
+						else if ('a' <= h <= 'f')	cp = cp * 16 + h - 'a' + 10;
+						else if ('A' <= h <= 'F')	cp = cp * 16 + h - 'A' + 10;
+					}
+					if (32 <= cp < 0x7F)
+						out[n++] = cp;
+					else
+						out[n++] = '?';
+					break;
+				case 0:		break;
+				default:	out[n++] = *yhj_p;	//\" \\ \/ etc.
+			}
+			if (*yhj_p)
+				yhj_p++;
+		}
+		else
+		{
+			if (*yhj_p & 0x80)
+			{//UTF-8 lead byte: emit '?' once, skip continuations.
+				out[n++] = '?';
+				yhj_p++;
+				while ((*yhj_p & 0xC0) == 0x80)
+					yhj_p++;
+			}
+			else
+			{
+				if (*yhj_p >= 32)
+					out[n++] = *yhj_p;
+				yhj_p++;
+			}
+		}
+	}
+	if (*yhj_p == '"')
+		yhj_p++;
+	out[n] = 0;
+	return out;
+}
+
+CYhJson *YhjValue()
+{//Recursive descent from the cursor. NULL only on hard garbage.
+	CYhJson	*v = CAlloc(sizeof(CYhJson)), *c, *tail;
+	U8		*s;
+	F64		 f;
+	Bool	 neg;
+
+	YhjSkipWs;
+	switch (*yhj_p)
+	{
+		case '"':
+			v->type = YHJ_STR;
+			v->str = YhjString;
+			if (!v->str)
+				v->str = StrNew("");
+			return v;
+		case '{':
+			v->type = YHJ_OBJ;
+			yhj_p++;
+			tail = NULL;
+			YhjSkipWs;
+			while (*yhj_p && *yhj_p != '}')
+			{
+				YhjSkipWs;
+				s = YhjString;	//Key.
+				if (!s)
+					break;
+				YhjSkipWs;
+				if (*yhj_p == ':')
+					yhj_p++;
+				c = YhjValue;
+				if (!c)
+				{
+					Free(s);
+					break;
+				}
+				c->key = s;
+				if (tail)
+					tail->next = c;
+				else
+					v->child = c;
+				tail = c;
+				YhjSkipWs;
+				if (*yhj_p == ',')
+					yhj_p++;
+				YhjSkipWs;
+			}
+			if (*yhj_p == '}')
+				yhj_p++;
+			return v;
+		case '[':
+			v->type = YHJ_ARR;
+			yhj_p++;
+			tail = NULL;
+			YhjSkipWs;
+			while (*yhj_p && *yhj_p != ']')
+			{
+				c = YhjValue;
+				if (!c)
+					break;
+				if (tail)
+					tail->next = c;
+				else
+					v->child = c;
+				tail = c;
+				YhjSkipWs;
+				if (*yhj_p == ',')
+					yhj_p++;
+				YhjSkipWs;
+			}
+			if (*yhj_p == ']')
+				yhj_p++;
+			return v;
+		case 't':
+			v->type = YHJ_BOOL;
+			v->b = TRUE;
+			while ('a' <= *yhj_p <= 'z')
+				yhj_p++;
+			return v;
+		case 'f':
+			v->type = YHJ_BOOL;
+			v->b = FALSE;
+			while ('a' <= *yhj_p <= 'z')
+				yhj_p++;
+			return v;
+		case 'n':
+			v->type = YHJ_NULL;
+			while ('a' <= *yhj_p <= 'z')
+				yhj_p++;
+			return v;
+		case 0:
+			Free(v);
+			return NULL;
+		default:	//Number (or garbage byte: consume one to guarantee progress).
+			if (*yhj_p == '-' || '0' <= *yhj_p <= '9')
+			{
+				v->type = YHJ_NUM;
+				neg = FALSE;
+				if (*yhj_p == '-')
+				{
+					neg = TRUE;
+					yhj_p++;
+				}
+				f = 0;
+				while ('0' <= *yhj_p <= '9')
+					f = f * 10 + (*yhj_p++ - '0');
+				if (*yhj_p == '.')
+				{
+					yhj_p++;
+					while ('0' <= *yhj_p <= '9')
+						yhj_p++;	//Fraction ignored (ids/counts only).
+				}
+				if (*yhj_p == 'e' || *yhj_p == 'E')
+				{
+					yhj_p++;
+					if (*yhj_p == '+' || *yhj_p == '-')
+						yhj_p++;
+					while ('0' <= *yhj_p <= '9')
+						yhj_p++;
+				}
+				if (neg)
+					f = -f;
+				v->num = f;
+				return v;
+			}
+			yhj_p++;
+			Free(v);
+			return NULL;
+	}
+}
+
+CYhJson *YhjParse(U8 *text)
+{
+	if (!text)
+		return NULL;
+	yhj_p = text;
+	return YhjValue;
+}
+
+CYhJson *YhjGet(CYhJson *obj, U8 *key)
+{//Object member by key; NULL if absent.
+	CYhJson *c;
+
+	if (!obj || obj->type != YHJ_OBJ)
+		return NULL;
+	c = obj->child;
+	while (c)
+	{
+		if (c->key && !StrCompare(c->key, key))
+			return c;
+		c = c->next;
+	}
+	return NULL;
+}
+
+U8 *YhjStr(CYhJson *v, U8 *default="")
+{
+	if (v && v->type == YHJ_STR && v->str)
+		return v->str;
+	return default;
+}
+
+/***** data model *****/
+
+class CYhLine
+{
+	U8	kind, hh, mm;
+	U8	nick[YH_NAME_LEN];
+	U8	text[YH_TEXT_LEN];
+};
+
+class CYhChan
+{
+	U8		 id[YH_UUID_LEN];
+	U8		 name[YH_NAME_LEN];
+	I64		 server;			//Index into servers[].
+	CYhLine	*lines;				//Ring of YH_MAX_LINES; NULL until first open.
+	I64		 count;
+	I64		 unread;
+	Bool	 loaded;			//History page fetched.
+	U8		 last_ts[40];		//Newest created_at seen (poll watermark).
+};
+
+class CYhServer
+{
+	U8	id[YH_UUID_LEN];
+	U8	name[YH_NAME_LEN];
+	Bool chans_loaded;
+	I64	 tab_x, tab_w;			//Draw pass fills for hit tests.
+};
+
+class CYhProfile
+{
+	U8	id[YH_UUID_LEN];
+	U8	name[YH_NAME_LEN];
+};
+
+class CYhGlobals
+{
+	I64			 state;
+	Bool		 quit;
+	//Session.
+	U8			 jwt[2048], refresh[512], auth_uid[YH_UUID_LEN];
+	U8			 prof_id[YH_UUID_LEN], username[YH_NAME_LEN];
+	I64			 tok_deadline;	//jiffies when the JWT should be refreshed.
+	U8			 hdrs[3072];	//"apikey: ...\r\nAuthorization: Bearer ...\r\n"
+	//Data.
+	CYhServer	 servers[YH_MAX_SERVERS];
+	I64			 num_servers, cur_srv;
+	CYhChan		 chans[YH_MAX_CHANS];
+	I64			 num_chans, cur_chan;	//cur_chan: index or -1.
+	CYhProfile	 profiles[YH_MAX_PROFILES];
+	I64			 num_profiles;
+	//Realtime.
+	CWs			*ws;
+	Bool		 ws_ok;
+	I64			 ws_lock;		//Bit 0 = send lock (UI + heartbeat task).
+	I64			 ws_ref;
+	CTask		*ws_task, *hb_task;
+	U8			*rt_ring[YH_RT_RING];
+	I64			 rt_wr, rt_rd;
+	I64			 poll_deadline, reconnect_deadline;
+	//UI.
+	I64			 scroll;
+	U8			 input[YH_IN_MAX];
+	I64			 input_len;
+	U8			 hist[YH_HIST_MAX * YH_IN_MAX];
+	I64			 hist_count, hist_pos;
+	I64			 last_z;
+	//Login form.
+	U8			 f_url[128], f_anon[512], f_email[80], f_pass[80];
+	I64			 f_focus;
+	U8			 f_status[96];
+	Bool		 f_autoconn;
+	//Pens.
+	CColorROPU32 c_red, c_green;
+	CColorROPU32 c_nick[16];
+} yh;
+
+/***** config *****/
+
+U0 YhConfigSave()
+{
+	U8 *buf;
+
+	if (!DriveIsWritable)
+		return;
+	buf = MStrPrint(
+		"# yHarmony settings - edit freely (easiest way to paste the anon key).\n"
+		"url %s\n"
+		"anon %s\n"
+		"email %s\n"
+		"password %s\n"
+		"autoconnect %d\n",
+		yh.f_url, yh.f_anon, yh.f_email, yh.f_pass, yh.f_autoconn != 0);
+	FileWrite(YH_CFG_PATH, buf, StrLen(buf));
+	Free(buf);
+}
+
+U0 YhConfigLoad()
+{//Reuses the DE key=value parser (DE.ZC is compiled before apps launch).
+	I64	 size;
+	U8	*body = FileRead(YH_CFG_PATH, &size);
+
+	if (!body)
+		return;
+	DEConfigValStr(body, "url",      yh.f_url,   sizeof(yh.f_url));
+	DEConfigValStr(body, "anon",     yh.f_anon,  sizeof(yh.f_anon));
+	DEConfigValStr(body, "email",    yh.f_email, sizeof(yh.f_email));
+	DEConfigValStr(body, "password", yh.f_pass,  sizeof(yh.f_pass));
+	yh.f_autoconn = DEConfigValI64(body, "autoconnect", 0) != 0;
+	Free(body);
+}
+
+/***** buffers / log *****/
+
+CColorROPU32 YhNickPen(U8 *nick)
+{//Hash the name into the palette - standard modern IRC/Discord behavior.
+	I64 h = 0;
+
+	while (*nick)
+		h = h * 31 + *nick++;
+	return yh.c_nick[h & 15];
+}
+
+U0 YhAdd(I64 ci, I64 kind, U8 *nick, U8 *text, U8 hh=255, U8 mm=0)
+{//Append a line to a channel ring. hh=255 -> stamp with local time.
+	CYhChan		*ch;
+	CYhLine		*ln;
+	CDateStruct	 ds;
+	I64			 n;
+
+	if (ci < 0 || ci >= yh.num_chans)
+		return;
+	ch = &yh.chans[ci];
+	if (!ch->lines)
+		ch->lines = CAlloc(sizeof(CYhLine) * YH_MAX_LINES);
+	ln = &ch->lines[ch->count % YH_MAX_LINES];
+	if (hh == 255)
+	{
+		Date2Struct(&ds, Now);
+		ln->hh = ds.hour;
+		ln->mm = ds.min;
+	}
+	else
+	{
+		ln->hh = hh;
+		ln->mm = mm;
+	}
+	ln->kind = kind;
+	ln->nick[0] = 0;
+	if (nick)
+	{
+		n = MinI64(StrLen(nick), YH_NAME_LEN - 1);
+		MemCopy(ln->nick, nick, n);
+		ln->nick[n] = 0;
+	}
+	n = MinI64(StrLen(text), YH_TEXT_LEN - 1);
+	MemCopy(ln->text, text, n);
+	ln->text[n] = 0;
+	ch->count++;
+	if (ci != yh.cur_chan)
+		ch->unread++;
+}
+
+U0 YhStatus(U8 *text)
+{//Status line into the current channel (or form status when not in chat).
+	if (yh.state == YH_ST_CHAT && yh.cur_chan >= 0)
+		YhAdd(yh.cur_chan, YH_LK_STATUS, NULL, text);
+	else
+	{
+		MemCopy(yh.f_status, text, MinI64(StrLen(text), 95));
+		yh.f_status[MinI64(StrLen(text), 95)] = 0;
+	}
+}
+
+/***** profiles cache *****/
+
+U8 *YhProfileName(U8 *id)
+{//NULL when unknown (caller batches a fetch).
+	I64 i;
+
+	for (i = 0; i < yh.num_profiles; i++)
+		if (!StrCompare(yh.profiles[i].id, id))
+			return yh.profiles[i].name;
+	return NULL;
+}
+
+U0 YhProfileAdd(U8 *id, U8 *name)
+{
+	I64 i = yh.num_profiles;
+
+	if (YhProfileName(id))
+		return;
+	if (i >= YH_MAX_PROFILES)
+		i = yh.num_profiles = 0;	//Wrap: cheap eviction.
+	MemCopy(yh.profiles[i].id, id, MinI64(StrLen(id), YH_UUID_LEN - 1));
+	yh.profiles[i].id[MinI64(StrLen(id), YH_UUID_LEN - 1)] = 0;
+	MemCopy(yh.profiles[i].name, name, MinI64(StrLen(name), YH_NAME_LEN - 1));
+	yh.profiles[i].name[MinI64(StrLen(name), YH_NAME_LEN - 1)] = 0;
+	if (i == yh.num_profiles)
+		yh.num_profiles++;
+}
+
+/***** REST helpers *****/
+
+CYhJson *YhRest(U8 *method, U8 *path_fmt, U8 *body=NULL, ...)
+{//One PostgREST/GoTrue call. path_fmt is printed with argv, then prefixed
+//with the instance URL. Returns the parsed JSON tree (caller YhjFree's) or
+//NULL. Retries once through a token refresh on 401.
+	U8			  *path, *url;
+	CHttpResponse *resp;
+	CYhJson		  *json;
+	U8			   tmp[128];
+
+	path = StrPrintJoin(NULL, path_fmt, argc, argv);
+	url = MStrPrint("%s%s", yh.f_url, path);
+	Free(path);
+	resp = HttpReq(url, method, body, "application/json", yh.hdrs);
+	Free(url);
+	if (!resp)
+	{
+		YhStatus("Request failed (no response).");
+		return NULL;
+	}
+	if (resp->status == 401)
+	{
+		HttpResponseFree(resp);
+		YhStatus("401: session expired.");
+		return NULL;
+	}
+	if (resp->status < 200 || resp->status >= 300)
+	{
+		StrPrint(tmp, "HTTP %d from the instance.", resp->status);
+		YhStatus(tmp);
+		if (resp->body)
+			NetLog("yHarmony: %d body: %s", resp->status, resp->body);
+		HttpResponseFree(resp);
+		return NULL;
+	}
+	json = NULL;
+	if (resp->body && resp->body_length)
+		json = YhjParse(resp->body);
+	HttpResponseFree(resp);
+	return json;
+}
+
+U0 YhJsonEsc(U8 *dst, U8 *src, I64 max)
+{//Escape for embedding inside a JSON string literal.
+	I64 n = 0;
+
+	while (*src && n < max - 3)
+	{
+		if (*src == '"' || *src == '\\')
+		{
+			dst[n++] = '\\';
+			dst[n++] = *src;
+		}
+		else if (*src == '\n')
+		{
+			dst[n++] = '\\';
+			dst[n++] = 'n';
+		}
+		else if (*src >= 32)
+			dst[n++] = *src;
+		src++;
+	}
+	dst[n] = 0;
+}
+
+/***** content rendering *****/
+
+U0 YhContentToText(CYhJson *content, U8 *out, I64 max)
+{//Flatten Harmony's MessagePart[] into plain text.
+	CYhJson	*part, *f;
+	I64		 n = 0, len;
+	U8		*s;
+
+	out[0] = 0;
+	if (!content || content->type != YHJ_ARR)
+		return;
+	part = content->child;
+	while (part && n < max - 2)
+	{
+		s = NULL;
+		f = YhjGet(part, "text");
+		if (f)
+			s = YhjStr(f);
+		else
+		{
+			f = YhjGet(part, "username");
+			if (f)
+			{
+				if (n < max - 2)
+					out[n++] = '@';
+				s = YhjStr(f);
+			}
+			else
+			{
+				f = YhjGet(part, "url");
+				if (f)
+					s = YhjStr(f);
+				else
+				{
+					f = YhjGet(part, "name");	//Emoji/file-ish parts.
+					if (f)
+						s = YhjStr(f);
+				}
+			}
+		}
+		if (s)
+		{
+			len = MinI64(StrLen(s), max - 1 - n);
+			MemCopy(out + n, s, len);
+			n += len;
+			if (part->next && n < max - 2)
+				out[n++] = ' ';
+		}
+		part = part->next;
+	}
+	out[n] = 0;
+}
+
+/***** messages *****/
+
+U0 YhTsEnc(U8 *dst, U8 *src)
+{//URL-encode a timestamp for a query param: '+' -> %2B (else it decodes as a
+//space server-side). Passed to YhRest as a %s ARG so the '%' never hits the
+//format parser.
+	while (*src)
+	{
+		if (*src == '+')
+		{
+			*dst++ = '%';
+			*dst++ = '2';
+			*dst++ = 'B';
+			src++;
+		}
+		else
+			*dst++ = *src++;
+	}
+	*dst = 0;
+}
+
+U0 YhMsgTime(U8 *created_at, U8 *hh, U8 *mm)
+{//"2026-07-23T18:19:23..." -> 18,19. UTC (no tz conversion).
+	*hh = 0;
+	*mm = 0;
+	if (StrLen(created_at) >= 16)
+	{
+		*hh = (created_at[11] - '0') * 10 + created_at[12] - '0';
+		*mm = (created_at[14] - '0') * 10 + created_at[15] - '0';
+	}
+}
+
+U0 YhFetchProfiles(U8 *idlist)
+{//idlist = "uuid,uuid,...". Fills the cache.
+	CYhJson	*json, *row;
+
+	if (!*idlist)
+		return;
+	json = YhRest("GET", "/rest/v1/profiles?id=in.(%s)&select=id,username,display_name",
+				  NULL, idlist);
+	if (!json)
+		return;
+	row = json->child;
+	while (row)
+	{
+		if (YhjGet(row, "id"))
+		{
+			if (YhjGet(row, "username") && *YhjStr(YhjGet(row, "username")))
+				YhProfileAdd(YhjStr(YhjGet(row, "id")), YhjStr(YhjGet(row, "username")));
+			else
+				YhProfileAdd(YhjStr(YhjGet(row, "id")), YhjStr(YhjGet(row, "display_name"), "user"));
+		}
+		row = row->next;
+	}
+	YhjFree(json);
+}
+
+U0 YhMsgRowAdd(I64 ci, CYhJson *row, U8 *missing, I64 missing_max)
+{//One PostgREST message row -> channel line. Unknown authors are appended
+//to the comma-separated `missing` id list for a later batch profile fetch.
+	U8		 text[YH_TEXT_LEN], hh, mm;
+	U8		*uid, *name, *created;
+	I64		 kind;
+	CYhChan	*ch = &yh.chans[ci];
+
+	YhContentToText(YhjGet(row, "content"), text, YH_TEXT_LEN);
+	created = YhjStr(YhjGet(row, "created_at"));
+	YhMsgTime(created, &hh, &mm);
+	uid = YhjStr(YhjGet(row, "user_id"));
+	name = NULL;
+	if (*uid)
+		name = YhProfileName(uid);
+	if (!name)
+	{
+		if (*uid)
+		{
+			if (*missing)
+				CatPrint(missing, ",");
+			if (StrLen(missing) + StrLen(uid) < missing_max - 2)
+				CatPrint(missing, "%s", uid);
+			name = "...";	//Redrawn correctly on the next page load; poll fills cache first.
+		}
+		else
+			name = "bot";
+	}
+	kind = YH_LK_MSG;
+	if (YhjGet(row, "is_system") && YhjGet(row, "is_system")->b)
+		kind = YH_LK_SYSTEM;
+	else if (!StrCompare(uid, yh.prof_id))
+		kind = YH_LK_SELF;
+	YhAdd(ci, kind, name, text, hh, mm);
+	if (StrCompare(created, ch->last_ts) > 0)
+	{
+		MemCopy(ch->last_ts, created, MinI64(StrLen(created), 39));
+		ch->last_ts[MinI64(StrLen(created), 39)] = 0;
+	}
+}
+
+U0 YhFetchMessages(I64 ci, Bool initial)
+{//initial: last 40, else only rows newer than the watermark.
+	CYhJson	*json, *row, *rows[64];
+	CYhChan	*ch = &yh.chans[ci];
+	I64		 n, i;
+	U8		 missing[1600], enc_ts[56];
+
+	if (initial)
+		json = YhRest("GET",
+			"/rest/v1/messages?channel_id=eq.%s&thread_id=is.null"
+			"&is_deleted=not.is.true&order=created_at.desc&limit=40"
+			"&select=id,created_at,user_id,content,is_system",
+			NULL, ch->id);
+	else
+	{
+		YhTsEnc(enc_ts, ch->last_ts);
+		json = YhRest("GET",
+			"/rest/v1/messages?channel_id=eq.%s&thread_id=is.null"
+			"&is_deleted=not.is.true&created_at=gt.%s&order=created_at.asc&limit=40"
+			"&select=id,created_at,user_id,content,is_system",
+			NULL, ch->id, enc_ts);
+	}
+	if (!json)
+		return;
+
+	//Pass 1: batch-resolve unknown authors so names render on first paint.
+	missing[0] = 0;
+	row = json->child;
+	while (row)
+	{
+		if (YhjGet(row, "user_id"))
+		{
+			if (*YhjStr(YhjGet(row, "user_id")) &&
+				!YhProfileName(YhjStr(YhjGet(row, "user_id"))))
+			{
+				if (*missing)
+					CatPrint(missing, ",");
+				if (StrLen(missing) + 40 < sizeof(missing))
+					CatPrint(missing, "%s", YhjStr(YhjGet(row, "user_id")));
+			}
+		}
+		row = row->next;
+	}
+	YhFetchProfiles(missing);
+	missing[0] = 0;
+
+	if (initial)
+	{//Rows arrive newest-first; append oldest-first.
+		n = 0;
+		row = json->child;
+		while (row && n < 64)
+		{
+			rows[n++] = row;
+			row = row->next;
+		}
+		for (i = n - 1; i >= 0; i--)
+			YhMsgRowAdd(ci, rows[i], missing, sizeof(missing));
+		ch->loaded = TRUE;
+	}
+	else
+	{
+		row = json->child;
+		while (row)
+		{
+			YhMsgRowAdd(ci, row, missing, sizeof(missing));
+			row = row->next;
+		}
+	}
+	YhjFree(json);
+}
+
+U0 YhSendMessage(U8 *text)
+{
+	U8		 esc[YH_TEXT_LEN * 2];
+	U8		*body;
+	CYhJson	*json;
+
+	if (yh.cur_chan < 0)
+		return;
+	YhJsonEsc(esc, text, sizeof(esc));
+	body = MStrPrint(
+		"{\"user_id\":\"%s\",\"channel_id\":\"%s\","
+		"\"content\":[{\"type\":\"text\",\"text\":\"%s\"}],"
+		"\"metadata\":{\"created_via\":\"yharmony_zealos\"}}",
+		yh.prof_id, yh.chans[yh.cur_chan].id, esc);
+	json = YhRest("POST", "/rest/v1/messages", body);
+	Free(body);
+	if (json)
+	{//Prefer: return=representation gives the row back: echo it and bump the
+	 //watermark so realtime/poll won't show it twice.
+		if (json->child)
+			YhMsgRowAdd(yh.cur_chan, json->child, esc, sizeof(esc));
+		YhjFree(json);
+	}
+	else
+		YhStatus("Send failed.");
+}
+
+/***** servers + channels *****/
+
+U0 YhFetchChannels(I64 si)
+{
+	CYhJson	*json, *row;
+	CYhChan	*ch;
+	U8		*nm;
+
+	json = YhRest("GET",
+		"/rest/v1/channels?server_id=eq.%s&type=eq.0&order=order.asc"
+		"&select=id,name",
+		NULL, yh.servers[si].id);
+	if (!json)
+		return;
+	row = json->child;
+	while (row && yh.num_chans < YH_MAX_CHANS)
+	{
+		ch = &yh.chans[yh.num_chans];
+		MemSet(ch, 0, sizeof(CYhChan));
+		MemCopy(ch->id, YhjStr(YhjGet(row, "id")), YH_UUID_LEN - 1);
+		nm = YhjStr(YhjGet(row, "name"), "channel");
+		MemCopy(ch->name, nm, MinI64(StrLen(nm), YH_NAME_LEN - 1));
+		ch->server = si;
+		StrCopy(ch->last_ts, "1970-01-01T00:00:00");
+		yh.num_chans++;
+		row = row->next;
+	}
+	YhjFree(json);
+	yh.servers[si].chans_loaded = TRUE;
+}
+
+I64 YhFirstChan(I64 si)
+{
+	I64 i;
+
+	for (i = 0; i < yh.num_chans; i++)
+		if (yh.chans[i].server == si)
+			return i;
+	return -1;
+}
+
+U0 YhSwitchChan(I64 ci)
+{
+	if (ci < 0 || ci >= yh.num_chans)
+		return;
+	yh.cur_chan = ci;
+	yh.cur_srv = yh.chans[ci].server;
+	yh.chans[ci].unread = 0;
+	yh.scroll = 0;
+	if (!yh.chans[ci].loaded)
+		YhFetchMessages(ci, TRUE);
+}
+
+U0 YhSwitchServer(I64 si)
+{
+	I64 ci;
+
+	if (si < 0 || si >= yh.num_servers)
+		return;
+	yh.cur_srv = si;
+	if (!yh.servers[si].chans_loaded)
+		YhFetchChannels(si);
+	ci = YhFirstChan(si);
+	if (ci >= 0 && (yh.cur_chan < 0 || yh.chans[yh.cur_chan].server != si))
+		YhSwitchChan(ci);
+}
+
+U0 YhFetchServers()
+{
+	CYhJson		*json, *row;
+	CYhServer	*sv;
+	U8			 ids[YH_MAX_SERVERS * 40 + 8];
+	U8			*nm;
+
+	//Membership first, then names in one batch.
+	json = YhRest("GET",
+		"/rest/v1/user_servers?user_id=eq.%s&status=eq.accepted&select=server_id",
+		NULL, yh.prof_id);
+	if (!json)
+		return;
+	ids[0] = 0;
+	row = json->child;
+	while (row && yh.num_servers < YH_MAX_SERVERS)
+	{
+		if (YhjGet(row, "server_id"))
+		{
+			if (*ids)
+				CatPrint(ids, ",");
+			CatPrint(ids, "%s", YhjStr(YhjGet(row, "server_id")));
+			yh.num_servers++;	//Reserve; names fill below.
+		}
+		row = row->next;
+	}
+	YhjFree(json);
+	yh.num_servers = 0;
+	if (!*ids)
+	{
+		YhStatus("No servers joined on this account.");
+		return;
+	}
+
+	json = YhRest("GET", "/rest/v1/servers?id=in.(%s)&select=id,name", NULL, ids);
+	if (!json)
+		return;
+	row = json->child;
+	while (row && yh.num_servers < YH_MAX_SERVERS)
+	{
+		sv = &yh.servers[yh.num_servers];
+		MemSet(sv, 0, sizeof(CYhServer));
+		MemCopy(sv->id, YhjStr(YhjGet(row, "id")), YH_UUID_LEN - 1);
+		nm = YhjStr(YhjGet(row, "name"), "server");
+		MemCopy(sv->name, nm, MinI64(StrLen(nm), YH_NAME_LEN - 1));
+		yh.num_servers++;
+		row = row->next;
+	}
+	YhjFree(json);
+}
+
+/***** auth *****/
+
+Bool YhAuth()
+{
+	U8		 esc_e[160], esc_p[160];
+	U8		*body, *url;
+	CHttpResponse *resp;
+	CYhJson	*json, *f, *user;
+	I64		 expires;
+
+	//Normalize the URL: no trailing slash.
+	if (yh.f_url[0] && yh.f_url[StrLen(yh.f_url) - 1] == '/')
+		yh.f_url[StrLen(yh.f_url) - 1] = 0;
+	if (!yh.f_url[0] || !yh.f_anon[0] || !yh.f_email[0] || !yh.f_pass[0])
+	{
+		YhStatus("URL, anon key, email and password all required.");
+		return FALSE;
+	}
+
+	StrPrint(yh.hdrs, "apikey: %s\r\n", yh.f_anon);	//Pre-auth: apikey only.
+	YhJsonEsc(esc_e, yh.f_email, sizeof(esc_e));
+	YhJsonEsc(esc_p, yh.f_pass, sizeof(esc_p));
+	body = MStrPrint("{\"email\":\"%s\",\"password\":\"%s\"}", esc_e, esc_p);
+	url = MStrPrint("%s/auth/v1/token?grant_type=password", yh.f_url);
+	resp = HttpReq(url, "POST", body, "application/json", yh.hdrs);
+	Free(body);
+	Free(url);
+	if (!resp)
+	{
+		YhStatus("Auth request failed (network).");
+		return FALSE;
+	}
+	if (resp->status != 200)
+	{
+		YhStatus("Login rejected (bad email/password/key?).");
+		NetLog("yHarmony auth %d: %s", resp->status, resp->body);
+		HttpResponseFree(resp);
+		return FALSE;
+	}
+	json = YhjParse(resp->body);
+	HttpResponseFree(resp);
+	if (!json)
+	{
+		YhStatus("Auth response unparsable.");
+		return FALSE;
+	}
+	f = YhjGet(json, "access_token");
+	if (!f || !*YhjStr(f))
+	{
+		YhStatus("No access token in the auth response.");
+		YhjFree(json);
+		return FALSE;
+	}
+	StrCopy(yh.jwt, YhjStr(f));
+	StrCopy(yh.refresh, YhjStr(YhjGet(json, "refresh_token")));
+	expires = 3600;
+	f = YhjGet(json, "expires_in");
+	if (f && f->type == YHJ_NUM)
+		expires = ToI64(f->num);
+	yh.tok_deadline = counts.jiffies + expires * 8 / 10 * JIFFY_FREQ;
+	user = YhjGet(json, "user");
+	StrCopy(yh.auth_uid, YhjStr(YhjGet(user, "id")));
+	YhjFree(json);
+
+	//Prefer makes PostgREST return the inserted row (harmless on GETs).
+	StrPrint(yh.hdrs, "apikey: %s\r\nAuthorization: Bearer %s\r\n"
+			 "Prefer: return=representation\r\n", yh.f_anon, yh.jwt);
+
+	//auth uid -> Harmony profile (RLS keys off profiles.id, not auth.uid).
+	json = YhRest("GET", "/rest/v1/profiles?auth_user_id=eq.%s&select=id,username",
+				  NULL, yh.auth_uid);
+	if (!json || !json->child)
+	{
+		YhStatus("No Harmony profile for this account.");
+		YhjFree(json);
+		return FALSE;
+	}
+	StrCopy(yh.prof_id, YhjStr(YhjGet(json->child, "id")));
+	StrCopy(yh.username, YhjStr(YhjGet(json->child, "username"), "me"));
+	YhProfileAdd(yh.prof_id, yh.username);
+	YhjFree(json);
+	return TRUE;
+}
+
+U0 YhTokenRefresh()
+{
+	U8		*body, *url;
+	CHttpResponse *resp;
+	CYhJson	*json, *f;
+	I64		 expires;
+	U8		*hb;
+
+	body = MStrPrint("{\"refresh_token\":\"%s\"}", yh.refresh);
+	url = MStrPrint("%s/auth/v1/token?grant_type=refresh_token", yh.f_url);
+	StrPrint(yh.hdrs, "apikey: %s\r\n", yh.f_anon);
+	resp = HttpReq(url, "POST", body, "application/json", yh.hdrs);
+	Free(body);
+	Free(url);
+	if (resp && resp->status == 200)
+	{
+		json = YhjParse(resp->body);
+		if (json)
+		{
+			f = YhjGet(json, "access_token");
+			if (f && *YhjStr(f))
+			{
+				StrCopy(yh.jwt, YhjStr(f));
+				StrCopy(yh.refresh, YhjStr(YhjGet(json, "refresh_token")));
+				expires = 3600;
+				f = YhjGet(json, "expires_in");
+				if (f && f->type == YHJ_NUM)
+					expires = ToI64(f->num);
+				yh.tok_deadline = counts.jiffies + expires * 8 / 10 * JIFFY_FREQ;
+				if (yh.ws_ok)
+				{//Push the fresh token into the realtime session too.
+					hb = MStrPrint("{\"topic\":\"realtime:zealos\",\"event\":\"access_token\","
+								   "\"payload\":{\"access_token\":\"%s\"},\"ref\":\"%d\"}",
+								   yh.jwt, ++yh.ws_ref);
+					while (LBts(&yh.ws_lock, 0))
+						Yield;
+					WsSendStr(yh.ws, hb);
+					LBtr(&yh.ws_lock, 0);
+					Free(hb);
+				}
+			}
+			YhjFree(json);
+		}
+	}
+	else
+		yh.tok_deadline = counts.jiffies + 60 * JIFFY_FREQ;	//Retry in a minute.
+	if (resp)
+		HttpResponseFree(resp);
+	StrPrint(yh.hdrs, "apikey: %s\r\nAuthorization: Bearer %s\r\n"
+			 "Prefer: return=representation\r\n", yh.f_anon, yh.jwt);
+}
+
+/***** realtime (WebSocket) *****/
+
+U0 YhWsRecvTask()
+{//Blocks on the socket; pushes raw JSON frames into the ring (strings live
+//on the PARENT task's heap so they survive if this task dies).
+	CTask	*parent = Fs->parent_task;
+	U8		*msg, *copy;
+	I64		 n;
+
+	while (!yh.quit && yh.ws && yh.ws->open)
+	{
+		n = WsRecv(yh.ws, &msg, 30000);
+		if (n < 0)
+			break;
+		if (n > 0 && msg)
+		{
+			if (yh.rt_wr - yh.rt_rd < YH_RT_RING)
+			{
+				copy = MAlloc(n + 1, parent);
+				MemCopy(copy, msg, n + 1);
+				yh.rt_ring[yh.rt_wr & (YH_RT_RING - 1)] = copy;
+				yh.rt_wr++;	//After the slot is filled.
+			}
+			Free(msg);
+		}
+	}
+	yh.ws_ok = FALSE;
+}
+
+U0 YhWsHbTask()
+{//Phoenix heartbeat every 4s. Keeps the server side alive AND keeps bytes
+//flowing back (phx_reply) so the TLS stall detector never fires while the
+//UI task is blocked in a popup.
+	U8 hb[128];
+
+	while (!yh.quit && yh.ws_ok && yh.ws && yh.ws->open)
+	{
+		StrPrint(hb, "{\"topic\":\"phoenix\",\"event\":\"heartbeat\","
+					 "\"payload\":{},\"ref\":\"%d\"}", ++yh.ws_ref);
+		while (LBts(&yh.ws_lock, 0))
+			Yield;
+		if (yh.ws && yh.ws->open)
+			WsSendStr(yh.ws, hb);
+		LBtr(&yh.ws_lock, 0);
+		Sleep(4000);
+	}
+}
+
+U0 YhWsConnect()
+{
+	U8	*wsurl, *join;
+	U8	 host[256];
+	I64	 i;
+
+	if (yh.ws_ok)
+		return;
+	//https://host -> wss://host/realtime/v1/websocket?...
+	if (!StrNICompare(yh.f_url, "https://", 8))
+		StrCopy(host, yh.f_url + 8);
+	else if (!StrNICompare(yh.f_url, "http://", 7))
+		StrCopy(host, yh.f_url + 7);
+	else
+		StrCopy(host, yh.f_url);
+	wsurl = MStrPrint("wss://%s/realtime/v1/websocket?apikey=%s&vsn=1.0.0",
+					  host, yh.f_anon);
+	yh.ws = WsOpen(wsurl);
+	Free(wsurl);
+	if (!yh.ws)
+	{
+		YhStatus("Realtime socket failed; polling instead.");
+		yh.reconnect_deadline = counts.jiffies + 60 * JIFFY_FREQ;
+		return;
+	}
+
+	//Join one channel subscribed to every INSERT on public.messages; the
+	//server applies RLS with our JWT, so only visible rows arrive.
+	join = MStrPrint(
+		"{\"topic\":\"realtime:zealos\",\"event\":\"phx_join\",\"payload\":{"
+		"\"config\":{\"broadcast\":{\"self\":false},\"presence\":{\"key\":\"\"},"
+		"\"postgres_changes\":[{\"event\":\"INSERT\",\"schema\":\"public\","
+		"\"table\":\"messages\"}]},\"access_token\":\"%s\"},\"ref\":\"%d\"}",
+		yh.jwt, ++yh.ws_ref);
+	WsSendStr(yh.ws, join);	//No lock needed: tasks not spawned yet.
+	Free(join);
+
+	yh.ws_ok = TRUE;
+	yh.rt_wr = yh.rt_rd = 0;
+	yh.ws_task = Spawn(&YhWsRecvTask, NULL, "yHarmonyWS",, Fs);
+	yh.hb_task = Spawn(&YhWsHbTask,  NULL, "yHarmonyHB",, Fs);
+	YhStatus("Realtime connected.");
+}
+
+U0 YhWsShutdown()
+{
+	yh.ws_ok = FALSE;
+	if (yh.ws_task && TaskValidate(yh.ws_task))
+		Kill(yh.ws_task);
+	if (yh.hb_task && TaskValidate(yh.hb_task))
+		Kill(yh.hb_task);
+	yh.ws_task = yh.hb_task = NULL;
+	if (yh.ws)
+	{
+		WsClose(yh.ws);
+		yh.ws = NULL;
+	}
+	while (yh.rt_rd < yh.rt_wr)
+	{
+		Free(yh.rt_ring[yh.rt_rd & (YH_RT_RING - 1)]);
+		yh.rt_rd++;
+	}
+}
+
+I64 YhChanFind(U8 *id)
+{
+	I64 i;
+
+	for (i = 0; i < yh.num_chans; i++)
+		if (!StrCompare(yh.chans[i].id, id))
+			return i;
+	return -1;
+}
+
+U0 YhRtHandle(U8 *frame)
+{//One Phoenix frame off the ring.
+	CYhJson	*json, *payload, *data, *record;
+	U8		*event, *cid, *uid, *created;
+	U8		 text[YH_TEXT_LEN], hh, mm;
+	U8		*name;
+	I64		 ci, kind;
+	CYhChan	*ch;
+	U8		 missing[80];
+
+	json = YhjParse(frame);
+	if (!json)
+		return;
+	event = YhjStr(YhjGet(json, "event"));
+	if (StrCompare(event, "postgres_changes"))
+	{//Heartbeat replies / join replies / system: ignore.
+		YhjFree(json);
+		return;
+	}
+	payload = YhjGet(json, "payload");
+	data = YhjGet(payload, "data");
+	record = YhjGet(data, "record");
+	if (!record)
+	{
+		YhjFree(json);
+		return;
+	}
+	cid = YhjStr(YhjGet(record, "channel_id"));
+	ci = YhChanFind(cid);
+	if (ci < 0)
+	{//Channel we haven't loaded (other server / DM): drop for now.
+		YhjFree(json);
+		return;
+	}
+	ch = &yh.chans[ci];
+	created = YhjStr(YhjGet(record, "created_at"));
+	if (*created && StrCompare(created, ch->last_ts) <= 0)
+	{//Already have it (poll raced the socket).
+		YhjFree(json);
+		return;
+	}
+	uid = YhjStr(YhjGet(record, "user_id"));
+	name = NULL;
+	if (*uid)
+	{
+		name = YhProfileName(uid);
+		if (!name)
+		{//Single unknown author: fetch inline (small + rare).
+			StrPrint(missing, "%s", uid);
+			YhFetchProfiles(missing);
+			name = YhProfileName(uid);
+		}
+	}
+	if (!name)
+		name = "bot";
+	YhContentToText(YhjGet(record, "content"), text, YH_TEXT_LEN);
+	YhMsgTime(created, &hh, &mm);
+	kind = YH_LK_MSG;
+	if (YhjGet(record, "is_system") && YhjGet(record, "is_system")->b)
+		kind = YH_LK_SYSTEM;
+	else if (!StrCompare(uid, yh.prof_id))
+		kind = YH_LK_SELF;
+	YhAdd(ci, kind, name, text, hh, mm);
+	if (*created)
+	{
+		MemCopy(ch->last_ts, created, MinI64(StrLen(created), 39));
+		ch->last_ts[MinI64(StrLen(created), 39)] = 0;
+	}
+	YhjFree(json);
+}
+
+/***** drawing *****/
+
+U0 YhDrawEdge(CDC *dc, I64 x, I64 y, I64 w, I64 h)
+{
+	dc->color = de_theme.panel_edge;
+	GrRect(dc, x, y, w, 1);
+	GrRect(dc, x, y + h - 1, w, 1);
+	GrRect(dc, x, y, 1, h);
+	GrRect(dc, x + w - 1, y, 1, h);
+}
+
+//Login-form geometry, shared by draw + hit test.
+#define YH_FORM_W	420
+#define YH_FORM_H	266
+#define YH_CB_DY	174
+#define YH_CB_SZ	14
+#define YH_BTN_DY	202
+
+U0 YhDrawForm(CTask *task, CDC *dc)
+{
+	I64	 fx = (task->pix_width - YH_FORM_W) / 2;
+	I64	 fy = (task->pix_height - YH_FORM_H) / 2;
+	I64	 i, y, off;
+	U8	*labels[4], *vals[4];
+	U8	 buf[96];
+
+	labels[0] = "URL";		vals[0] = yh.f_url;
+	labels[1] = "Anon key";	vals[1] = yh.f_anon;
+	labels[2] = "Email";	vals[2] = yh.f_email;
+	labels[3] = "Password";	vals[3] = yh.f_pass;
+
+	dc->color = de_theme.panel;
+	GrRect(dc, fx, fy, YH_FORM_W, YH_FORM_H);
+	YhDrawEdge(dc, fx, fy, YH_FORM_W, YH_FORM_H);
+	dc->color = de_theme.accent;
+	GrPrint(dc, fx + (YH_FORM_W - 16 * FONT_WIDTH) / 2, fy + 12, "yHarmony - Login");
+
+	for (i = 0; i < 4; i++)
+	{
+		y = fy + 40 + i * 32;
+		dc->color = de_theme.text_dim;
+		GrPrint(dc, fx + 16, y + 5, "%s", labels[i]);
+		dc->color = de_theme.win_bg;
+		GrRect(dc, fx + 96, y, YH_FORM_W - 112, 20);
+		if (yh.f_focus == i)
+			dc->color = de_theme.accent;
+		else
+			dc->color = de_theme.bttn;
+		GrRect(dc, fx + 96, y, YH_FORM_W - 112, 1);
+		GrRect(dc, fx + 96, y + 19, YH_FORM_W - 112, 1);
+		GrRect(dc, fx + 96, y, 1, 20);
+		GrRect(dc, fx + YH_FORM_W - 17, y, 1, 20);
+		dc->color = de_theme.text;
+		//Long values (anon key!) show the tail; password masked.
+		off = 0;
+		if (StrLen(vals[i]) > 36)
+			off = StrLen(vals[i]) - 36;
+		if (i == 3)
+		{
+			for (off = 0; off < MinI64(StrLen(vals[i]), 36); off++)
+				buf[off] = '*';
+			buf[off] = 0;
+		}
+		else
+			StrCopy(buf, vals[i] + off);
+		if (yh.f_focus == i && Blink)
+			CatPrint(buf, "_");
+		GrPrint(dc, fx + 102, y + 6, "%s", buf);
+	}
+
+	//Auto-connect checkbox.
+	y = fy + YH_CB_DY;
+	dc->color = de_theme.win_bg;
+	GrRect(dc, fx + 16, y, YH_CB_SZ, YH_CB_SZ);
+	YhDrawEdge(dc, fx + 16, y, YH_CB_SZ, YH_CB_SZ);
+	if (yh.f_autoconn)
+	{
+		dc->color = de_theme.accent;
+		GrRect(dc, fx + 19, y + 3, YH_CB_SZ - 6, YH_CB_SZ - 6);
+	}
+	dc->color = de_theme.text_dim;
+	GrPrint(dc, fx + 16 + YH_CB_SZ + 8, y + 3, "Auto-connect on launch");
+
+	//Buttons.
+	y = fy + YH_BTN_DY;
+	if (yh.f_focus == 4)
+		dc->color = de_theme.bttn_focus;
+	else
+		dc->color = de_theme.bttn_hot;
+	GrRect(dc, fx + 96, y, 120, 24);
+	YhDrawEdge(dc, fx + 96, y, 120, 24);
+	dc->color = de_theme.text;
+	GrPrint(dc, fx + 96 + (120 - 5 * FONT_WIDTH) / 2, y + 8, "Login");
+	dc->color = de_theme.bttn;
+	GrRect(dc, fx + 232, y, 120, 24);
+	YhDrawEdge(dc, fx + 232, y, 120, 24);
+	dc->color = de_theme.text_dim;
+	GrPrint(dc, fx + 232 + (120 - 4 * FONT_WIDTH) / 2, y + 8, "Quit");
+
+	dc->color = de_theme.text_dim;
+	GrPrint(dc, fx + 16, fy + YH_BTN_DY + 34,
+			"Tip: paste keys into ::/Home/YHARMONY.CFG instead of typing.");
+	if (yh.f_status[0])
+	{
+		dc->color = yh.c_red;
+		GrPrint(dc, fx + 16, fy + YH_BTN_DY + 48, "%s", yh.f_status);
+	}
+}
+
+U0 YhLineHead(CYhLine *ln, U8 *head, CColorROPU32 *head_pen, CColorROPU32 *body_pen)
+{
+	U8 ts[8];
+
+	StrPrint(ts, "%02d:%02d", ln->hh, ln->mm);
+	switch (ln->kind)
+	{
+		case YH_LK_MSG:
+			StrPrint(head, "%s <%s> ", ts, ln->nick);
+			*head_pen = YhNickPen(ln->nick);
+			*body_pen = de_theme.text;
+			break;
+		case YH_LK_SELF:
+			StrPrint(head, "%s <%s> ", ts, ln->nick);
+			*head_pen = YhNickPen(ln->nick);
+			*body_pen = de_theme.text;
+			break;
+		case YH_LK_ERROR:
+			StrPrint(head, "%s !! ", ts);
+			*head_pen = yh.c_red;
+			*body_pen = yh.c_red;
+			break;
+		case YH_LK_SYSTEM:
+			StrPrint(head, "%s ** ", ts);
+			*head_pen = de_theme.accent_dim;
+			*body_pen = de_theme.text_dim;
+			break;
+		default:	//YH_LK_STATUS
+			StrPrint(head, "%s -- ", ts);
+			*head_pen = de_theme.accent_dim;
+			*body_pen = de_theme.text_dim;
+	}
+}
+
+U0 YhDrawChat(CTask *task, CDC *dc)
+{
+	CYhChan		*ch, *cb = NULL;
+	CYhServer	*sv;
+	CYhLine		*ln;
+	CColorROPU32 head_pen, body_pen;
+	I64	 i, x, y, w, r, rows, avail, blen, hlen, first, seg, skip, cpl;
+	I64	 tab_y = 4, tab_h = 20;
+	I64	 in_h = 22;
+	I64	 in_y = task->pix_height - in_h - 4;
+	I64	 log_y = tab_h + 12;
+	I64	 log_x = YH_CHAN_PANEL_W + 16;
+	I64	 log_w = task->pix_width - log_x - 8;
+	I64	 log_h = in_y - 6 - log_y;
+	U8	 head[72], seg_buf[200], buf2[240];
+
+	if (yh.cur_chan >= 0)
+		cb = &yh.chans[yh.cur_chan];
+	cpl = MaxI64(16, log_w / FONT_WIDTH);
+
+	//Server tabs.
+	x = 8;
+	for (i = 0; i < yh.num_servers; i++)
+	{
+		sv = &yh.servers[i];
+		w = StrLen(sv->name) * FONT_WIDTH + 16;
+		sv->tab_x = x;
+		if (x + w > task->pix_width - 8)
+			sv->tab_w = 0;
+		else
+		{
+			sv->tab_w = w;
+			if (i == yh.cur_srv)
+				dc->color = de_theme.accent_dim;
+			else
+				dc->color = de_theme.bttn;
+			GrRect(dc, x, tab_y, w, tab_h);
+			YhDrawEdge(dc, x, tab_y, w, tab_h);
+			if (i == yh.cur_srv)
+				dc->color = de_theme.text;
+			else
+				dc->color = de_theme.text_dim;
+			GrPrint(dc, x + 8, tab_y + (tab_h - FONT_HEIGHT) / 2, "%s", sv->name);
+			x += w + 4;
+		}
+	}
+	//Realtime state chip on the right edge of the tab row.
+	if (yh.ws_ok)
+	{
+		dc->color = yh.c_green;
+		GrPrint(dc, task->pix_width - 5 * FONT_WIDTH, tab_y + 4, "live");
+	}
+	else
+	{
+		dc->color = de_theme.text_dim;
+		GrPrint(dc, task->pix_width - 5 * FONT_WIDTH, tab_y + 4, "poll");
+	}
+
+	//Channel panel (left).
+	dc->color = de_theme.panel;
+	GrRect(dc, 8, log_y - 2, YH_CHAN_PANEL_W, log_h + 2);
+	YhDrawEdge(dc, 8, log_y - 2, YH_CHAN_PANEL_W, log_h + 2);
+	dc->color = de_theme.accent_dim;
+	GrPrint(dc, 14, log_y + 4, "channels");
+	r = 0;
+	for (i = 0; i < yh.num_chans; i++)
+	{//No `continue` in ZealC: filter with a plain if instead.
+		ch = &yh.chans[i];
+		if (ch->server == yh.cur_srv)
+		{
+			y = log_y + 18 + r * YH_ROW_H;
+			if (y + FONT_HEIGHT > log_y + log_h)
+				break;
+			if (i == yh.cur_chan)
+				dc->color = de_theme.text;
+			else if (ch->unread)
+				dc->color = de_theme.chip_hot;
+			else
+				dc->color = de_theme.text_dim;
+			StrCopy(buf2, ch->name);
+			if (StrLen(buf2) > 17)
+				buf2[17] = 0;
+			if (ch->unread)
+				GrPrint(dc, 14, y, "#%s (%d)", buf2, MinI64(ch->unread, 99));
+			else
+				GrPrint(dc, 14, y, "#%s", buf2);
+			r++;
+		}
+	}
+
+	//Chat log, bottom-up.
+	if (cb && cb->lines)
+	{
+		skip = yh.scroll;
+		y = log_y + log_h - YH_ROW_H;
+		first = MaxI64(0, cb->count - YH_MAX_LINES);
+		i = cb->count - 1;
+		while (i >= first && y + FONT_HEIGHT > log_y)
+		{
+			ln = &cb->lines[i % YH_MAX_LINES];
+			YhLineHead(ln, head, &head_pen, &body_pen);
+			hlen = StrLen(head);
+			avail = MaxI64(8, cpl - hlen);
+			blen = StrLen(ln->text);
+			rows = MaxI64(1, (blen + avail - 1) / avail);
+			for (r = rows - 1; r >= 0 && y + FONT_HEIGHT > log_y; r--)
+			{
+				if (skip)
+					skip--;
+				else
+				{
+					seg = MinI64(avail, blen - r * avail);
+					if (seg < 0)
+						seg = 0;
+					MemCopy(seg_buf, &ln->text[r * avail], seg);
+					seg_buf[seg] = 0;
+					dc->color = body_pen;
+					if (r == 0)
+					{
+						dc->color = head_pen;
+						GrPrint(dc, log_x, y, "%s", head);
+						dc->color = body_pen;
+					}
+					GrPrint(dc, log_x + hlen * FONT_WIDTH, y, "%s", seg_buf);
+					y -= YH_ROW_H;
+				}
+			}
+			i--;
+		}
+		if (yh.scroll)
+		{
+			dc->color = de_theme.chip_hot;
+			GrPrint(dc, log_x + log_w - 10 * FONT_WIDTH, log_y, "(scrolled)");
+		}
+	}
+	else
+	{
+		dc->color = de_theme.text_dim;
+		GrPrint(dc, log_x, log_y + 4, "(no channel)");
+	}
+
+	//Input bar.
+	dc->color = de_theme.panel;
+	GrRect(dc, 4, in_y, task->pix_width - 8, in_h);
+	YhDrawEdge(dc, 4, in_y, task->pix_width - 8, in_h);
+	if (cb)
+		StrPrint(buf2, "[#%s] ", cb->name);
+	else
+		StrCopy(buf2, "[-] ");
+	dc->color = de_theme.accent;
+	GrPrint(dc, 10, in_y + (in_h - FONT_HEIGHT) / 2, "%s", buf2);
+	x = 10 + StrLen(buf2) * FONT_WIDTH;
+	w = (task->pix_width - 14 - x) / FONT_WIDTH - 1;
+	i = 0;
+	if (yh.input_len > w)
+		i = yh.input_len - w;
+	if (Blink)
+		StrPrint(buf2, "%s_", &yh.input[i]);
+	else
+		StrPrint(buf2, "%s", &yh.input[i]);
+	dc->color = de_theme.text;
+	GrPrint(dc, x, in_y + (in_h - FONT_HEIGHT) / 2, "%s", buf2);
+}
+
+U0 YhDrawIt(CTask *task, CDC *dc)
+{
+	dc->color = de_theme.win_bg;
+	GrRect(dc, 0, 0, task->pix_width, task->pix_height);
+	if (yh.state == YH_ST_FORM)
+		YhDrawForm(task, dc);
+	else
+		YhDrawChat(task, dc);
+}
+
+/***** login flow *****/
+
+U0 YhLogin()
+{
+	StrCopy(yh.f_status, "Logging in...");
+	if (!YhAuth)
+		return;
+	YhConfigSave;
+	yh.state = YH_ST_CHAT;
+	StrPrint(Fs->task_title, "yHarmony - %s", yh.username);
+	YhFetchServers;
+	if (yh.num_servers)
+		YhSwitchServer(0);
+	YhWsConnect;
+	yh.poll_deadline = counts.jiffies + 3 * JIFFY_FREQ;
+}
+
+/***** input *****/
+
+U0 YhSubmit()
+{
+	U8 *slot;
+
+	if (!yh.input_len)
+		return;
+	if (yh.hist_count == YH_HIST_MAX)
+	{
+		MemCopy(yh.hist, yh.hist + YH_IN_MAX, (YH_HIST_MAX - 1) * YH_IN_MAX);
+		yh.hist_count--;
+	}
+	slot = yh.hist + yh.hist_count * YH_IN_MAX;
+	MemCopy(slot, yh.input, yh.input_len + 1);
+	yh.hist_count++;
+	yh.hist_pos = yh.hist_count;
+
+	if (yh.input[0] == '/')
+	{
+		if (!StrICompare(yh.input, "/quit"))
+			yh.quit = TRUE;
+		else if (!StrICompare(yh.input, "/reconnect"))
+		{
+			YhWsShutdown;
+			YhWsConnect;
+		}
+		else
+		{
+			YhStatus("Commands: /quit /reconnect   TAB cycles channels");
+		}
+	}
+	else
+		YhSendMessage(yh.input);
+	yh.input_len = 0;
+	yh.input[0] = 0;
+	yh.scroll = 0;
+}
+
+U0 YhHistNav(I64 dir)
+{
+	U8 *slot;
+
+	yh.hist_pos = ClampI64(yh.hist_pos + dir, 0, yh.hist_count);
+	if (yh.hist_pos == yh.hist_count)
+	{
+		yh.input_len = 0;
+		yh.input[0] = 0;
+	}
+	else
+	{
+		slot = yh.hist + yh.hist_pos * YH_IN_MAX;
+		StrCopy(yh.input, slot);
+		yh.input_len = StrLen(yh.input);
+	}
+}
+
+U0 YhFormKey(I64 ch, I64 sc)
+{
+	U8	*vals[4];
+	I64	 max[4], len;
+	U8	*f;
+
+	vals[0] = yh.f_url;		max[0] = 126;
+	vals[1] = yh.f_anon;	max[1] = 510;
+	vals[2] = yh.f_email;	max[2] = 78;
+	vals[3] = yh.f_pass;	max[3] = 78;
+
+	if (ch == '\t')
+		yh.f_focus = (yh.f_focus + 1) % 5;
+	else if (ch == '\n')
+	{
+		if (yh.f_focus < 4)
+			yh.f_focus++;
+		if (yh.f_focus >= 4)
+			YhLogin;
+	}
+	else if (ch == CH_ESC || ch == CH_SHIFT_ESC)
+		yh.quit = TRUE;
+	else if (ch == CH_BACKSPACE && yh.f_focus < 4)
+	{
+		f = vals[yh.f_focus];
+		len = StrLen(f);
+		if (len)
+			f[len - 1] = 0;
+	}
+	else if (' ' <= ch < 0x7F && yh.f_focus < 4)
+	{
+		f = vals[yh.f_focus];
+		len = StrLen(f);
+		if (len < max[yh.f_focus])
+		{
+			f[len] = ch;
+			f[len + 1] = 0;
+		}
+	}
+	else if (!ch)
+	{
+		if (sc == SC_CURSOR_DOWN)
+			yh.f_focus = (yh.f_focus + 1) % 5;
+		else if (sc == SC_CURSOR_UP)
+			yh.f_focus = (yh.f_focus + 4) % 5;
+	}
+}
+
+U0 YhFormClick(I64 mx, I64 my)
+{
+	I64 fx = (Fs->pix_width - YH_FORM_W) / 2;
+	I64 fy = (Fs->pix_height - YH_FORM_H) / 2;
+	I64 i, y;
+
+	for (i = 0; i < 4; i++)
+	{
+		y = fy + 40 + i * 32;
+		if (fx + 96 <= mx < fx + YH_FORM_W - 16 && y <= my < y + 20)
+		{
+			yh.f_focus = i;
+			return;
+		}
+	}
+	y = fy + YH_CB_DY;
+	if (fx + 16 <= mx < fx + 300 && y - 2 <= my < y + YH_CB_SZ + 2)
+	{
+		yh.f_autoconn = !yh.f_autoconn;
+		YhConfigSave;
+		return;
+	}
+	y = fy + YH_BTN_DY;
+	if (fx + 96 <= mx < fx + 216 && y <= my < y + 24)
+		YhLogin;
+	else if (fx + 232 <= mx < fx + 352 && y <= my < y + 24)
+		yh.quit = TRUE;
+}
+
+U0 YhNextChan(I64 dir)
+{//Cycle channels within the current server.
+	I64 i, n = yh.num_chans;
+
+	if (yh.cur_chan < 0)
+		return;
+	i = yh.cur_chan;
+	while (n--)
+	{
+		i = (i + dir + yh.num_chans) % yh.num_chans;
+		if (yh.chans[i].server == yh.cur_srv)
+		{
+			YhSwitchChan(i);
+			return;
+		}
+	}
+}
+
+U0 YhChatKey(I64 ch, I64 sc)
+{
+	if (ch == CH_ESC || ch == CH_SHIFT_ESC)
+		yh.quit = TRUE;
+	else if (ch == '\n')
+		YhSubmit;
+	else if (ch == '\t')
+		YhNextChan(1);
+	else if (ch == CH_BACKSPACE)
+	{
+		if (yh.input_len)
+			yh.input[--yh.input_len] = 0;
+	}
+	else if (' ' <= ch < 0x7F)
+	{
+		if (yh.input_len < YH_IN_MAX - 2)
+		{
+			yh.input[yh.input_len++] = ch;
+			yh.input[yh.input_len] = 0;
+		}
+	}
+	else if (!ch)
+	{
+		switch (sc)
+		{
+			case SC_CURSOR_UP:
+				YhHistNav(-1);
+				break;
+			case SC_CURSOR_DOWN:
+				YhHistNav(1);
+				break;
+			case SC_PAGE_UP:
+				yh.scroll += 10;
+				break;
+			case SC_PAGE_DOWN:
+				yh.scroll = MaxI64(0, yh.scroll - 10);
+				break;
+			case SC_END:
+				yh.scroll = 0;
+				break;
+		}
+	}
+	yh.scroll = ClampI64(yh.scroll, 0, YH_MAX_LINES * 4);
+}
+
+U0 YhChatClick(I64 mx, I64 my)
+{
+	I64	 i, y, r, log_y = 4 + 20 + 12;
+	I64	 log_h = Fs->pix_height - 22 - 4 - 6 - log_y;
+
+	//Server tabs.
+	if (4 <= my < 24)
+	{
+		for (i = 0; i < yh.num_servers; i++)
+			if (yh.servers[i].tab_w &&
+				yh.servers[i].tab_x <= mx < yh.servers[i].tab_x + yh.servers[i].tab_w)
+			{
+				YhSwitchServer(i);
+				return;
+			}
+		return;
+	}
+	//Channel panel.
+	if (8 <= mx < 8 + YH_CHAN_PANEL_W)
+	{
+		r = 0;
+		for (i = 0; i < yh.num_chans; i++)
+		{//No `continue` in ZealC.
+			if (yh.chans[i].server == yh.cur_srv)
+			{
+				y = log_y + 18 + r * YH_ROW_H;
+				if (y + FONT_HEIGHT > log_y + log_h)
+					break;
+				if (y <= my < y + YH_ROW_H)
+				{
+					YhSwitchChan(i);
+					return;
+				}
+				r++;
+			}
+		}
+	}
+}
+
+/***** pump *****/
+
+U0 YhPoll()
+{
+	I64 m, a1, a2, dz;
+
+	while (m = MessageScan(&a1, &a2))
+	{
+		switch (m)
+		{
+			case MESSAGE_KEY_DOWN:
+				if (yh.state == YH_ST_FORM)
+					YhFormKey(a1, a2.u8[0]);
+				else
+					YhChatKey(a1, a2.u8[0]);
+				break;
+			case MESSAGE_MS_L_DOWN:
+				if (yh.state == YH_ST_FORM)
+					YhFormClick(a1, a2);
+				else
+					YhChatClick(a1, a2);
+				break;
+		}
+	}
+
+	dz = mouse.pos.z - yh.last_z;
+	yh.last_z = mouse.pos.z;
+	if (dz && yh.state == YH_ST_CHAT && Fs == sys_focus_task)
+		yh.scroll = ClampI64(yh.scroll - dz * 3, 0, YH_MAX_LINES * 4);
+}
+
+U0 YhNetPump()
+{//Realtime ring drain, poll fallback, token upkeep. UI task only.
+	while (yh.rt_rd < yh.rt_wr)
+	{
+		YhRtHandle(yh.rt_ring[yh.rt_rd & (YH_RT_RING - 1)]);
+		Free(yh.rt_ring[yh.rt_rd & (YH_RT_RING - 1)]);
+		yh.rt_rd++;
+	}
+
+	if (yh.cur_chan >= 0 && counts.jiffies > yh.poll_deadline)
+	{//Fast poll when the socket is down; slow safety-net poll when it's up
+	 //(covers instances where realtime delivers nothing, e.g. WALRUS off).
+	 //The created_at watermark dedupes against realtime rows.
+		YhFetchMessages(yh.cur_chan, FALSE);
+		if (yh.ws_ok)
+			yh.poll_deadline = counts.jiffies + 15 * JIFFY_FREQ;
+		else
+			yh.poll_deadline = counts.jiffies + 25 * JIFFY_FREQ / 10;	//2.5s.
+	}
+
+	if (!yh.ws_ok)
+	{
+		if (yh.ws && counts.jiffies > yh.reconnect_deadline)
+		{//The socket died at some point: clean it up, then retry once a minute.
+			YhWsShutdown;
+			YhWsConnect;
+			yh.reconnect_deadline = counts.jiffies + 60 * JIFFY_FREQ;
+		}
+		else if (!yh.ws && counts.jiffies > yh.reconnect_deadline)
+		{
+			YhWsConnect;
+			yh.reconnect_deadline = counts.jiffies + 60 * JIFFY_FREQ;
+		}
+	}
+
+	if (yh.jwt[0] && counts.jiffies > yh.tok_deadline)
+		YhTokenRefresh;
+}
+
+/***** main *****/
+
+public U0 YHarmony()
+{
+	I64 i, old_inhibit;
+
+	MemSet(&yh, 0, sizeof(CYhGlobals));	//Globals are NOT zeroed on load.
+	yh.last_z = mouse.pos.z;
+	yh.cur_chan = -1;
+
+	yh.c_red   = ColorRGB(0xD8, 0x6A, 0x6A);
+	yh.c_green = ColorRGB(0x5E, 0xC8, 0x7A);
+	for (i = 0; i < 16; i++)
+		yh.c_nick[i] = DEHue2RGB(i * 360 / 16, 170, 210 + (i & 1) * 35);
+
+	StrCopy(yh.f_url, "https://");
+	YhConfigLoad;
+
+	SettingsPush;
+	old_inhibit = Fs->win_inhibit;
+	StrCopy(Fs->task_title, "yHarmony");
+	WinHorz(MaxI64(1, (TEXT_COLS - 116) / 2), MaxI64(1, (TEXT_COLS - 116) / 2) + 115);
+	WinVert(MaxI64(2, (TEXT_ROWS - 56) / 2), MaxI64(2, (TEXT_ROWS - 56) / 2) + 55);
+	Fs->win_inhibit = old_inhibit | WIF_FOCUS_TASK_MS_L_D;
+	WinFocus;
+	DocCursor(OFF);
+	DocClear;
+	Fs->draw_it = &YhDrawIt;
+
+	if (yh.f_autoconn && yh.f_anon[0] && yh.f_email[0])
+		YhLogin;
+
+	while (!yh.quit)
+	{
+		YhPoll;
+		if (yh.state == YH_ST_CHAT)
+			YhNetPump;
+		Sleep(30);
+	}
+
+	YhWsShutdown;
+	Fs->draw_it = NULL;
+	Fs->win_inhibit = old_inhibit;
+	for (i = 0; i < yh.num_chans; i++)
+		Free(yh.chans[i].lines);
+	DocCursor(ON);
+	DocClear;
+	SettingsPop;
+}
+
+YHarmony;

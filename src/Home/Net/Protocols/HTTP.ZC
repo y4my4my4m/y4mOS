@@ -769,9 +769,11 @@ I64 HttpChunkedComplete(U8 *body, I64 len)
 }
 
 CHttpResponse *HttpRequestRaw(CHttpUrl *url, U8 *method="GET",
-							  U8 *content_type=NULL, U8 *body=NULL, I64 body_len=0)
+							  U8 *content_type=NULL, U8 *body=NULL, I64 body_len=0,
+							  U8 *extra_hdrs=NULL)
 { // One request/response round trip; no redirect handling here.
   // Sends the cookie jar, accepts gzip, parses Set-Cookie, inflates the body.
+  // extra_hdrs: raw header lines ("Name: v\r\n" each), for API auth headers.
 	CTCPSocket	  *sock;
 	CTLS		  *tls = NULL;
 	CHttpResponse *response;
@@ -832,6 +834,8 @@ http_fresh:
 	}
 
 	cookie_hdr = HttpCookieHeaderBuild(url); // "" or "Cookie: ...\r\n"
+	if (!extra_hdrs)
+		extra_hdrs = "";
 	if (poolable)
 		conn_val = "keep-alive"; // this task reuses the socket for the next req
 	else
@@ -855,12 +859,12 @@ http_fresh:
 							"Sec-Fetch-User: ?1\r\n"
 							"Sec-Fetch-Dest: document\r\n"
 							"Upgrade-Insecure-Requests: 1\r\n"
-							"%s"
+							"%s%s"
 							"Content-Type: %s\r\n"
 							"Content-Length: %d\r\n"
 							"Connection: %s\r\n"
 							"\r\n",
-							method, url->path, url->host, cookie_hdr,
+							method, url->path, url->host, cookie_hdr, extra_hdrs,
 							content_type, body_len, conn_val);
 	}
 	else
@@ -879,10 +883,11 @@ http_fresh:
 							"Sec-Fetch-User: ?1\r\n"
 							"Sec-Fetch-Dest: document\r\n"
 							"Upgrade-Insecure-Requests: 1\r\n"
-							"%s"
+							"%s%s"
 							"Connection: %s\r\n"
 							"\r\n",
-							method, url->path, url->host, cookie_hdr, conn_val);
+							method, url->path, url->host, cookie_hdr, extra_hdrs,
+							conn_val);
 	Free(cookie_hdr);
 	if (tls)
 	{
@@ -1124,7 +1129,8 @@ CHttpResponse *HttpGetRaw(CHttpUrl *url)
 	return HttpRequestRaw(url, "GET");
 }
 
-CHttpResponse *HttpNav(U8 *url, U8 *method, U8 *content_type, U8 *body, I64 body_len)
+CHttpResponse *HttpNav(U8 *url, U8 *method, U8 *content_type, U8 *body, I64 body_len,
+					   U8 *extra_hdrs=NULL)
 { // request with redirect following. Browser rules: 303 (and 301/302 after a
   // POST) turn into a GET without a body; 307/308 repeat the method + body.
 	CHttpUrl	   parsed;
@@ -1140,7 +1146,8 @@ CHttpResponse *HttpNav(U8 *url, U8 *method, U8 *content_type, U8 *body, I64 body
 			done = TRUE;
 		else
 		{
-			response = HttpRequestRaw(&parsed, method, content_type, body, body_len);
+			response = HttpRequestRaw(&parsed, method, content_type, body, body_len,
+									  extra_hdrs);
 
 			if (response &&
 				(response->status == 301 || response->status == 302 ||
@@ -1199,6 +1206,17 @@ CHttpResponse *HttpPost(U8 *url, U8 *body,
 						U8 *content_type="application/x-www-form-urlencoded")
 { // POST with browser-style redirect handling. Caller keeps ownership of body.
 	return HttpNav(url, "POST", content_type, body, StrLen(body));
+}
+
+CHttpResponse *HttpReq(U8 *url, U8 *method="GET", U8 *body=NULL,
+					   U8 *content_type="application/json", U8 *extra_hdrs=NULL)
+{ // API-style request: any method, JSON default, custom header lines
+  // ("Name: value\r\n" each). Caller frees with HttpResponseFree.
+	I64 body_len = 0;
+
+	if (body)
+		body_len = StrLen(body);
+	return HttpNav(url, method, content_type, body, body_len, extra_hdrs);
 }
 
 public U0 HttpTest(U8 *url="https://example.com")
