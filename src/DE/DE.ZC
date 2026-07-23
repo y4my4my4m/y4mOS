@@ -46,7 +46,8 @@ class CDEGlobals
 	Bool	 on, net_up, glass, cfg_dirty;
 } de;
 
-#define DE_CFG_PATH		"::/Home/YDE.CFG"
+#define DE_CFG_DIR		"::/Home/Config"
+#define DE_CFG_PATH		"::/Home/Config/YDE.CFG"
 
 U0 DEConfigSave()
 {//Persist the tweakable desktop settings as a plain key=value text file the
@@ -55,6 +56,7 @@ U0 DEConfigSave()
 
 	if (!de.on || !DriveIsWritable)
 		return;
+	DirMake(DE_CFG_DIR);
 	buf = MStrPrint(
 		"# YDE desktop settings - edit freely, reloaded on boot.\n"
 		"hue %d\n"

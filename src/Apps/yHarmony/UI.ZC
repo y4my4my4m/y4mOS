@@ -473,6 +473,7 @@ U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
 						}
 						ay += YH_ROW_H;
 					}
+				}
 					//Action footer: reply / boost / fav / bookmark. Distinct nx0
 					//codes let the click handler tell the buttons apart.
 					ay += 2;
@@ -498,7 +499,6 @@ U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
 						GrPrint(dc, fbx, ay, "mark");
 						YhHitPush(ay, ay + YH_ROW_H, fbx, fbx + 5 * FONT_WIDTH, yh.cur_chan, i, 4);
 					}
-				}
 			}
 			y = ytop + cardh + 8;	//Card gap.
 			imgn = 0;

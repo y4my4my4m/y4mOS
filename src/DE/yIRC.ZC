@@ -26,7 +26,8 @@
 #define YIRC_HIST_MAX	10
 #define YIRC_IN_MAX		440
 
-#define YIRC_CFG_PATH	"::/Home/YIRC.CFG"
+#define YIRC_CFG_DIR	"::/Home/Config"
+#define YIRC_CFG_PATH	"::/Home/Config/YIRC.CFG"
 
 //Line kinds.
 #define YIRC_LK_MSG		0
@@ -659,6 +660,7 @@ U0 YIrcConfigSave()
 
 	if (!DriveIsWritable)
 		return;
+	DirMake(YIRC_CFG_DIR);
 	buf = MStrPrint(
 		"# yIRC settings - edit freely, reloaded on launch.\n"
 		"server %s\n"

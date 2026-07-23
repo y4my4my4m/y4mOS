@@ -9,7 +9,8 @@
 #define YH_HIST_MAX		8
 #define YH_MAX_PROFILES	128
 
-#define YH_CFG_PATH		"::/Home/YHARMONY.CFG"
+#define YH_CFG_DIR		"::/Home/Config"
+#define YH_CFG_PATH		"::/Home/Config/YHARMONY.CFG"
 
 #define YH_ROW_H		(FONT_HEIGHT + 2)
 #define YH_HDR_H		18	//Message-group header row (16px avatar + pad).
@@ -233,6 +234,7 @@ U0 YhConfigSave()
 
 	if (!DriveIsWritable)
 		return;
+	DirMake(YH_CFG_DIR);
 	buf = MStrPrint(
 		"# yHarmony settings. host = your instance domain; url + anon are\n"
 		"# auto-discovered from https://host/instance-info and cached here.\n"
