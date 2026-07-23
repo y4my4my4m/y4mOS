@@ -701,50 +701,77 @@ U0 YhFetchMessages(I64 ci, Bool initial)
 		YhFetchReactions(ci);
 }
 
-U0 YhSendMessage(U8 *text)
-{
-	U8		 esc[YH_TEXT_LEN * 2], reply[80];
-	U8		*body, *col;
-	CYhJson	*json;
+U0 YhAttachPick()
+{//"+" button: stage a local file. NOT uploaded yet - a helper strip above
+//the input shows it; the upload happens when the message is sent.
+	U8 *file = PopUpPickFile("::/Home");
 
-	if (yh.cur_chan < 0)
+	if (!file)
 		return;
-	if (yh.chans[yh.cur_chan].is_dm)
-		col = "conversation_id";
-	else
-		col = "channel_id";
-	reply[0] = 0;
-	if (yh.reply_to[0])
-		StrPrint(reply, "\"reply_to\":\"%s\",", yh.reply_to);
-	YhJsonEsc(esc, text, sizeof(esc));
-	body = MStrPrint(
-		"{\"user_id\":\"%s\",\"%s\":\"%s\",%s"
-		"\"content\":[{\"type\":\"text\",\"text\":\"%s\"}],"
-		"\"metadata\":{\"created_via\":\"yharmony_zealos\"}}",
-		yh.prof_id, col, yh.chans[yh.cur_chan].id, reply, esc);
-	json = YhRest("POST", "/rest/v1/messages", body);
-	Free(body);
-	if (json)
-	{//Prefer: return=representation gives the row back: echo it and bump the
-	 //watermark so realtime/poll won't show it twice.
-		if (json->child)
-			YhMsgRowAdd(yh.cur_chan, json->child, esc, sizeof(esc));
-		YhjFree(json);
-		yh.reply_to[0] = 0;	//One-shot.
-		yh.reply_nick[0] = 0;
-	}
-	else
-		YhStatus("Send failed.");
+	MemCopy(yh.att_file, file, MinI64(StrLen(file), 199));
+	yh.att_file[MinI64(StrLen(file), 199)] = 0;
+	yh.att_on = TRUE;
+	Free(file);
 }
 
-U8 *YhListAdd(U8 *w, U8 *fmt, ...)
-{//Append one PopUpPickList item plus its NUL separator; returns new write ptr.
-	U8 *s = StrPrintJoin(NULL, fmt, argc, argv);
+U8 *YhAttachUpload(U8 *ftype_out)
+{//Upload the staged file to user_media/{prof}/. Returns the MStrPrint'ed
+//public URL (caller frees) or NULL. ftype_out (>=12 bytes) gets image/file.
+	U8	*fbuf, *url, *pub;
+	I64	 size;
+	CHttpResponse *resp;
+	U8	 name[96], *ext;
 
-	StrCopy(w, s);
-	w += StrLen(s) + 1;
-	Free(s);
-	return w;
+	StrCopy(ftype_out, "file");
+	if (!yh.att_on || !yh.att_file[0])
+		return NULL;
+	fbuf = FileRead(yh.att_file, &size);
+	if (!fbuf || size < 1)
+	{
+		YhStatus("Could not read the staged file.");
+		return NULL;
+	}
+	ext = "bin";
+	if (size > 8 && !MemCompare(fbuf + 1, "PNG", 3))
+	{
+		ext = "png";
+		StrCopy(ftype_out, "image");
+	}
+	else if (size > 2 && fbuf[0] == 0xFF && fbuf[1] == 0xD8)
+	{
+		ext = "jpg";
+		StrCopy(ftype_out, "image");
+	}
+	else if (size > 4 && !MemCompare(fbuf, "GIF8", 4))
+	{
+		ext = "gif";
+		StrCopy(ftype_out, "image");
+	}
+	else if (size > 12 && !MemCompare(fbuf, "RIFF", 4) &&
+			 !MemCompare(fbuf + 8, "WEBP", 4))
+	{
+		ext = "webp";
+		StrCopy(ftype_out, "image");
+	}
+	StrPrint(name, "%s/zeal_%08X.%s", yh.prof_id, counts.jiffies & 0xFFFFFFFF, ext);
+	url = MStrPrint("%s/storage/v1/object/user_media/%s", yh.f_url, name);
+	YhStatus("Uploading...");
+	//Binary body: bypass HttpReq (StrLen would stop at the first NUL byte).
+	resp = HttpNav(url, "POST", "application/octet-stream", fbuf, size, yh.hdrs);
+	Free(url);
+	Free(fbuf);
+	if (!resp || resp->status < 200 || resp->status >= 300)
+	{
+		if (resp)
+			HttpResponseFree(resp);
+		YhStatus("Upload failed (check Network Log).");
+		return NULL;
+	}
+	HttpResponseFree(resp);
+	yh.att_on = FALSE;
+	yh.att_file[0] = 0;
+	pub = MStrPrint("%s/storage/v1/object/public/user_media/%s", yh.f_url, name);
+	return pub;
 }
 
 U0 YhEmojiLoad()
@@ -778,10 +805,13 @@ U0 YhEmojiLoad()
 			StrCopy(yh.em_ids[yh.em_n], YhjStr(YhjGet(row, "id")));
 			MemCopy(yh.em_names[yh.em_n], nm, MinI64(StrLen(nm), 31));
 			yh.em_names[yh.em_n][MinI64(StrLen(nm), 31)] = 0;
+			nm = YhjStr(YhjGet(row, "url"));
+			MemCopy(yh.em_url[yh.em_n], nm, MinI64(StrLen(nm), 159));
+			yh.em_url[yh.em_n][MinI64(StrLen(nm), 159)] = 0;
 			yh.em_img[yh.em_n] = -1;
-			if (*YhjStr(YhjGet(row, "url")))
+			if (*yh.em_url[yh.em_n])
 			{
-				YhImgAbs(YhjStr(YhjGet(row, "url")), abs, sizeof(abs));
+				YhImgAbs(yh.em_url[yh.em_n], abs, sizeof(abs));
 				yh.em_img[yh.em_n] = YhImgGet(abs, 12, 12);
 			}
 			yh.em_n++;
@@ -790,6 +820,174 @@ U0 YhEmojiLoad()
 	}
 	YhjFree(json);
 }
+
+U0 YhBuildContent(U8 *text, U8 *out, I64 max)
+{//Turn plain text with :name: shortcodes into a Harmony MessagePart[] JSON
+//array: text runs stay {type:text}, known custom emojis become proper
+//{type:emoji,emoji:{id,name,url}} parts. Unknown :names: stay in text.
+//(ZealC: no `continue`, locals function-scoped - tmp hoisted.)
+	U8	 esc[YH_TEXT_LEN * 2], name[40], eurl[240], tmp[YH_TEXT_LEN];
+	U8	*p = text, *run = text, *colon;
+	I64	 n, k, i, len, runlen;
+	Bool first = TRUE, matched;
+
+	YhEmojiLoad;	//Ensure the cache reflects the current server.
+	out[0] = '[';
+	n = 1;
+	while (*p)
+	{
+		matched = FALSE;
+		if (*p == ':')
+		{
+			colon = StrFirstOcc(p + 1, ":");
+			len = 0;
+			if (colon)
+				len = colon - (p + 1);
+			k = -1;
+			if (colon && len >= 1 && len <= 31)
+			{
+				MemCopy(name, p + 1, len);
+				name[len] = 0;
+				for (i = 0; i < yh.em_n; i++)
+					if (!StrCompare(yh.em_names[i], name))
+						k = i;
+			}
+			if (k >= 0)
+			{
+				matched = TRUE;
+				//Flush the pending text run before the emoji part.
+				if (p > run)
+				{
+					runlen = MinI64(p - run, YH_TEXT_LEN - 1);
+					MemCopy(tmp, run, runlen);
+					tmp[runlen] = 0;
+					YhJsonEsc(esc, tmp, sizeof(esc));
+					if (!first)
+						out[n++] = ',';
+					StrPrint(out + n, "{\"type\":\"text\",\"text\":\"%s\"}", esc);
+					n += StrLen(out + n);
+					first = FALSE;
+				}
+				YhJsonEsc(eurl, yh.em_url[k], sizeof(eurl));
+				if (!first)
+					out[n++] = ',';
+				StrPrint(out + n,
+					"{\"type\":\"emoji\",\"emoji\":{\"id\":\"%s\","
+					"\"name\":\"%s\",\"url\":\"%s\"}}",
+					yh.em_ids[k], yh.em_names[k], eurl);
+				n += StrLen(out + n);
+				first = FALSE;
+				p = colon + 1;
+				run = p;
+			}
+		}
+		if (!matched)
+			p++;
+		if (n > max - 400)
+			break;
+	}
+	//Trailing text run.
+	if (p > run)
+	{
+		runlen = MinI64(p - run, YH_TEXT_LEN - 1);
+		MemCopy(tmp, run, runlen);
+		tmp[runlen] = 0;
+		YhJsonEsc(esc, tmp, sizeof(esc));
+		if (!first)
+			out[n++] = ',';
+		StrPrint(out + n, "{\"type\":\"text\",\"text\":\"%s\"}", esc);
+		n += StrLen(out + n);
+		first = FALSE;
+	}
+	if (first)
+	{//Empty text = a single empty text part (content must be non-empty).
+		StrPrint(out + n, "{\"type\":\"text\",\"text\":\"\"}");
+		n += StrLen(out + n);
+	}
+	out[n++] = ']';
+	out[n] = 0;
+}
+
+U0 YhContentAddFile(U8 *content, U8 *url, U8 *ftype, I64 max)
+{//Splice a {type:file} part before the closing ']' of a content array.
+	I64	 n = StrLen(content);
+	U8	 esc[300];
+
+	while (n && content[n - 1] != ']')
+		n--;
+	if (!n)
+		return;
+	n--;	//On the ']'.
+	YhJsonEsc(esc, url, sizeof(esc));
+	if (n + StrLen(esc) + 80 >= max)
+		return;
+	//content[..n) is "[...parts"; append ",{file}]".
+	if (content[n - 1] == '[')
+		StrPrint(content + n, "{\"type\":\"file\",\"url\":\"%s\",\"fileType\":\"%s\"}]",
+				 esc, ftype);
+	else
+		StrPrint(content + n, ",{\"type\":\"file\",\"url\":\"%s\",\"fileType\":\"%s\"}]",
+				 esc, ftype);
+}
+
+U0 YhSendMessage(U8 *text)
+{
+	U8		 esc[YH_TEXT_LEN * 2], reply[80], ftype[12];
+	U8		 content[YH_TEXT_LEN * 4];
+	U8		*body, *col, *att_url;
+	CYhJson	*json;
+
+	if (yh.cur_chan < 0)
+		return;
+	if (yh.chans[yh.cur_chan].is_dm)
+		col = "conversation_id";
+	else
+		col = "channel_id";
+	reply[0] = 0;
+	if (yh.reply_to[0])
+		StrPrint(reply, "\"reply_to\":\"%s\",", yh.reply_to);
+	//Staged attachment: upload now, then send text+file (or file-only) parts.
+	att_url = NULL;
+	if (yh.att_on)
+	{
+		att_url = YhAttachUpload(ftype);
+		if (!att_url)
+			return;	//Upload failed; keep the input + staging intact.
+	}
+	//Text -> proper MessagePart[] (custom :emoji: become emoji parts).
+	YhBuildContent(text, content, sizeof(content));
+	if (att_url)
+		YhContentAddFile(content, att_url, ftype, sizeof(content));
+	Free(att_url);
+	body = MStrPrint(
+		"{\"user_id\":\"%s\",\"%s\":\"%s\",%s\"content\":%s,"
+		"\"metadata\":{\"created_via\":\"yharmony_zealos\"}}",
+		yh.prof_id, col, yh.chans[yh.cur_chan].id, reply, content);
+	json = YhRest("POST", "/rest/v1/messages", body);
+	Free(body);
+	if (json)
+	{//Prefer: return=representation gives the row back: echo it and bump the
+	 //watermark so realtime/poll won't show it twice.
+		if (json->child)
+			YhMsgRowAdd(yh.cur_chan, json->child, esc, sizeof(esc));
+		YhjFree(json);
+		yh.reply_to[0] = 0;	//One-shot.
+		yh.reply_nick[0] = 0;
+	}
+	else
+		YhStatus("Send failed.");
+}
+
+U8 *YhListAdd(U8 *w, U8 *fmt, ...)
+{//Append one PopUpPickList item plus its NUL separator; returns new write ptr.
+	U8 *s = StrPrintJoin(NULL, fmt, argc, argv);
+
+	StrCopy(w, s);
+	w += StrLen(s) + 1;
+	Free(s);
+	return w;
+}
+
 
 U0 YhReactPost(CYhLine *ln, I64 k)
 {//Insert a reactions row for cached emoji k; pill appended locally.
@@ -813,102 +1011,156 @@ U0 YhReactPost(CYhLine *ln, I64 k)
 		YhStatus("Reaction failed.");
 }
 
-U0 YhUpload()
-{//Pick a local file, upload it to the user_media bucket (path must start
-//with our profile id - storage RLS), then send it as a file-part message.
-	U8	*file, *fbuf, *body, *url, *pub, *ext, *ftype;
-	I64	 size;
-	CHttpResponse *resp;
-	U8	 name[96];
-	CYhJson	*json;
-	U8	 esc[YH_TEXT_LEN * 2];
 
-	if (yh.cur_chan < 0 || yh.chans[yh.cur_chan].server == YH_SRV_FEED)
-	{
-		YhStatus("Open a channel or DM first.");
-		return;
-	}
-	file = PopUpPickFile("::/Home");
-	if (!file)
-		return;
-	fbuf = FileRead(file, &size);
-	if (!fbuf || size < 1)
-	{
-		Free(file);
-		YhStatus("Could not read that file.");
-		return;
-	}
-	//Content sniff -> extension + mime + fileType part field.
-	ext = "bin";
-	ftype = "file";
-	if (size > 8 && !MemCompare(fbuf + 1, "PNG", 3))
-	{
-		ext = "png";
-		ftype = "image";
-	}
-	else if (size > 2 && fbuf[0] == 0xFF && fbuf[1] == 0xD8)
-	{
-		ext = "jpg";
-		ftype = "image";
-	}
-	else if (size > 4 && !MemCompare(fbuf, "GIF8", 4))
-	{
-		ext = "gif";
-		ftype = "image";
-	}
-	else if (size > 12 && !MemCompare(fbuf, "RIFF", 4) &&
-			 !MemCompare(fbuf + 8, "WEBP", 4))
-	{
-		ext = "webp";
-		ftype = "image";
-	}
+I64 YhUserSearch(U8 *query)
+{//Search profiles by username prefix/substring into yh.fl_ids +
+//yh.menu_items (shared with the follow-list menu plumbing). Returns count.
+	CYhJson	*json, *row;
+	I64		 n = 0;
+	U8		*nm, *uid;
 
-	StrPrint(name, "%s/zeal_%08X.%s", yh.prof_id, counts.jiffies & 0xFFFFFFFF, ext);
-	url = MStrPrint("%s/storage/v1/object/user_media/%s", yh.f_url, name);
-	YhStatus("Uploading...");
-	//Binary body: bypass HttpReq (StrLen would stop at the first NUL byte).
-	resp = HttpNav(url, "POST", "application/octet-stream", fbuf, size, yh.hdrs);
-	Free(url);
-	Free(fbuf);
-	Free(file);
-	if (!resp || resp->status < 200 || resp->status >= 300)
+	json = YhRest("GET",
+		"/rest/v1/profiles?username=ilike.*%s*&is_suspended=eq.false"
+		"&limit=14&select=id,username,avatar_url",
+		NULL, query);
+	if (!json)
+		return 0;
+	row = json->child;
+	while (row && n < 14)
 	{
-		if (resp)
-			HttpResponseFree(resp);
-		YhStatus("Upload failed (check Network Log).");
-		return;
-	}
-	HttpResponseFree(resp);
-
-	pub = MStrPrint("%s/storage/v1/object/public/user_media/%s", yh.f_url, name);
-	YhJsonEsc(esc, pub, sizeof(esc));
-	if (yh.chans[yh.cur_chan].is_dm)
-		body = MStrPrint(
-			"{\"user_id\":\"%s\",\"conversation_id\":\"%s\","
-			"\"content\":[{\"type\":\"file\",\"url\":\"%s\",\"fileType\":\"%s\"}],"
-			"\"metadata\":{\"created_via\":\"yharmony_zealos\"}}",
-			yh.prof_id, yh.chans[yh.cur_chan].id, esc, ftype);
-	else
-		body = MStrPrint(
-			"{\"user_id\":\"%s\",\"channel_id\":\"%s\","
-			"\"content\":[{\"type\":\"file\",\"url\":\"%s\",\"fileType\":\"%s\"}],"
-			"\"metadata\":{\"created_via\":\"yharmony_zealos\"}}",
-			yh.prof_id, yh.chans[yh.cur_chan].id, esc, ftype);
-	json = YhRest("POST", "/rest/v1/messages", body);
-	Free(body);
-	Free(pub);
-	if (json)
-	{
-		if (json->child)
+		uid = YhjStr(YhjGet(row, "id"));
+		nm = YhjStr(YhjGet(row, "username"));
+		if (*uid && *nm)
 		{
-			esc[0] = 0;
-			YhMsgRowAdd(yh.cur_chan, json->child, esc, sizeof(esc));
+			YhProfileAdd(uid, nm, YhjStr(YhjGet(row, "avatar_url")));
+			StrCopy(yh.fl_ids[n], uid);
+			MemCopy(yh.menu_items[n], nm, MinI64(StrLen(nm), 35));
+			yh.menu_items[n][MinI64(StrLen(nm), 35)] = 0;
+			n++;
 		}
-		YhjFree(json);
-		YhStatus("Uploaded.");
+		row = row->next;
 	}
-	else
-		YhStatus("Upload message failed.");
+	YhjFree(json);
+	return n;
+}
+
+
+I64 YhServerBrowse()
+{//Public servers into yh.fl_ids + menu items. Returns count.
+	CYhJson	*json, *row;
+	I64		 n = 0;
+	U8		*sid, *nm;
+
+	json = YhRest("GET",
+		"/rest/v1/servers?public=eq.true&limit=14&select=id,name",
+		NULL);
+	if (!json)
+		return 0;
+	row = json->child;
+	while (row && n < 14)
+	{
+		sid = YhjStr(YhjGet(row, "id"));
+		nm = YhjStr(YhjGet(row, "name"), "server");
+		if (*sid)
+		{
+			StrCopy(yh.fl_ids[n], sid);
+			MemCopy(yh.menu_items[n], nm, MinI64(StrLen(nm), 35));
+			yh.menu_items[n][MinI64(StrLen(nm), 35)] = 0;
+			n++;
+		}
+		row = row->next;
+	}
+	YhjFree(json);
+	return n;
+}
+
+
+U0 YhProfileEditSelf()
+{//In-app profile editor: display name + bio prompts, optional avatar upload.
+	U8		*s, *body, *url, *fbuf, *ext;
+	U8		 esc[300], name[96];
+	CYhJson	*json;
+	I64		 size;
+	CHttpResponse *resp;
+
+	s = PopUpGetStr("Display name (empty = keep):");
+	if (s)
+	{
+		if (*s && *s != '\n')
+		{
+			if (s[StrLen(s) - 1] == '\n')
+				s[StrLen(s) - 1] = 0;
+			YhJsonEsc(esc, s, sizeof(esc));
+			body = MStrPrint("{\"display_name\":\"%s\"}", esc);
+			json = YhRest("PATCH", "/rest/v1/profiles?id=eq.%s", body, yh.prof_id);
+			Free(body);
+			YhjFree(json);
+		}
+		Free(s);
+	}
+	s = PopUpGetStr("Bio / about (empty = keep):");
+	if (s)
+	{
+		if (*s && *s != '\n')
+		{
+			if (s[StrLen(s) - 1] == '\n')
+				s[StrLen(s) - 1] = 0;
+			YhJsonEsc(esc, s, sizeof(esc));
+			body = MStrPrint("{\"bio\":\"%s\"}", esc);
+			json = YhRest("PATCH", "/rest/v1/profiles?id=eq.%s", body, yh.prof_id);
+			Free(body);
+			YhjFree(json);
+		}
+		Free(s);
+	}
+	if (PopUpNoYes("Change profile picture?"))
+	{
+		s = PopUpPickFile("::/Home");
+		if (s)
+		{
+			fbuf = FileRead(s, &size);
+			Free(s);
+			if (fbuf && size > 8)
+			{
+				ext = "png";
+				if (fbuf[0] == 0xFF && fbuf[1] == 0xD8)
+					ext = "jpg";
+				else if (!MemCompare(fbuf, "GIF8", 4))
+					ext = "gif";
+				else if (size > 12 && !MemCompare(fbuf, "RIFF", 4) &&
+						 !MemCompare(fbuf + 8, "WEBP", 4))
+					ext = "webp";
+				StrPrint(name, "%s/zeal_av_%08X.%s", yh.prof_id,
+						 counts.jiffies & 0xFFFFFFFF, ext);
+				url = MStrPrint("%s/storage/v1/object/avatars/%s", yh.f_url, name);
+				resp = HttpNav(url, "POST", "application/octet-stream", fbuf, size, yh.hdrs);
+				Free(url);
+				Free(fbuf);
+				if (resp && 200 <= resp->status < 300)
+				{
+					HttpResponseFree(resp);
+					url = MStrPrint("%s/storage/v1/object/public/avatars/%s",
+									yh.f_url, name);
+					YhJsonEsc(esc, url, sizeof(esc));
+					body = MStrPrint("{\"avatar_url\":\"%s\"}", esc);
+					json = YhRest("PATCH", "/rest/v1/profiles?id=eq.%s", body, yh.prof_id);
+					Free(body);
+					Free(url);
+					YhjFree(json);
+					YhStatus("Avatar updated.");
+				}
+				else
+				{
+					if (resp)
+						HttpResponseFree(resp);
+					YhStatus("Avatar upload failed.");
+				}
+			}
+			else
+				Free(fbuf);
+		}
+	}
+	YhStatus("Profile saved.");
 }
 
 /***** servers + channels *****/
@@ -978,6 +1230,23 @@ U0 YhSwitchServer(I64 si)
 	ci = YhFirstChan(si);
 	if (ci >= 0 && (yh.cur_chan < 0 || yh.chans[yh.cur_chan].server != si))
 		YhSwitchChan(ci);
+}
+
+U0 YhResetData()
+{//Clear servers/channels/DMs so a refresh rebuilds from scratch (no dupes).
+//Frees the per-channel line rings; pseudo-channels (feed/profile/DM) are
+//recreated by the caller after the refetch.
+	I64 i;
+
+	for (i = 0; i < yh.num_chans; i++)
+	{
+		Free(yh.chans[i].lines);
+		yh.chans[i].lines = NULL;
+	}
+	yh.num_chans = 0;
+	yh.num_servers = 0;
+	yh.cur_chan = -1;
+	yh.cur_srv = 0;
 }
 
 U0 YhFetchServers()

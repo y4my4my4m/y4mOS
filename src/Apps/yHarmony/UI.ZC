@@ -271,8 +271,9 @@ U0 YhDrawPills(CDC *dc, I64 x, I64 y, U8 *react, I64 xmax, I64 mx, I64 my)
 
 U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
 			  I64 log_x, I64 log_y, I64 log_w, I64 log_h, I64 mx, I64 my)
-{//Mastodon-style cards, newest at the bottom, scrolled by yh.scroll rows.
-	I64	 y = log_y + log_h - 4 + yh.scroll * YH_ROW_H;
+{//Mastodon-style cards, NEWEST AT THE TOP (social-feed order; the chat
+//keeps its bottom-up log). yh.scroll rows shift toward older cards below.
+	I64	 y = log_y + 4 - yh.scroll * YH_ROW_H;
 	I64	 first = MaxI64(0, cb->count - YH_MAX_LINES);
 	I64	 i = cb->count - 1, j, r, rows, avail, blen, seg, ytop, ih, ay, cardh;
 	I64	 imgn, imgi[4];
@@ -284,7 +285,7 @@ U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
 
 	avail = MaxI64(16, (cw - 20) / FONT_WIDTH);
 	imgn = 0;
-	while (i >= first && y > y0c)
+	while (i >= first && y < y1c)
 	{
 		ln = &cb->lines[i % YH_MAX_LINES];
 		if (ln->kind == YH_LK_IMG)
@@ -316,11 +317,11 @@ U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
 			cardh = 16 + YH_HDR_H + rows * YH_ROW_H + ih;
 			if (boost)
 				cardh += YH_ROW_H;
-			ytop = y - cardh;
+			ytop = y;
 
-			if (ytop < y1c && y > y0c)
+			if (ytop < y1c && ytop + cardh > y0c)
 			{
-				hov = log_x <= mx < log_x + cw && ytop <= my < y;
+				hov = log_x <= mx < log_x + cw && ytop <= my < ytop + cardh;
 				dc->color = de_theme.panel;
 				YhCRect(dc, log_x, ytop, cw, cardh, y0c, y1c);
 				if (hov)
@@ -386,7 +387,12 @@ U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
 					if (il->img >= 0 && yh.imgs[il->img].state == 2)
 					{
 						if (ay >= y0c && ay + yh.imgs[il->img].dc->height <= y1c)
+						{
 							GrBlot(dc, tx, ay, yh.imgs[il->img].dc);
+							//nx0 = -1 marks an image hit (click -> lightbox).
+							YhHitPush(ay, ay + yh.imgs[il->img].dc->height,
+									  -1, -1, yh.cur_chan, imgi[j]);
+						}
 						ay += yh.imgs[il->img].dc->height + 6;
 					}
 					else
@@ -400,7 +406,7 @@ U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
 					}
 				}
 			}
-			y = ytop - 8;	//Card gap.
+			y = ytop + cardh + 8;	//Card gap.
 			imgn = 0;
 			if (boost)
 				i--;
@@ -408,12 +414,12 @@ U0 YhDrawFeed(CTask *task, CDC *dc, CYhChan *cb,
 		}
 		else
 		{//Status / error lines: plain dim row.
-			y -= YH_ROW_H;
 			if (y >= y0c && y + FONT_HEIGHT <= y1c)
 			{
 				dc->color = de_theme.text_dim;
 				GrPrint(dc, log_x + 4, y, "%s", ln->text);
 			}
+			y += YH_ROW_H;
 			i--;
 		}
 	}
@@ -565,7 +571,15 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 	GrRect(dc, 8, log_y - 2, YH_CHAN_PANEL_W, log_h + 2);
 	YhDrawEdge(dc, 8, log_y - 2, YH_CHAN_PANEL_W, log_h + 2);
 	dc->color = de_theme.accent_dim;
-	GrPrint(dc, 14, log_y + 6, "channels");
+	if (yh.cur_srv == YH_SRV_DM)
+	{
+		GrPrint(dc, 14, log_y + 6, "DMs");
+		yh.dmnew_y = log_y + log_h - 16;
+		dc->color = de_theme.chip_hot;
+		GrPrint(dc, 14, yh.dmnew_y, "+ new dm");
+	}
+	else
+		GrPrint(dc, 14, log_y + 6, "channels");
 	r = 0;
 	for (i = 0; i < yh.num_chans; i++)
 	{//No `continue` in ZealC: filter with a plain if instead.
@@ -712,7 +726,12 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 					y -= yh.imgs[ln->img].dc->height + 4;
 					if (y >= log_y &&
 						y + yh.imgs[ln->img].dc->height <= y1c)
+					{
 						GrBlot(dc, log_x + YH_IND, y, yh.imgs[ln->img].dc);
+						//nx0 = -1 marks an image (click -> lightbox).
+						YhHitPush(y, y + yh.imgs[ln->img].dc->height,
+								  -1, -1, yh.cur_chan, i);
+					}
 				}
 				else
 				{
@@ -877,6 +896,13 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 			StrCopy(buf2, "dm");
 		GrPrint(dc, yh.vis_btn_x + 4, in_y + (in_h - FONT_HEIGHT) / 2, "%s", buf2);
 	}
+	//"+" attach button at the left edge.
+	yh.plus_btn_x = 8;
+	dc->color = de_theme.bttn_hot;
+	GrRect(dc, yh.plus_btn_x, in_y + 3, 16, in_h - 6);
+	YhDrawEdge(dc, yh.plus_btn_x, in_y + 3, 16, in_h - 6);
+	dc->color = de_theme.text;
+	GrPrint(dc, yh.plus_btn_x + 4, in_y + (in_h - FONT_HEIGHT) / 2, "+");
 	if (cb && yh.reply_to[0])
 		StrPrint(buf2, "[#%s > @%s] ", cb->name, yh.reply_nick);
 	else if (cb)
@@ -884,8 +910,21 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 	else
 		StrCopy(buf2, "[-] ");
 	dc->color = de_theme.accent;
-	GrPrint(dc, 10, in_y + (in_h - FONT_HEIGHT) / 2, "%s", buf2);
-	x = 10 + StrLen(buf2) * FONT_WIDTH;
+	GrPrint(dc, 28, in_y + (in_h - FONT_HEIGHT) / 2, "%s", buf2);
+	x = 28 + StrLen(buf2) * FONT_WIDTH;
+
+	//Staged-attachment helper strip just above the composer (webapp-style).
+	if (yh.att_on)
+	{
+		dc->color = de_theme.panel;
+		GrRect(dc, 4, in_y - 16, task->pix_width - 8, 14);
+		YhDrawEdge(dc, 4, in_y - 16, task->pix_width - 8, 14);
+		dc->color = de_theme.text_dim;
+		GrPrint(dc, 10, in_y - 13, "attach: %s", yh.att_file);
+		yh.att_x_x = task->pix_width - 26;
+		dc->color = yh.c_red;
+		GrPrint(dc, yh.att_x_x, in_y - 13, "[x]");
+	}
 	//Text field ends before whichever right-edge chip is nearest.
 	if (yh.vis_btn_x)
 		w = (yh.vis_btn_x - 6 - x) / FONT_WIDTH - 1;
@@ -944,6 +983,33 @@ U0 YhDrawChat(CTask *task, CDC *dc)
 		//Remember the drawn geometry for the click handler.
 		yh.menu_x = x;
 		yh.menu_y = y;
+	}
+
+	//Image lightbox: darken + center the full-size image. Click/<ESC> closes.
+	if (yh.light_on)
+	{
+		dc->color = de_theme.win_bg;
+		GrRect(dc, 0, 0, task->pix_width, task->pix_height);
+		if (yh.light_img >= 0 && yh.imgs[yh.light_img].state == 2)
+		{
+			x = MaxI64(0, (task->pix_width - yh.imgs[yh.light_img].dc->width) / 2);
+			y = MaxI64(0, (task->pix_height - yh.imgs[yh.light_img].dc->height) / 2);
+			GrBlot(dc, x, y, yh.imgs[yh.light_img].dc);
+		}
+		else if (yh.light_img >= 0 && yh.imgs[yh.light_img].state == 3)
+		{
+			dc->color = yh.c_red;
+			GrPrint(dc, task->pix_width / 2 - 8 * FONT_WIDTH,
+					task->pix_height / 2, "(image failed to load)");
+		}
+		else
+		{
+			dc->color = de_theme.text_dim;
+			GrPrint(dc, task->pix_width / 2 - 6 * FONT_WIDTH,
+					task->pix_height / 2, "(loading...)");
+		}
+		dc->color = de_theme.text_dim;
+		GrPrint(dc, 8, 4, "click or <ESC> to close");
 	}
 }
 
@@ -1007,6 +1073,8 @@ U0 YhConfigMenu()
 		else
 			rt = "polling";
 		w = list;
+		w = YhListAdd(w, "Edit profile (name/bio/avatar)...");
+		w = YhListAdd(w, "Browse public servers...");
 		w = YhListAdd(w, "Auto-connect on launch: %s", onoff);
 		w = YhListAdd(w, "Reconnect realtime (now: %s)", rt);
 		w = YhListAdd(w, "Refresh servers + DMs");
@@ -1017,18 +1085,38 @@ U0 YhConfigMenu()
 		switch (sel)
 		{
 			case 0:
+				YhProfileEditSelf;
+				return;
+			case 1:
+				sel = YhServerBrowse;
+				if (!sel)
+				{
+					YhStatus("No public servers found.");
+					return;
+				}
+				yh.menu_mode = 5;
+				yh.menu_n = sel;
+				yh.menu_x = 200;
+				yh.menu_y = 60;
+				yh.menu_on = TRUE;
+				return;
+			case 2:
 				yh.f_autoconn = !yh.f_autoconn;
 				YhConfigSave;
 				break;
-			case 1:
+			case 3:
 				YhWsShutdown;
 				YhWsConnect;
 				break;
-			case 2:
+			case 4:
+				YhResetData;		//Clean rebuild - no duplicate rows.
 				YhFetchServers;
+				YhFeedChan;
 				YhFetchDMs;
+				if (yh.num_servers)
+					YhSwitchServer(0);
 				return;
-			case 3:
+			case 5:
 				yh.f_url[0] = 0;
 				yh.f_anon[0] = 0;
 				YhConfigSave;
@@ -1047,7 +1135,16 @@ U0 YhSubmit()
 	U8 *slot;
 
 	if (!yh.input_len)
+	{//Attachment-only send is fine; empty otherwise = no-op.
+		if (yh.att_on && yh.cur_chan >= 0)
+		{
+			if (yh.chans[yh.cur_chan].server == YH_SRV_FEED)
+				YhSendPost("");
+			else
+				YhSendMessage("");
+		}
 		return;
+	}
 	if (yh.hist_count == YH_HIST_MAX)
 	{
 		MemCopy(yh.hist, yh.hist + YH_IN_MAX, (YH_HIST_MAX - 1) * YH_IN_MAX);
@@ -1073,7 +1170,7 @@ U0 YhSubmit()
 		{
 			yh.input_len = 0;	//Clear before the blocking file picker.
 			yh.input[0] = 0;
-			YhUpload;
+			YhAttachPick;	//Stages; sent with the next message.
 			return;
 		}
 		else
@@ -1245,6 +1342,7 @@ U0 YhChatRClick(I64 mx, I64 my)
 		StrCopy(yh.menu_items[yh.menu_n++], "React...");
 		StrCopy(yh.menu_items[yh.menu_n++], "Reply");
 		StrCopy(yh.menu_items[yh.menu_n++], "Mention");
+		StrCopy(yh.menu_items[yh.menu_n++], "View profile");
 		StrCopy(yh.menu_items[yh.menu_n++], "Copy text");
 		if (yh.reply_to[0])
 			StrCopy(yh.menu_items[yh.menu_n++], "Cancel reply");
@@ -1264,6 +1362,20 @@ U0 YhMenuAct(I64 sel)
 		yh.menu_on = FALSE;
 		if (sel < 14 && yh.fl_ids[sel][0])
 			YhProfileOpen(yh.fl_ids[sel]);
+		return;
+	}
+	if (yh.menu_mode == 4)
+	{//New-DM user pick.
+		yh.menu_on = FALSE;
+		if (sel < 14 && yh.fl_ids[sel][0])
+			YhDmCreate(yh.fl_ids[sel]);
+		return;
+	}
+	if (yh.menu_mode == 5)
+	{//Public-server join pick.
+		yh.menu_on = FALSE;
+		if (sel < 14 && yh.fl_ids[sel][0])
+			YhServerJoin(yh.fl_ids[sel]);
 		return;
 	}
 	if (yh.menu_mode == 3)
@@ -1346,10 +1458,14 @@ U0 YhMenuAct(I64 sel)
 			}
 			break;
 		case 3:
+			if (ln->auid[0])
+				YhProfileOpen(ln->auid);
+			break;
+		case 4:
 			YhClipSet(ln->text);
 			YhStatus("Copied.");
 			break;
-		case 4:
+		case 5:
 			yh.reply_to[0] = 0;
 			yh.reply_nick[0] = 0;
 			break;
@@ -1509,8 +1625,10 @@ U0 YhChatKey(I64 ch, I64 sc)
 
 	if (ch == CH_ESC || ch == CH_SHIFT_ESC)
 	{
-		if (yh.menu_on)
-			yh.menu_on = FALSE;		//First ESC dismisses the menu.
+		if (yh.light_on)
+			yh.light_on = FALSE;	//ESC closes overlays before quitting.
+		else if (yh.menu_on)
+			yh.menu_on = FALSE;
 		else
 			yh.quit = TRUE;
 	}
@@ -1608,18 +1726,71 @@ U0 YhChatKey(I64 ch, I64 sc)
 	yh.scroll = ClampI64(yh.scroll, 0, YH_MAX_LINES * 4);
 }
 
+I64 YhNewDmPrompt(I64 mx, I64 my)
+{//Prompt a username, search, open the pick menu (mode 4) at the cursor.
+	U8	*q, *p;
+	I64	 n;
+
+	q = PopUpGetStr("Find user (name or part of it):");
+	if (!q)
+		return 0;
+	p = q;
+	while (*p == ' ')
+		p++;
+	if (StrLen(p) && p[StrLen(p) - 1] == '\n')
+		p[StrLen(p) - 1] = 0;
+	if (!*p)
+	{
+		Free(q);
+		return 0;
+	}
+	n = YhUserSearch(p);
+	Free(q);
+	if (!n)
+	{
+		YhStatus("No matching users.");
+		return 0;
+	}
+	yh.menu_mode = 4;
+	yh.menu_n = n;
+	yh.menu_x = mx;
+	yh.menu_y = MaxI64(30, my - n * 14 - 6);
+	yh.menu_on = TRUE;
+	return n;
+}
+
 U0 YhChatClick(I64 mx, I64 my)
 {
 	I64		 i, y, r, log_y = 4 + 20 + 12;
 	I64		 log_h = Fs->pix_height - 22 - 4 - 6 - log_y;
 	CYhLine	*ln;
+	U8		 bigurl[YH_IMG_URL_LEN + 8];
 
+	if (yh.light_on)
+	{//Lightbox open: any click closes it.
+		yh.light_on = FALSE;
+		return;
+	}
 	if (YhMenuClick(mx, my))
 		return;	//Context menu open: it consumed the click.
+
+	//Staged-attachment cancel [x].
+	if (yh.att_on && my >= Fs->pix_height - 42 && my < Fs->pix_height - 28 &&
+		mx >= yh.att_x_x)
+	{
+		yh.att_on = FALSE;
+		yh.att_file[0] = 0;
+		return;
+	}
 
 	//Input-bar buttons (emoji picker + post-visibility cycle).
 	if (my >= Fs->pix_height - 26)
 	{
+		if (yh.plus_btn_x <= mx < yh.plus_btn_x + 16)
+		{
+			YhAttachPick;
+			return;
+		}
 		if (yh.emoji_btn_x && yh.emoji_btn_x <= mx < yh.emoji_btn_x + 20)
 		{
 			YhEmojiLoad;
@@ -1692,6 +1863,13 @@ U0 YhChatClick(I64 mx, I64 my)
 	//Channel panel.
 	if (8 <= mx < 8 + YH_CHAN_PANEL_W)
 	{
+		if (yh.cur_srv == YH_SRV_DM && yh.dmnew_y &&
+			yh.dmnew_y <= my < yh.dmnew_y + 12)
+		{//New DM: prompt a name, search, pick from the cursor menu.
+			ln = NULL;	//(reuse slot; popup blocks.)
+			r = YhNewDmPrompt(mx, my);
+			return;
+		}
 		r = 0;
 		for (i = 0; i < yh.num_chans; i++)
 		{//No `continue` in ZealC.
@@ -1762,6 +1940,20 @@ U0 YhChatClick(I64 mx, I64 my)
 			}
 		}
 	}
+	//Click an inline image (nx0 == -1 hits): open the lightbox at full size.
+	for (i = 0; i < yh.hit_count; i++)
+		if (yh.hits[i].nx0 == -1 && yh.hits[i].y0 <= my < yh.hits[i].y1)
+		{
+			ln = &yh.chans[yh.hits[i].ci].lines[yh.hits[i].ring % YH_MAX_LINES];
+			if (ln->kind == YH_LK_IMG && ln->text[0])
+			{//"#big" suffix = separate cache slot at window size.
+				StrPrint(bigurl, "%s#big", ln->text);
+				yh.light_img = YhImgGet(bigurl, Fs->pix_width - 24,
+										Fs->pix_height - 40);
+				yh.light_on = TRUE;
+			}
+			return;
+		}
 	//Click a name (or avatar): open the profile (feed) / insert an @mention.
 	for (i = 0; i < yh.hit_count; i++)
 		if (yh.hits[i].y0 <= my < yh.hits[i].y1 &&
@@ -1816,7 +2008,12 @@ U0 YhPoll()
 	dz = mouse.pos.z - yh.last_z;
 	yh.last_z = mouse.pos.z;
 	if (dz && yh.state == YH_ST_CHAT && Fs == sys_focus_task)
-		yh.scroll = ClampI64(yh.scroll - dz * 3, 0, YH_MAX_LINES * 4);
+	{//Feed is newest-at-top, so its wheel direction is inverted vs the chat.
+		if (yh.cur_chan >= 0 && yh.chans[yh.cur_chan].server == YH_SRV_FEED)
+			yh.scroll = ClampI64(yh.scroll + dz * 3, 0, YH_MAX_LINES * 4);
+		else
+			yh.scroll = ClampI64(yh.scroll - dz * 3, 0, YH_MAX_LINES * 4);
+	}
 }
 
 U0 YhNetPump()

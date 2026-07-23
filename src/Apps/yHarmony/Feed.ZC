@@ -306,8 +306,9 @@ U0 YhSendPost(U8 *text)
 //picks it up (is_federated + federation_status pending) and delivers via
 //ActivityPub. Honors yh.post_vis + yh.post_cw. A leading "cw:<warn>|<body>"
 //in the text sets the content warning inline.
-	U8		 esc[YH_TEXT_LEN * 2], cwesc[240], cwbuf[120];
-	U8		*body, *vis, *msg = text, *bar;
+	U8		 esc[YH_TEXT_LEN * 2], cwesc[240], cwbuf[120], ftype[12];
+	U8		 media[400], content[YH_TEXT_LEN * 4];
+	U8		*body, *vis, *msg = text, *bar, *att_url;
 	CYhJson	*json;
 	I64		 ci = YhFeedChan;
 
@@ -339,27 +340,37 @@ U0 YhSendPost(U8 *text)
 	else
 		vis = "public";
 
-	YhJsonEsc(esc, msg, sizeof(esc));
+	//Staged attachment -> post media.
+	att_url = NULL;
+	media[0] = 0;
+	if (yh.att_on)
+	{
+		att_url = YhAttachUpload(ftype);
+		if (!att_url)
+			return;
+		StrPrint(media, ",\"media_attachments\":[{\"url\":\"%s\",\"type\":\"%s\"}]",
+				 att_url, ftype);
+		Free(att_url);
+	}
+	YhBuildContent(msg, content, sizeof(content));	//:emoji: -> emoji parts.
 	if (cwbuf[0])
 	{
 		YhJsonEsc(cwesc, cwbuf, sizeof(cwesc));
 		body = MStrPrint(
 			"{\"author_id\":\"%s\",\"visibility\":\"%s\",\"content_warning\":\"%s\","
-			"\"is_sensitive\":true,"
-			"\"content\":[{\"type\":\"text\",\"text\":\"%s\"}],"
+			"\"is_sensitive\":true,\"content\":%s,"
 			"\"is_local\":true,\"is_federated\":true,"
 			"\"metadata\":{\"created_via\":\"yharmony_zealos\","
-			"\"content_format\":\"message_parts_v1\"}}",
-			yh.prof_id, vis, cwesc, esc);
+			"\"content_format\":\"message_parts_v1\"}%s}",
+			yh.prof_id, vis, cwesc, content, media);
 	}
 	else
 		body = MStrPrint(
-			"{\"author_id\":\"%s\",\"visibility\":\"%s\","
-			"\"content\":[{\"type\":\"text\",\"text\":\"%s\"}],"
+			"{\"author_id\":\"%s\",\"visibility\":\"%s\",\"content\":%s,"
 			"\"is_local\":true,\"is_federated\":true,"
 			"\"metadata\":{\"created_via\":\"yharmony_zealos\","
-			"\"content_format\":\"message_parts_v1\"}}",
-			yh.prof_id, vis, esc);
+			"\"content_format\":\"message_parts_v1\"}%s}",
+			yh.prof_id, vis, content, media);
 	json = YhRest("POST", "/rest/v1/posts", body);
 	Free(body);
 	yh.post_cw[0] = 0;	//One-shot.
@@ -569,3 +580,57 @@ U0 YhPostInteract(U8 *post_id, U8 *type)
 	else
 		YhStatus("Interaction failed (already done?).");
 }
+
+/***** DM creation + server joining (need Chat + Feed symbols) *****/
+
+U0 YhDmCreate(U8 *other_id)
+{//New 1:1 conversation via the SECURITY DEFINER RPC (handles participant
+//rows + permissions server-side), then refresh the DM list.
+	CYhJson	*json;
+	U8		*body;
+	I64		 i;
+
+	body = MStrPrint(
+		"{\"p_creator_user_id\":\"%s\",\"p_participant_ids\":[\"%s\"],"
+		"\"p_conversation_name\":null,\"p_is_private\":true}",
+		yh.prof_id, other_id);
+	json = YhRest("POST", "/rest/v1/rpc/create_group_conversation", body);
+	Free(body);
+	if (!json)
+	{
+		YhStatus("Could not create the conversation.");
+		return;
+	}
+	YhjFree(json);
+	YhFetchDMs;
+	//Jump to the newest DM with that user.
+	for (i = 0; i < yh.num_chans; i++)
+		if (yh.chans[i].server == YH_SRV_DM)
+			YhSwitchChan(i);
+	YhStatus("Conversation ready.");
+}
+
+U0 YhServerJoin(U8 *server_id)
+{//user_servers insert; status defaults to 'accepted'.
+	CYhJson	*json;
+	U8		*body;
+
+	body = MStrPrint("{\"user_id\":\"%s\",\"server_id\":\"%s\"}",
+					 yh.prof_id, server_id);
+	json = YhRest("POST", "/rest/v1/user_servers", body);
+	Free(body);
+	if (json)
+	{
+		YhjFree(json);
+		YhResetData;	//Frees rings + zeroes counts: clean rebuild, no dupes.
+		YhFetchServers;
+		YhFeedChan;
+		YhFetchDMs;
+		if (yh.num_servers)
+			YhSwitchServer(yh.num_servers - 1);
+		YhStatus("Joined.");
+	}
+	else
+		YhStatus("Join failed (already a member?).");
+}
+

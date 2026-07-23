@@ -570,7 +570,12 @@ I64 DNSQueryRun(CUDPSocket *udp_socket, U8 *name, U16 port, CAddressInfo **resul
 
 						ipv4_addr_temp->family	= AF_INET;
 						ipv4_addr_temp->port	= port;
-						MemCopy(&ipv4_addr_temp->address.address, answers->r_data, 4);
+						//BUG WAS `answers->r_data`: that copies the FIRST RR's
+						//data, not the matched A record. With a CNAME chain
+						//(CNAME then A) the first RR is the CNAME, so the cached
+						//IP was garbage -> intermittent connect failures. Copy
+						//the record we actually matched.
+						MemCopy(&ipv4_addr_temp->address.address, a->r_data, 4);
 
 						DNSCachePut(name, res);
 						*result_out = res;

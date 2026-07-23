@@ -10,7 +10,12 @@ I64 YhImgGet(U8 *url, I64 maxw, I64 maxh)
 		return -1;
 	for (i = 0; i < yh.img_count; i++)
 		if (!StrCompare(yh.imgs[i].url, url))
+		{
+			if (yh.imgs[i].state == 3 &&
+				counts.jiffies > yh.imgs[i].fail_t + 20 * JIFFY_FREQ)
+				yh.imgs[i].state = 1;	//Retry failures every ~20s (DNS flake).
 			return i;
+		}
 	if (yh.img_count >= YH_IMG_MAX)
 		return -1;
 	im = &yh.imgs[yh.img_count];
@@ -58,6 +63,8 @@ U0 YhImgLoaderTask()
 {//Fetch + decode queued images, one at a time. Decoded on this task's heap,
 //then scaled into a DC on the UI task's heap (survives us).
 	I64		 i, w, h, tries;
+	U8		 fetch_url[YH_IMG_URL_LEN];
+	U8		*p;
 	CYhImg	*im;
 	CHttpResponse *resp;
 	CDC		*raw, *fit;
@@ -69,20 +76,31 @@ U0 YhImgLoaderTask()
 		for (i = 0; i < yh.img_count && !found; i++)
 		{
 			im = &yh.imgs[i];
+			//Re-queue stale failures HERE (not just in YhImgGet): server
+			//icons + avatars store their cache index once and never re-call
+			//YhImgGet, so a DNS-flaked failure would otherwise be permanent.
+			if (im->state == 3 && counts.jiffies > im->fail_t + 20 * JIFFY_FREQ)
+				im->state = 1;
 			if (im->state == 1)
 			{
 				found = TRUE;
 				raw = NULL;
+				//Cache keys may carry a "#suffix" (e.g. the lightbox wants
+				//the same URL at full size): strip it before fetching.
+				StrCopy(fetch_url, im->url);
+				p = StrFirstOcc(fetch_url, "#");
+				if (p)
+					*p = 0;
 				//DNS/TLS to media + federated hosts is flaky in the VM; retry
 				//a couple times before giving up (matches HTTP.ZC's connect
 				//retry). Remote hosts (wasabi/CDNs) may still never resolve.
-				resp = HttpGet(im->url);
+				resp = HttpGet(fetch_url);
 				for (tries = 0; tries < 2 && (!resp || resp->status != 200); tries++)
 				{
 					if (resp)
 						HttpResponseFree(resp);
 					Sleep(300);
-					resp = HttpGet(im->url);
+					resp = HttpGet(fetch_url);
 				}
 				if (resp && resp->status == 200 && resp->body_length > 8)
 				{
@@ -100,7 +118,7 @@ U0 YhImgLoaderTask()
 						NetLog("yHarmony img: unknown format %s", im->url);
 				}
 				else
-					NetLog("yHarmony img: fetch failed %s", im->url);
+					NetLog("yHarmony img: fetch failed %s", fetch_url);
 				if (resp)
 					HttpResponseFree(resp);
 				if (raw && raw->width > 0 && raw->height > 0)
@@ -130,7 +148,8 @@ U0 YhImgLoaderTask()
 				{
 					if (raw)
 						DCDel(raw);
-					im->state = 3;	//Failed (bad fetch / webp / corrupt).
+					im->fail_t = counts.jiffies;
+					im->state = 3;	//Failed; retried by YhImgGet in ~20s.
 				}
 			}
 		}
